@@ -1,0 +1,15 @@
+Collecting django
+  Using cached django-6.0.3-py3-none-any.whl.metadata (3.9 kB)
+Collecting djangorestframework
+  Downloading djangorestframework-3.17.0-py3-none-any.whl.metadata (7.9 kB)
+Collecting django-filter
+  Using cached django_filter-25.2-py3-none-any.whl.metadata (5.1 kB)
+Collecting django-cors-headers
+  Using cached django_cors_headers-4.9.0-py3-none-any.whl.metadata (16 kB)
+Collecting maturin
+  Using cached maturin-1.12.6-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl.metadata (16 kB)
+ERROR: Could not find a version that satisfies the requirement pyo3 (from versions: none)
+
+[notice] A new release of pip is available: 25.0 -> 26.0.1
+[notice] To update, run: pip install --upgrade pip
+ERROR: No matching distribution found for pyo3

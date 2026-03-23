@@ -1,0 +1,14 @@
+/Users/brandao/Documents/biohub.solutions/davinci/rust_engine/target/release/deps/serde-bf8d0a69c7268bcb.d: /Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/brandao/Documents/biohub.solutions/davinci/rust_engine/target/release/build/serde-2f309d18b0e63270/out/private.rs
+
+/Users/brandao/Documents/biohub.solutions/davinci/rust_engine/target/release/deps/libserde-bf8d0a69c7268bcb.rlib: /Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/brandao/Documents/biohub.solutions/davinci/rust_engine/target/release/build/serde-2f309d18b0e63270/out/private.rs
+
+/Users/brandao/Documents/biohub.solutions/davinci/rust_engine/target/release/deps/libserde-bf8d0a69c7268bcb.rmeta: /Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/brandao/Documents/biohub.solutions/davinci/rust_engine/target/release/build/serde-2f309d18b0e63270/out/private.rs
+
+/Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/brandao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/brandao/Documents/biohub.solutions/davinci/rust_engine/target/release/build/serde-2f309d18b0e63270/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/brandao/Documents/biohub.solutions/davinci/rust_engine/target/release/build/serde-2f309d18b0e63270/out
