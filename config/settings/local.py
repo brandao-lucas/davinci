@@ -17,3 +17,10 @@ DATABASES = {
 
 CELERY_BROKER_URL = 'redis://localhost:6379/0'
 CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+
+CELERY_BEAT_SCHEDULE = {
+    'refresh-all-project-stats': {
+        'task': 'apps.core.tasks.stats_tasks.refresh_all_project_stats',
+        'schedule': 3600,  # every hour
+    },
+}

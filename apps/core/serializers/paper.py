@@ -1,0 +1,123 @@
+from rest_framework import serializers
+from apps.core.models import (
+    Paper, PaperAuthor, PaperKeyword, PaperMeSHTerm,
+    PaperGene, PaperDrug, PaperVariant, EntityContext,
+    ProjectPaper, ClinicalCategory, UserCategory,
+)
+
+
+class PaperAuthorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PaperAuthor
+        fields = ['position', 'last_name', 'initials', 'affiliation', 'country']
+
+
+class PaperKeywordSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PaperKeyword
+        fields = ['keyword']
+
+
+class PaperMeSHTermSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PaperMeSHTerm
+        fields = ['descriptor', 'qualifier', 'is_major_topic']
+
+
+class PaperGeneSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PaperGene
+        fields = ['gene_symbol', 'entrez_id', 'mention_count']
+
+
+class PaperDrugSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PaperDrug
+        fields = ['drug_name', 'mention_count', 'drugbank_id']
+
+
+class PaperVariantSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PaperVariant
+        fields = ['rs_number']
+
+
+class EntityContextSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EntityContext
+        fields = ['entity_type', 'entity_name', 'sentence', 'sentence_position']
+
+
+class PaperDetailSerializer(serializers.ModelSerializer):
+    """Full paper detail with all nested entities."""
+    authors = PaperAuthorSerializer(many=True, read_only=True)
+    keywords = PaperKeywordSerializer(many=True, read_only=True)
+    mesh_terms = PaperMeSHTermSerializer(many=True, read_only=True)
+    genes = PaperGeneSerializer(many=True, read_only=True)
+    drugs = PaperDrugSerializer(many=True, read_only=True)
+    variants = PaperVariantSerializer(many=True, read_only=True)
+    contexts = EntityContextSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Paper
+        fields = [
+            'id', 'pmid', 'pmc_id', 'doi', 'title', 'abstract',
+            'journal', 'pub_year', 'pub_month',
+            'authors', 'keywords', 'mesh_terms', 'genes', 'drugs',
+            'variants', 'contexts', 'ingested_at',
+        ]
+
+
+class ClinicalCategoryBriefSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ClinicalCategory
+        fields = ['id', 'slug', 'name']
+
+
+class UserCategoryBriefSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UserCategory
+        fields = ['id', 'name', 'color']
+
+
+class ProjectPaperListSerializer(serializers.ModelSerializer):
+    """Compact representation for list views."""
+    pmid = serializers.IntegerField(source='paper.pmid', read_only=True)
+    title = serializers.CharField(source='paper.title', read_only=True)
+    journal = serializers.CharField(source='paper.journal', read_only=True)
+    pub_year = serializers.IntegerField(source='paper.pub_year', read_only=True)
+    clinical_categories = ClinicalCategoryBriefSerializer(many=True, read_only=True)
+    user_categories = UserCategoryBriefSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = ProjectPaper
+        fields = [
+            'id', 'pmid', 'title', 'journal', 'pub_year',
+            'curation_status', 'exclusion_reason', 'notes',
+            'relevance_score', 'clinical_categories', 'user_categories',
+            'added_at', 'curated_at',
+        ]
+
+
+class ProjectPaperDetailSerializer(serializers.ModelSerializer):
+    """Full detail: paper content + curation fields."""
+    paper = PaperDetailSerializer(read_only=True)
+    clinical_categories = ClinicalCategoryBriefSerializer(many=True, read_only=True)
+    user_categories = UserCategoryBriefSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = ProjectPaper
+        fields = [
+            'id', 'paper',
+            'curation_status', 'exclusion_reason', 'notes',
+            'relevance_score', 'clinical_categories', 'user_categories',
+            'added_at', 'curated_at',
+        ]
+        read_only_fields = ['id', 'paper', 'added_at', 'curated_at']
+
+
+class ProjectPaperCurateSerializer(serializers.ModelSerializer):
+    """Write-only: update curation fields."""
+    class Meta:
+        model = ProjectPaper
+        fields = ['curation_status', 'exclusion_reason', 'notes', 'relevance_score']

@@ -1,10 +1,71 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
+
 from .views.project_views import DaVinciProjectViewSet
+from .views.paper_views import ProjectPaperViewSet
+from .views.dataset_views import ProjectDatasetViewSet
+from .views.category_views import ClinicalCategoryViewSet, UserCategoryViewSet
+from .views.link_views import ProjectPaperDatasetViewSet
+from .views.job_views import IngestionJobViewSet
 
 router = DefaultRouter()
 router.register(r'projects', DaVinciProjectViewSet, basename='project')
+router.register(r'clinical-categories', ClinicalCategoryViewSet, basename='clinical-category')
+
+# ── Nested routes under /projects/{project_pk}/ ───────────────────────────────
+
+paper_list = ProjectPaperViewSet.as_view({'get': 'list'})
+paper_detail = ProjectPaperViewSet.as_view({'get': 'retrieve', 'patch': 'partial_update'})
+paper_categorize = ProjectPaperViewSet.as_view({'post': 'categorize'})
+paper_bulk_curate = ProjectPaperViewSet.as_view({'post': 'bulk_curate'})
+paper_search = ProjectPaperViewSet.as_view({'get': 'search'})
+
+dataset_list = ProjectDatasetViewSet.as_view({'get': 'list'})
+dataset_detail = ProjectDatasetViewSet.as_view({'get': 'retrieve', 'patch': 'partial_update'})
+dataset_search = ProjectDatasetViewSet.as_view({'get': 'search'})
+
+category_list = UserCategoryViewSet.as_view({'get': 'list', 'post': 'create'})
+category_detail = UserCategoryViewSet.as_view({
+    'patch': 'partial_update',
+    'delete': 'destroy',
+})
+
+link_list = ProjectPaperDatasetViewSet.as_view({'get': 'list'})
+link_confirm = ProjectPaperDatasetViewSet.as_view({'post': 'confirm'})
+link_reject = ProjectPaperDatasetViewSet.as_view({'post': 'reject'})
+
+job_list = IngestionJobViewSet.as_view({'get': 'list'})
+job_detail = IngestionJobViewSet.as_view({'get': 'retrieve'})
+job_cancel = IngestionJobViewSet.as_view({'post': 'cancel'})
+
+PROJECT_PREFIX = r'projects/<uuid:project_pk>/'
 
 urlpatterns = [
     path('', include(router.urls)),
+
+    # Papers
+    path(f'{PROJECT_PREFIX}papers/', paper_list, name='project-paper-list'),
+    path(f'{PROJECT_PREFIX}papers/search/', paper_search, name='project-paper-search'),
+    path(f'{PROJECT_PREFIX}papers/bulk_curate/', paper_bulk_curate, name='project-paper-bulk-curate'),
+    path(f'{PROJECT_PREFIX}papers/<int:pk>/', paper_detail, name='project-paper-detail'),
+    path(f'{PROJECT_PREFIX}papers/<int:pk>/categorize/', paper_categorize, name='project-paper-categorize'),
+
+    # Datasets
+    path(f'{PROJECT_PREFIX}datasets/', dataset_list, name='project-dataset-list'),
+    path(f'{PROJECT_PREFIX}datasets/search/', dataset_search, name='project-dataset-search'),
+    path(f'{PROJECT_PREFIX}datasets/<int:pk>/', dataset_detail, name='project-dataset-detail'),
+
+    # Custom categories
+    path(f'{PROJECT_PREFIX}categories/', category_list, name='project-category-list'),
+    path(f'{PROJECT_PREFIX}categories/<int:pk>/', category_detail, name='project-category-detail'),
+
+    # Literature ↔ Omics links
+    path(f'{PROJECT_PREFIX}links/', link_list, name='project-link-list'),
+    path(f'{PROJECT_PREFIX}links/<int:pk>/confirm/', link_confirm, name='project-link-confirm'),
+    path(f'{PROJECT_PREFIX}links/<int:pk>/reject/', link_reject, name='project-link-reject'),
+
+    # Ingestion jobs
+    path(f'{PROJECT_PREFIX}jobs/', job_list, name='project-job-list'),
+    path(f'{PROJECT_PREFIX}jobs/<uuid:pk>/', job_detail, name='project-job-detail'),
+    path(f'{PROJECT_PREFIX}jobs/<uuid:pk>/cancel/', job_cancel, name='project-job-cancel'),
 ]

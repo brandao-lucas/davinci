@@ -42,6 +42,7 @@ INSTALLED_APPS = [
     'django_filters',
     'corsheaders',
     'apps.core',
+    'apps.accounts',
 ]
 
 MIDDLEWARE = [
@@ -121,10 +122,28 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
+# ── Firebase Admin SDK ───────────────────────────────────────────────────────
+# Inicializado aqui para que fique disponível globalmente.
+# Se o arquivo de credenciais não existir (ex: CI sem Firebase configurado),
+# a SDK não é inicializada e o FirebaseAuthentication retornará erro 401.
+import os as _os
+_FIREBASE_CREDENTIALS_PATH = _os.environ.get(
+    'FIREBASE_CREDENTIALS_PATH',
+    str(BASE_DIR / 'firebase-service-account.json'),
+)
+try:
+    import firebase_admin
+    from firebase_admin import credentials as _fb_creds
+    if not firebase_admin._apps and _os.path.exists(_FIREBASE_CREDENTIALS_PATH):
+        _cred = _fb_creds.Certificate(_FIREBASE_CREDENTIALS_PATH)
+        firebase_admin.initialize_app(_cred)
+except ImportError:
+    pass  # firebase-admin não instalado — FirebaseAuthentication retornará erro 401
+
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
-        'rest_framework.authentication.SessionAuthentication',
-        'rest_framework.authentication.TokenAuthentication',
+        'apps.accounts.authentication.FirebaseAuthentication',
+        'rest_framework.authentication.SessionAuthentication',  # DRF Browsable API em dev
     ],
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
