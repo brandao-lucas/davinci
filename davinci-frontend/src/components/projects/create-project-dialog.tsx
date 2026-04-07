@@ -6,13 +6,14 @@ import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import {
-  Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger,
+  Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger,
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { useCreateProject } from '@/lib/hooks/use-projects';
+import { projectsApi } from '@/lib/api/projects';
 import { Plus } from 'lucide-react';
 
 const schema = z.object({
@@ -43,6 +44,11 @@ export function CreateProjectDialog() {
       date_to: data.date_to ? parseInt(data.date_to, 10) : undefined,
     };
     const project = await createProject.mutateAsync(payload);
+    try {
+      await projectsApi.search(project.id);
+    } catch {
+      // Project created; search can be started manually from the project page
+    }
     reset();
     setOpen(false);
     router.push(`/projects/${project.id}`);
@@ -59,6 +65,7 @@ export function CreateProjectDialog() {
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Create New Project</DialogTitle>
+          <DialogDescription>Fill in the details to start a new systematic review project.</DialogDescription>
         </DialogHeader>
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
           <div className="space-y-1.5">

@@ -1,5 +1,6 @@
 'use client';
 
+import { useState } from 'react';
 import {
   useReactTable,
   getCoreRowModel,
@@ -10,6 +11,7 @@ import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from '@/components/ui/table';
 import { Badge } from '@/components/ui/badge';
+import { Checkbox } from '@/components/ui/checkbox';
 import { truncate, formatNumber } from '@/lib/utils/format';
 import type { OmicDataset } from '@/lib/types/dataset';
 
@@ -24,10 +26,30 @@ const statusColors: Record<string, string> = {
 interface DatasetsTableProps {
   datasets: OmicDataset[];
   onSelect?: (dataset: OmicDataset) => void;
+  onSelectionChange?: (datasetIds: number[]) => void;
 }
 
-export function DatasetsTable({ datasets, onSelect }: DatasetsTableProps) {
+export function DatasetsTable({ datasets, onSelect, onSelectionChange }: DatasetsTableProps) {
+  const [rowSelection, setRowSelection] = useState<Record<string, boolean>>({});
+
   const columns: ColumnDef<OmicDataset>[] = [
+    {
+      id: 'select',
+      header: ({ table }) => (
+        <Checkbox
+          checked={table.getIsAllPageRowsSelected()}
+          onCheckedChange={(value) => table.toggleAllPageRowsSelected(!!value)}
+        />
+      ),
+      cell: ({ row }) => (
+        <Checkbox
+          checked={row.getIsSelected()}
+          onCheckedChange={(value) => row.toggleSelected(!!value)}
+          onClick={(e) => e.stopPropagation()}
+        />
+      ),
+      size: 40,
+    },
     {
       accessorKey: 'accession',
       header: 'Accession',
@@ -63,7 +85,7 @@ export function DatasetsTable({ datasets, onSelect }: DatasetsTableProps) {
       size: 80,
       cell: ({ getValue }) => {
         const v = getValue<number | null>();
-        return v !== null ? formatNumber(v) : '—';
+        return v != null ? formatNumber(v) : '—';
       },
     },
     {
@@ -81,7 +103,14 @@ export function DatasetsTable({ datasets, onSelect }: DatasetsTableProps) {
   const table = useReactTable({
     data: datasets,
     columns,
+    state: { rowSelection },
+    onRowSelectionChange: (updater) => {
+      const next = typeof updater === 'function' ? updater(rowSelection) : updater;
+      setRowSelection(next);
+      onSelectionChange?.(Object.keys(next).filter((k) => next[k]).map(Number));
+    },
     getCoreRowModel: getCoreRowModel(),
+    getRowId: (row) => String(row.id),
   });
 
   return (
@@ -110,6 +139,7 @@ export function DatasetsTable({ datasets, onSelect }: DatasetsTableProps) {
               <TableRow
                 key={row.id}
                 className="cursor-pointer hover:bg-muted/50"
+                data-state={row.getIsSelected() ? 'selected' : undefined}
                 onClick={() => onSelect?.(row.original)}
               >
                 {row.getVisibleCells().map((cell) => (

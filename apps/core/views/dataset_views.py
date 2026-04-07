@@ -1,7 +1,7 @@
 from django.contrib.postgres.search import SearchQuery
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from rest_framework import mixins, viewsets
+from rest_framework import mixins, viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
@@ -40,7 +40,7 @@ class ProjectDatasetViewSet(
         project = self._get_project()
         qs = ProjectDataset.objects.filter(project=project).select_related('dataset')
 
-        curation_status = self.request.query_params.get('status')
+        curation_status = self.request.query_params.get('curation_status')
         if curation_status:
             qs = qs.filter(curation_status=curation_status)
 
@@ -56,6 +56,9 @@ class ProjectDatasetViewSet(
         if source_db:
             qs = qs.filter(dataset__source_db=source_db)
 
+        if self.request.query_params.get('has_summary') == 'true':
+            qs = qs.exclude(dataset__summary='')
+
         return qs.order_by('-added_at')
 
     def get_serializer_class(self):
@@ -67,6 +70,36 @@ class ProjectDatasetViewSet(
 
     def perform_update(self, serializer):
         serializer.save(curated_at=timezone.now())
+
+    @action(detail=False, methods=['post'], url_path='bulk_curate')
+    def bulk_curate(self, request, project_pk=None):
+        """
+        Bulk-update curation_status for multiple project datasets.
+
+        Body: {"dataset_ids": [int, ...], "curation_status": "included"}
+        """
+        dataset_ids = request.data.get('dataset_ids', [])
+        new_status = request.data.get('curation_status')
+
+        valid_statuses = [s.value for s in ProjectDataset.CurationStatus]
+        if new_status not in valid_statuses:
+            return Response(
+                {'detail': f'Invalid status. Choose from {valid_statuses}.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not dataset_ids:
+            return Response({'detail': 'dataset_ids is required.'}, status=400)
+
+        project = self._get_project()
+        exclusion_reason = request.data.get('exclusion_reason', '')
+        updated = ProjectDataset.objects.filter(
+            project=project, id__in=dataset_ids
+        ).update(
+            curation_status=new_status,
+            exclusion_reason=exclusion_reason,
+            curated_at=timezone.now(),
+        )
+        return Response({'updated': updated})
 
     @action(detail=False, methods=['get'], url_path='search')
     def search(self, request, project_pk=None):

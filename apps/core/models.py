@@ -176,6 +176,14 @@ class Paper(models.Model):
     journal = models.CharField('Periódico (ISO)', max_length=255, blank=True, default='')
     pub_year = models.PositiveSmallIntegerField('Ano de Publicação', blank=True, null=True)
     pub_month = models.PositiveSmallIntegerField('Mês de Publicação', blank=True, null=True)
+    pub_type = models.CharField(
+        'Tipo de Publicação',
+        max_length=100,
+        blank=True,
+        default='',
+        db_index=True,
+        help_text='Tipo primário do PubMed (Review, Systematic Review, RCT, etc.)'
+    )
 
     # Full-Text Search (Postgres tsvector)
     # O trigger no Postgres atualiza automaticamente:
@@ -452,16 +460,17 @@ class OmicDataset(models.Model):
     summary = models.TextField('Resumo/Descrição', blank=True, default='')
 
     # Classificação ômica
+    # Armazena múltiplos valores separados por vírgula (ex: "transcriptomic,genomic")
     omic_type = models.CharField(
         'Tipo Ômico',
-        max_length=20,
+        max_length=200,
         choices=OmicType.choices,
         blank=True,
         default=''
     )
     omic_subcategory = models.CharField(
         'Subcategoria',
-        max_length=200,
+        max_length=500,
         blank=True,
         default='',
         help_text='Ex: RNA-Seq, WGS, ChIP-Seq, 16S'
@@ -538,6 +547,25 @@ class DatasetPaperLink(models.Model):
 
     def __str__(self):
         return f"{self.dataset.accession} ↔ PMID:{self.paper.pmid}"
+
+
+class DatasetPaperLinkPending(models.Model):
+    """
+    Staging table for dataset-paper links awaiting FK resolution.
+    Links are stored here during omics ingestion and resolved when
+    both datasets and papers exist in the database.
+    """
+    dataset_accession = models.CharField(max_length=50)
+    paper_pmid = models.BigIntegerField()
+    link_source = models.CharField(max_length=50, default='elink')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ['dataset_accession', 'paper_pmid']
+        db_table = 'core_datasetpaperlinkpending'
+
+    def __str__(self):
+        return f"Pending: {self.dataset_accession} ↔ PMID:{self.paper_pmid}"
 
 
 # =============================================================================
@@ -929,6 +957,8 @@ class ProjectStats(models.Model):
         blank=True,
         help_text='Contagem por categoria clínica (diagnosis, treatment, etc.)'
     )
+    datasets_by_omic_type = models.CharField(max_length=200, blank=True)
+    omic_subcategory = models.CharField(max_length=500, blank=True)
     datasets_by_omic_type = models.JSONField(default=dict, blank=True)
     datasets_by_organism = models.JSONField(default=dict, blank=True)
     top_genes = models.JSONField(

@@ -21,6 +21,12 @@ export const projectsApi = {
   search: (id: string) =>
     apiClient.post<{ job_id: string; status: string }>(`/projects/${id}/search/`),
 
+  omicsSearch: (id: string, sources?: string[], maxPerSource?: number) =>
+    apiClient.post<{ job_id: string; status: string }>(`/projects/${id}/omics_search/`, {
+      sources,
+      max_per_source: maxPerSource,
+    }),
+
   getStats: (id: string) =>
     apiClient.get<ProjectStats>(`/projects/${id}/stats/`),
 

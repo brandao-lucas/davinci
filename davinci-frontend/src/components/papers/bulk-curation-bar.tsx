@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import {
-  Dialog, DialogContent, DialogHeader, DialogTitle,
+  Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
 import { useBulkCurate } from '@/lib/hooks/use-papers';
 
@@ -58,6 +58,7 @@ export function BulkCurationBar({ projectId, selectedIds, onClear }: BulkCuratio
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>Exclude {selectedIds.length} papers</DialogTitle>
+            <DialogDescription>Provide a reason for exclusion (required for audit trail).</DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
             <div className="space-y-1.5">

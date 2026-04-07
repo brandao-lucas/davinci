@@ -16,7 +16,11 @@ class UserProfileSerializer(serializers.ModelSerializer):
             'id', 'email', 'first_name', 'last_name',
             'firebase_uid', 'auth_provider', 'orcid_id',
             'institution', 'research_area', 'avatar_url',
+            'ncbi_api_key',
         ]
+        extra_kwargs = {
+            'ncbi_api_key': {'write_only': True},
+        }
         read_only_fields = ['id', 'firebase_uid', 'auth_provider']
 
 
@@ -27,7 +31,7 @@ class UserProfileUpdateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = UserProfile
-        fields = ['orcid_id', 'institution', 'research_area', 'first_name', 'last_name']
+        fields = ['orcid_id', 'institution', 'research_area', 'first_name', 'last_name', 'ncbi_api_key']
 
     def update(self, instance, validated_data):
         first_name = validated_data.pop('first_name', None)

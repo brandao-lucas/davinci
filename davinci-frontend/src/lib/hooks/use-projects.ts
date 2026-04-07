@@ -40,7 +40,7 @@ export function useUpdateProject(id: string) {
   return useMutation({
     mutationFn: (data: Partial<CreateProjectInput>) => projectsApi.update(id, data).then(r => r.data),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['projects', id] });
+      queryClient.invalidateQueries({ queryKey: ['projects'] });
     },
   });
 }
@@ -59,6 +59,17 @@ export function useDispatchSearch(projectId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: () => projectsApi.search(projectId).then(r => r.data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['jobs', projectId] });
+    },
+  });
+}
+
+export function useDispatchOmicsSearch(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ sources, maxPerSource }: { sources?: string[]; maxPerSource?: number } = {}) =>
+      projectsApi.omicsSearch(projectId, sources, maxPerSource).then(r => r.data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['jobs', projectId] });
     },

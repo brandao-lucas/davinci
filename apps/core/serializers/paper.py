@@ -81,18 +81,24 @@ class UserCategoryBriefSerializer(serializers.ModelSerializer):
 
 
 class ProjectPaperListSerializer(serializers.ModelSerializer):
-    """Compact representation for list views."""
+    """Compact representation for list views — includes abstract for detail panel."""
     pmid = serializers.IntegerField(source='paper.pmid', read_only=True)
+    pmc_id = serializers.CharField(source='paper.pmc_id', read_only=True)
+    doi = serializers.CharField(source='paper.doi', read_only=True)
     title = serializers.CharField(source='paper.title', read_only=True)
+    abstract = serializers.CharField(source='paper.abstract', read_only=True)
     journal = serializers.CharField(source='paper.journal', read_only=True)
     pub_year = serializers.IntegerField(source='paper.pub_year', read_only=True)
+    pub_month = serializers.IntegerField(source='paper.pub_month', read_only=True, allow_null=True)
+    pub_type = serializers.CharField(source='paper.pub_type', read_only=True)
     clinical_categories = ClinicalCategoryBriefSerializer(many=True, read_only=True)
     user_categories = UserCategoryBriefSerializer(many=True, read_only=True)
 
     class Meta:
         model = ProjectPaper
         fields = [
-            'id', 'pmid', 'title', 'journal', 'pub_year',
+            'id', 'pmid', 'pmc_id', 'doi', 'title', 'abstract',
+            'journal', 'pub_year', 'pub_month', 'pub_type',
             'curation_status', 'exclusion_reason', 'notes',
             'relevance_score', 'clinical_categories', 'user_categories',
             'added_at', 'curated_at',

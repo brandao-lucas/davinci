@@ -38,6 +38,12 @@ class UserProfile(models.Model):
     institution = models.CharField(max_length=255, blank=True, default='')
     research_area = models.CharField(max_length=255, blank=True, default='')
     avatar_url = models.URLField(blank=True, default='')
+    ncbi_api_key = models.CharField(
+        max_length=255,
+        blank=True,
+        default='',
+        help_text='NCBI API Key pessoal (eleva rate limit de 3 para 10 req/s)',
+    )
     last_firebase_sync = models.DateTimeField(auto_now=True)
 
     class Meta:

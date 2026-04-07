@@ -21,20 +21,39 @@ export function PaperDetailPanel({ paper, onClose }: PaperDetailPanelProps) {
         </SheetHeader>
 
         <div className="mt-4 space-y-4 text-sm">
-          <div className="flex items-center gap-2 text-muted-foreground">
+          <div className="flex flex-wrap items-center gap-2 text-muted-foreground">
             <span>{paper.journal}</span>
             <span>·</span>
             <span>{paper.pub_year}</span>
+            {paper.pub_type && (
+              <>
+                <span>·</span>
+                <Badge variant="secondary" className="text-xs">{paper.pub_type}</Badge>
+              </>
+            )}
             <span>·</span>
             <span>PMID: {paper.pmid}</span>
+            {paper.doi && (
+              <>
+                <span>·</span>
+                <a
+                  href={`https://doi.org/${paper.doi}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline hover:text-foreground"
+                >
+                  DOI
+                </a>
+              </>
+            )}
           </div>
 
-          {paper.authors.length > 0 && (
+          {(paper.authors?.length ?? 0) > 0 && (
             <div>
               <p className="font-medium mb-1">Authors</p>
               <p className="text-muted-foreground">
-                {paper.authors.slice(0, 5).map(a => `${a.initials} ${a.last_name}`).join(', ')}
-                {paper.authors.length > 5 && ` et al.`}
+                {paper.authors!.slice(0, 5).map(a => `${a.initials} ${a.last_name}`).join(', ')}
+                {paper.authors!.length > 5 && ` et al.`}
               </p>
             </div>
           )}
@@ -46,13 +65,13 @@ export function PaperDetailPanel({ paper, onClose }: PaperDetailPanelProps) {
             <p className="text-muted-foreground leading-relaxed">{paper.abstract || 'No abstract available.'}</p>
           </div>
 
-          {paper.mesh_terms.length > 0 && (
+          {(paper.mesh_terms?.length ?? 0) > 0 && (
             <>
               <Separator />
               <div>
                 <p className="font-medium mb-2">MeSH Terms</p>
                 <div className="flex flex-wrap gap-1.5">
-                  {paper.mesh_terms.map((m, i) => (
+                  {paper.mesh_terms!.map((m, i) => (
                     <Badge key={i} variant={m.is_major_topic ? 'default' : 'secondary'} className="text-xs">
                       {m.descriptor}
                     </Badge>
@@ -62,13 +81,13 @@ export function PaperDetailPanel({ paper, onClose }: PaperDetailPanelProps) {
             </>
           )}
 
-          {paper.genes.length > 0 && (
+          {(paper.genes?.length ?? 0) > 0 && (
             <>
               <Separator />
               <div>
                 <p className="font-medium mb-2">Genes</p>
                 <div className="flex flex-wrap gap-1.5">
-                  {paper.genes.map((g, i) => (
+                  {paper.genes!.map((g, i) => (
                     <Badge key={i} variant="outline" className="text-xs font-mono">
                       {g.gene_symbol} ×{g.mention_count}
                     </Badge>
@@ -78,13 +97,13 @@ export function PaperDetailPanel({ paper, onClose }: PaperDetailPanelProps) {
             </>
           )}
 
-          {paper.variants.length > 0 && (
+          {(paper.variants?.length ?? 0) > 0 && (
             <>
               <Separator />
               <div>
                 <p className="font-medium mb-2">Variants</p>
                 <div className="flex flex-wrap gap-1.5">
-                  {paper.variants.map((v, i) => (
+                  {paper.variants!.map((v, i) => (
                     <Badge key={i} variant="outline" className="text-xs font-mono">{v}</Badge>
                   ))}
                 </div>

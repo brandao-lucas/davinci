@@ -73,6 +73,15 @@ export function PapersTable({ papers, onSelect, onSelectionChange }: PapersTable
       size: 70,
     },
     {
+      accessorKey: 'pub_type',
+      header: 'Type',
+      size: 130,
+      cell: ({ getValue }) => {
+        const v = getValue<string>();
+        return v ? <span className="text-xs text-muted-foreground">{v}</span> : null;
+      },
+    },
+    {
       accessorKey: 'curation_status',
       header: 'Status',
       size: 100,
@@ -101,7 +110,7 @@ export function PapersTable({ papers, onSelect, onSelectionChange }: PapersTable
       const next = typeof updater === 'function' ? updater(rowSelection) : updater;
       setRowSelection(next);
       onSelectionChange?.(
-        Object.keys(next).filter((k) => next[k]).map((k) => papers[Number(k)]?.id).filter(Boolean)
+        Object.keys(next).filter((k) => next[k]).map(Number)
       );
     },
     getCoreRowModel: getCoreRowModel(),

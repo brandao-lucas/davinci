@@ -50,17 +50,31 @@ class ProjectPaperViewSet(
         )
 
         # Filters
-        curation_status = self.request.query_params.get('status')
+        curation_status = self.request.query_params.get('curation_status')
         if curation_status:
             qs = qs.filter(curation_status=curation_status)
 
-        year = self.request.query_params.get('year')
-        if year:
-            qs = qs.filter(paper__pub_year=year)
+        pub_year_min = self.request.query_params.get('pub_year_min')
+        if pub_year_min:
+            qs = qs.filter(paper__pub_year__gte=pub_year_min)
+
+        pub_year_max = self.request.query_params.get('pub_year_max')
+        if pub_year_max:
+            qs = qs.filter(paper__pub_year__lte=pub_year_max)
 
         journal = self.request.query_params.get('journal')
         if journal:
             qs = qs.filter(paper__journal__icontains=journal)
+
+        pub_type = self.request.query_params.get('pub_type')
+        if pub_type:
+            qs = qs.filter(paper__pub_type=pub_type)
+
+        if self.request.query_params.get('has_abstract') == 'true':
+            qs = qs.exclude(paper__abstract='')
+
+        if self.request.query_params.get('free_full_text') == 'true':
+            qs = qs.exclude(paper__pmc_id='')
 
         clinical_category = self.request.query_params.get('clinical_category')
         if clinical_category:

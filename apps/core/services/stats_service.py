@@ -113,34 +113,34 @@ class StatsService:
                 datasets_by_organism[row['dataset__organism']] = row['n']
 
         # ── Top genes ────────────────────────────────────────────────
-        top_genes = list(
-            PaperGene.objects.filter(paper_id__in=included_paper_ids)
+        top_genes = [
+            {'gene': row['gene_symbol'], 'count': row['total']}
+            for row in PaperGene.objects.filter(paper_id__in=included_paper_ids)
             .values('gene_symbol')
             .annotate(total=Sum('mention_count'))
             .order_by('-total')[:20]
-            .values('gene_symbol', 'total')
-        )
+        ]
 
         # ── Top drugs ────────────────────────────────────────────────
-        top_drugs = list(
-            PaperDrug.objects.filter(paper_id__in=included_paper_ids)
+        top_drugs = [
+            {'drug': row['drug_name'], 'count': row['total']}
+            for row in PaperDrug.objects.filter(paper_id__in=included_paper_ids)
             .values('drug_name')
             .annotate(total=Sum('mention_count'))
             .order_by('-total')[:20]
-            .values('drug_name', 'total')
-        )
+        ]
 
         # ── Top MeSH terms ───────────────────────────────────────────
-        top_mesh_terms = list(
-            PaperMeSHTerm.objects.filter(
+        top_mesh_terms = [
+            {'term': row['descriptor'], 'count': row['n']}
+            for row in PaperMeSHTerm.objects.filter(
                 paper_id__in=included_paper_ids,
                 is_major_topic=True,
             )
             .values('descriptor')
             .annotate(n=Count('id'))
             .order_by('-n')[:20]
-            .values('descriptor', 'n')
-        )
+        ]
 
         stats, _ = ProjectStats.objects.update_or_create(
             project=project,

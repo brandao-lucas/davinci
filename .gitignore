@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# Django
+db.sqlite3
+*.log
+
+# Firebase credentials — NEVER commit these
+config/firebase-service-account.json
+firebase-service-account.json
+
+# Rust
+rust_src/target/
+
+# Environment
+.env
+.env.local

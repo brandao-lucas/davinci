@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python manage.py migrate --check)",
+      "Bash(python manage.py shell -c \"from apps.core.models import ClinicalCategory, OmicCategory; print\\(f''ClinicalCategory: {ClinicalCategory.objects.count\\(\\)}, OmicCategory: {OmicCategory.objects.count\\(\\)}''\\)\")"
+    ]
+  }
+}

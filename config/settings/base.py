@@ -46,6 +46,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -131,12 +132,18 @@ _FIREBASE_CREDENTIALS_PATH = _os.environ.get(
     'FIREBASE_CREDENTIALS_PATH',
     str(BASE_DIR / 'firebase-service-account.json'),
 )
+_FIREBASE_CREDENTIALS_JSON = _os.environ.get('CREDENTIALS_FILE', None)
 try:
     import firebase_admin
+    import json as _json
     from firebase_admin import credentials as _fb_creds
-    if not firebase_admin._apps and _os.path.exists(_FIREBASE_CREDENTIALS_PATH):
-        _cred = _fb_creds.Certificate(_FIREBASE_CREDENTIALS_PATH)
-        firebase_admin.initialize_app(_cred)
+    if not firebase_admin._apps:
+        if _FIREBASE_CREDENTIALS_JSON:
+            _cred = _fb_creds.Certificate(_json.loads(_FIREBASE_CREDENTIALS_JSON))
+            firebase_admin.initialize_app(_cred)
+        elif _os.path.exists(_FIREBASE_CREDENTIALS_PATH):
+            _cred = _fb_creds.Certificate(_FIREBASE_CREDENTIALS_PATH)
+            firebase_admin.initialize_app(_cred)
 except ImportError:
     pass  # firebase-admin não instalado — FirebaseAuthentication retornará erro 401
 

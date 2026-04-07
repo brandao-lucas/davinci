@@ -11,13 +11,14 @@ export interface UserProfile {
   institution: string;
   research_area: string;
   avatar_url: string;
+  ncbi_api_key?: string;
 }
 
 export const authApi = {
   getMe: () =>
     apiClient.get<UserProfile>('/auth/me/'),
 
-  updateMe: (data: Partial<Pick<UserProfile, 'first_name' | 'last_name' | 'institution' | 'research_area'>>) =>
+  updateMe: (data: Partial<Pick<UserProfile, 'first_name' | 'last_name' | 'institution' | 'research_area' | 'ncbi_api_key'>>) =>
     apiClient.patch<UserProfile>('/auth/me/', data),
 
   verify: () =>

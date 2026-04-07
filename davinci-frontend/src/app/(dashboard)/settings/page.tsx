@@ -1,33 +1,41 @@
 'use client';
 
+import { useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { PageHeader } from '@/components/layout/page-header';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+import { Eye, EyeOff } from 'lucide-react';
 import { useAuth } from '@/lib/hooks/use-auth';
 import { authApi } from '@/lib/api/auth';
 import { useMutation } from '@tanstack/react-query';
 import { toast } from 'sonner';
 
-const schema = z.object({
+const profileSchema = z.object({
   first_name: z.string().min(1),
   last_name: z.string(),
   institution: z.string(),
   research_area: z.string(),
 });
 
-type FormData = z.infer<typeof schema>;
+const apiKeySchema = z.object({
+  ncbi_api_key: z.string().optional(),
+});
+
+type ProfileFormData = z.infer<typeof profileSchema>;
+type ApiKeyFormData = z.infer<typeof apiKeySchema>;
 
 export default function SettingsPage() {
   const { user, profile } = useAuth();
+  const [showNcbiKey, setShowNcbiKey] = useState(false);
 
-  const { register, handleSubmit } = useForm<FormData>({
-    resolver: zodResolver(schema),
+  const { register: registerProfile, handleSubmit: handleProfileSubmit } = useForm<ProfileFormData>({
+    resolver: zodResolver(profileSchema),
     defaultValues: {
       first_name: profile?.first_name ?? '',
       last_name: profile?.last_name ?? '',
@@ -36,9 +44,19 @@ export default function SettingsPage() {
     },
   });
 
-  const update = useMutation({
-    mutationFn: (data: FormData) => authApi.updateMe(data).then(r => r.data),
+  const { register: registerApiKey, handleSubmit: handleApiKeySubmit } = useForm<ApiKeyFormData>({
+    resolver: zodResolver(apiKeySchema),
+    defaultValues: { ncbi_api_key: '' },
+  });
+
+  const updateProfile = useMutation({
+    mutationFn: (data: ProfileFormData) => authApi.updateMe(data).then(r => r.data),
     onSuccess: () => toast.success('Profile updated'),
+  });
+
+  const updateApiKey = useMutation({
+    mutationFn: (data: ApiKeyFormData) => authApi.updateMe({ ncbi_api_key: data.ncbi_api_key }).then(r => r.data),
+    onSuccess: () => toast.success('API key saved'),
   });
 
   const initials = profile
@@ -54,7 +72,7 @@ export default function SettingsPage() {
           <CardTitle className="text-base">Profile</CardTitle>
         </CardHeader>
         <CardContent>
-          <form onSubmit={handleSubmit((d) => update.mutate(d))} className="space-y-4">
+          <form onSubmit={handleProfileSubmit((d) => updateProfile.mutate(d))} className="space-y-4">
             <div className="flex items-center gap-4">
               <Avatar className="h-16 w-16">
                 <AvatarImage src={profile?.avatar_url} />
@@ -69,26 +87,70 @@ export default function SettingsPage() {
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-1.5">
                 <Label>First name</Label>
-                <Input {...register('first_name')} />
+                <Input {...registerProfile('first_name')} />
               </div>
               <div className="space-y-1.5">
                 <Label>Last name</Label>
-                <Input {...register('last_name')} />
+                <Input {...registerProfile('last_name')} />
               </div>
             </div>
 
             <div className="space-y-1.5">
               <Label>Institution</Label>
-              <Input {...register('institution')} placeholder="University of São Paulo" />
+              <Input {...registerProfile('institution')} placeholder="University of São Paulo" />
             </div>
 
             <div className="space-y-1.5">
               <Label>Research area</Label>
-              <Input {...register('research_area')} placeholder="Cardiology, Genomics…" />
+              <Input {...registerProfile('research_area')} placeholder="Cardiology, Genomics…" />
             </div>
 
-            <Button type="submit" disabled={update.isPending}>
-              {update.isPending ? 'Saving…' : 'Save changes'}
+            <Button type="submit" disabled={updateProfile.isPending}>
+              {updateProfile.isPending ? 'Saving…' : 'Save changes'}
+            </Button>
+          </form>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">API Keys</CardTitle>
+          <CardDescription>
+            Your personal NCBI API key increases the rate limit from 3 to 10 requests/second.{' '}
+            <a
+              href="https://www.ncbi.nlm.nih.gov/account/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline underline-offset-2"
+            >
+              Get your key at ncbi.nlm.nih.gov
+            </a>
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={handleApiKeySubmit((d) => updateApiKey.mutate(d))} className="space-y-4">
+            <div className="space-y-1.5">
+              <Label>NCBI API Key</Label>
+              <div className="relative">
+                <Input
+                  {...registerApiKey('ncbi_api_key')}
+                  type={showNcbiKey ? 'text' : 'password'}
+                  placeholder="Paste your NCBI API key here"
+                  className="pr-10"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowNcbiKey(v => !v)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                  tabIndex={-1}
+                >
+                  {showNcbiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
+              </div>
+            </div>
+
+            <Button type="submit" disabled={updateApiKey.isPending}>
+              {updateApiKey.isPending ? 'Saving…' : 'Save key'}
             </Button>
           </form>
         </CardContent>

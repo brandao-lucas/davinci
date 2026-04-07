@@ -2,6 +2,7 @@
 
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Checkbox } from '@/components/ui/checkbox';
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
@@ -14,6 +15,20 @@ interface PaperFiltersProps {
 
 const STATUSES = ['pending', 'included', 'excluded', 'maybe'];
 
+const PUB_TYPES = [
+  'Journal Article',
+  'Review',
+  'Systematic Review',
+  'Meta-Analysis',
+  'Randomized Controlled Trial',
+  'Clinical Trial',
+  'Observational Study',
+  'Case Reports',
+  'Editorial',
+  'Letter',
+  'Comment',
+];
+
 export function PaperFiltersPanel({ filters, onChange }: PaperFiltersProps) {
   return (
     <div className="space-y-4">
@@ -21,13 +36,13 @@ export function PaperFiltersPanel({ filters, onChange }: PaperFiltersProps) {
         <Label>Status</Label>
         <Select
           value={filters.curation_status ?? ''}
-          onValueChange={(v) => onChange({ ...filters, curation_status: v || undefined })}
+          onValueChange={(v) => onChange({ ...filters, curation_status: v === 'all' ? undefined : v })}
         >
           <SelectTrigger>
             <SelectValue placeholder="All statuses" />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="">All</SelectItem>
+            <SelectItem value="all">All</SelectItem>
             {STATUSES.map((s) => (
               <SelectItem key={s} value={s}>{s}</SelectItem>
             ))}
@@ -63,6 +78,42 @@ export function PaperFiltersPanel({ filters, onChange }: PaperFiltersProps) {
           value={filters.journal ?? ''}
           onChange={(e) => onChange({ ...filters, journal: e.target.value || undefined })}
         />
+      </div>
+
+      <div className="space-y-1.5">
+        <Label>Publication type</Label>
+        <Select
+          value={filters.pub_type ?? 'all'}
+          onValueChange={(v) => onChange({ ...filters, pub_type: v === 'all' ? undefined : v })}
+        >
+          <SelectTrigger>
+            <SelectValue placeholder="All types" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All types</SelectItem>
+            {PUB_TYPES.map((t) => (
+              <SelectItem key={t} value={t}>{t}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      <div className="space-y-2 pt-1">
+        <Label className="text-xs uppercase tracking-wide text-muted-foreground">Content</Label>
+        <label className="flex items-center gap-2 cursor-pointer text-sm">
+          <Checkbox
+            checked={!!filters.has_abstract}
+            onCheckedChange={(v) => onChange({ ...filters, has_abstract: v ? true : undefined })}
+          />
+          With abstract
+        </label>
+        <label className="flex items-center gap-2 cursor-pointer text-sm">
+          <Checkbox
+            checked={!!filters.free_full_text}
+            onCheckedChange={(v) => onChange({ ...filters, free_full_text: v ? true : undefined })}
+          />
+          Free full text
+        </label>
       </div>
     </div>
   );

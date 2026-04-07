@@ -1,7 +1,7 @@
 export interface OmicDataset {
   id: number;
   accession: string;
-  source_db: 'GEO' | 'SRA' | 'BioProject' | 'ArrayExpress' | 'TCGA';
+  source_db: 'geo' | 'sra' | 'bioproject' | 'gwas_catalog' | 'arrayexpress' | 'tcga';
   bioproject_id: string | null;
   title: string;
   summary: string;
@@ -21,6 +21,7 @@ export interface DatasetFilters {
   omic_type?: string;
   organism?: string;
   source_db?: string;
+  has_summary?: boolean;
   search?: string;
   ordering?: string;
   page?: number;

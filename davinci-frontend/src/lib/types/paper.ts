@@ -8,11 +8,12 @@ export interface Paper {
   journal: string;
   pub_year: number;
   pub_month: number | null;
-  authors: PaperAuthor[];
-  keywords: string[];
-  mesh_terms: MeSHTerm[];
-  genes: PaperGene[];
-  variants: string[];
+  pub_type: string;
+  authors?: PaperAuthor[];
+  keywords?: string[];
+  mesh_terms?: MeSHTerm[];
+  genes?: PaperGene[];
+  variants?: string[];
   curation_status: 'pending' | 'included' | 'excluded' | 'maybe';
   exclusion_reason: string | null;
   notes: string;
@@ -44,6 +45,9 @@ export interface PaperFilters {
   pub_year_min?: number;
   pub_year_max?: number;
   journal?: string;
+  pub_type?: string;
+  has_abstract?: boolean;
+  free_full_text?: boolean;
   search?: string;
   ordering?: string;
   page?: number;

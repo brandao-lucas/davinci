@@ -1,6 +1,9 @@
 import csv
 import io
 
+import uuid
+
+from django.db import IntegrityError
 from django.http import JsonResponse, StreamingHttpResponse
 from django.utils.text import slugify
 from rest_framework import viewsets, status
@@ -22,14 +25,23 @@ class DaVinciProjectViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         title = serializer.validated_data.get('title', 'project')
-        slug = slugify(f"{title}-{self.request.user.username}-davinci")
-        serializer.save(user=self.request.user, slug=slug)
+        base_slug = slugify(f"{title}-{self.request.user.username}-davinci")
+        slug = base_slug
+        for attempt in range(6):
+            try:
+                if attempt > 0:
+                    slug = f"{base_slug}-{uuid.uuid4().hex[:6]}"
+                serializer.save(user=self.request.user, slug=slug)
+                return
+            except IntegrityError:
+                continue
+        raise IntegrityError(f"Could not generate unique slug for '{title}'")
 
     @action(detail=True, methods=['post'])
     def search(self, request, pk=None):
         """Dispara busca no PubMed."""
         project = self.get_object()
-        job = SearchService.dispatch_pubmed_search(project)
+        job = SearchService.dispatch_pubmed_search(project, user=request.user)
         return Response(
             {'job_id': str(job.id), 'status': job.status},
             status=status.HTTP_202_ACCEPTED,
@@ -42,7 +54,7 @@ class DaVinciProjectViewSet(viewsets.ModelViewSet):
         sources = request.data.get('sources', None)
         max_per_source = request.data.get('max_per_source', 500)
         job = SearchService.dispatch_omics_search(
-            project, sources=sources, max_per_source=max_per_source
+            project, sources=sources, max_per_source=max_per_source, user=request.user
         )
         return Response(
             {'job_id': str(job.id), 'status': job.status},

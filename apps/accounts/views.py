@@ -17,11 +17,23 @@ class MeView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        profile = UserProfile.objects.select_related('user').get(user=request.user)
+        profile, _created = UserProfile.objects.select_related('user').get_or_create(
+            user=request.user,
+            defaults={
+                'firebase_uid': getattr(request.user, 'username', '') or str(request.user.pk),
+                'auth_provider': 'password',
+            },
+        )
         return Response(UserProfileSerializer(profile).data)
 
     def patch(self, request):
-        profile = UserProfile.objects.select_related('user').get(user=request.user)
+        profile, _created = UserProfile.objects.select_related('user').get_or_create(
+            user=request.user,
+            defaults={
+                'firebase_uid': getattr(request.user, 'username', '') or str(request.user.pk),
+                'auth_provider': 'password',
+            },
+        )
         serializer = UserProfileUpdateSerializer(profile, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()

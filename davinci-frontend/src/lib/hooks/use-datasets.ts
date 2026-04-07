@@ -18,6 +18,18 @@ export function useDataset(projectId: string, datasetId: number) {
   });
 }
 
+export function useBulkCurateDataset(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { dataset_ids: number[]; curation_status: string; exclusion_reason?: string }) =>
+      datasetsApi.bulkCurate(projectId, data).then(r => r.data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['datasets', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['projects', projectId] });
+    },
+  });
+}
+
 export function useCurateDataset(projectId: string) {
   const queryClient = useQueryClient();
   return useMutation({

@@ -14,20 +14,23 @@ class OmicDatasetSerializer(serializers.ModelSerializer):
 
 
 class ProjectDatasetListSerializer(serializers.ModelSerializer):
-    """Compact list representation."""
+    """Compact list — includes summary and platform for the detail panel."""
     accession = serializers.CharField(source='dataset.accession', read_only=True)
     source_db = serializers.CharField(source='dataset.source_db', read_only=True)
+    bioproject_id = serializers.CharField(source='dataset.bioproject_id', read_only=True)
     title = serializers.CharField(source='dataset.title', read_only=True)
+    summary = serializers.CharField(source='dataset.summary', read_only=True)
     omic_type = serializers.CharField(source='dataset.omic_type', read_only=True)
     omic_subcategory = serializers.CharField(source='dataset.omic_subcategory', read_only=True)
     organism = serializers.CharField(source='dataset.organism', read_only=True)
-    n_samples = serializers.IntegerField(source='dataset.n_samples', read_only=True)
+    n_samples = serializers.IntegerField(source='dataset.n_samples', read_only=True, allow_null=True)
+    platform = serializers.CharField(source='dataset.platform', read_only=True)
 
     class Meta:
         model = ProjectDataset
         fields = [
-            'id', 'accession', 'source_db', 'title',
-            'omic_type', 'omic_subcategory', 'organism', 'n_samples',
+            'id', 'accession', 'source_db', 'bioproject_id', 'title', 'summary',
+            'omic_type', 'omic_subcategory', 'organism', 'n_samples', 'platform',
             'curation_status', 'exclusion_reason', 'notes',
             'relevance_score', 'added_at', 'curated_at',
         ]

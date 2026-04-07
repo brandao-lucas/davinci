@@ -97,7 +97,7 @@ class PaperApiTests(APITestCase):
 
     def test_list_papers_filter_by_status(self):
         make_project_paper(self.project, make_paper(pmid=1002), curation_status='included')
-        response = self.client.get(self.base, {'status': 'included'})
+        response = self.client.get(self.base, {'curation_status': 'included'})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data['results']), 1)
         self.assertEqual(response.data['results'][0]['curation_status'], 'included')
