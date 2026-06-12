@@ -22,6 +22,7 @@ paper_search = ProjectPaperViewSet.as_view({'get': 'search'})
 
 dataset_list = ProjectDatasetViewSet.as_view({'get': 'list'})
 dataset_detail = ProjectDatasetViewSet.as_view({'get': 'retrieve', 'patch': 'partial_update'})
+dataset_bulk_curate = ProjectDatasetViewSet.as_view({'post': 'bulk_curate'})
 dataset_search = ProjectDatasetViewSet.as_view({'get': 'search'})
 
 category_list = UserCategoryViewSet.as_view({'get': 'list', 'post': 'create'})
@@ -53,6 +54,7 @@ urlpatterns = [
     # Datasets
     path(f'{PROJECT_PREFIX}datasets/', dataset_list, name='project-dataset-list'),
     path(f'{PROJECT_PREFIX}datasets/search/', dataset_search, name='project-dataset-search'),
+    path(f'{PROJECT_PREFIX}datasets/bulk_curate/', dataset_bulk_curate, name='project-dataset-bulk-curate'),
     path(f'{PROJECT_PREFIX}datasets/<int:pk>/', dataset_detail, name='project-dataset-detail'),
 
     # Custom categories
