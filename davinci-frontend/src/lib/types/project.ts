@@ -25,11 +25,15 @@ export interface ProjectStats {
   total_samples: number;
   papers_by_year: Record<string, number>;
   papers_by_journal: Record<string, number>;
+  papers_by_country: Record<string, number>;
+  papers_by_clinical_category: Record<string, number>;
   datasets_by_omic_type: Record<string, number>;
   datasets_by_organism: Record<string, number>;
   top_genes: Array<{ gene: string; count: number }>;
+  top_drugs: Array<{ drug: string; count: number }>;
   top_mesh_terms: Array<{ term: string; count: number }>;
   top_variants: Array<{ rs: string; count: number }>;
+  last_computed: string | null;
 }
 
 export interface CreateProjectInput {

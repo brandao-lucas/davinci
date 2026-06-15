@@ -7,7 +7,7 @@ class ProjectStatsSerializer(serializers.ModelSerializer):
         model = ProjectStats
         fields = [
             'total_papers', 'included_papers', 'excluded_papers', 'pending_papers',
-            'total_datasets', 'included_datasets', 'total_samples',
+            'total_datasets', 'included_datasets', 'total_samples', 'included_samples',
             'papers_by_year', 'papers_by_journal', 'papers_by_country',
             'papers_by_clinical_category', 'datasets_by_omic_type',
             'datasets_by_organism', 'top_genes', 'top_drugs',

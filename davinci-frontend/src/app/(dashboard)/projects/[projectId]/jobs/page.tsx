@@ -3,11 +3,12 @@
 import { use } from 'react';
 import { PageHeader } from '@/components/layout/page-header';
 import { JobStatusCard } from '@/components/jobs/job-status-card';
+import { QueryErrorState } from '@/components/ui/query-error-state';
 import { useJobs } from '@/lib/hooks/use-jobs';
 
 export default function JobsPage({ params }: { params: Promise<{ projectId: string }> }) {
   const { projectId } = use(params);
-  const { data, isLoading } = useJobs(projectId);
+  const { data, isLoading, isError, error, refetch } = useJobs(projectId);
   const jobs = data?.results ?? [];
 
   return (
@@ -20,6 +21,8 @@ export default function JobsPage({ params }: { params: Promise<{ projectId: stri
             <div key={i} className="h-28 bg-muted rounded-lg animate-pulse" />
           ))}
         </div>
+      ) : isError ? (
+        <QueryErrorState error={error} onRetry={() => refetch()} />
       ) : jobs.length === 0 ? (
         <p className="text-center py-16 text-muted-foreground">No jobs yet. Start a search to ingest data.</p>
       ) : (

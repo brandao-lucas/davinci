@@ -1,5 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { toast } from 'sonner';
 import { datasetsApi } from '@/lib/api/datasets';
+import { extractApiErrorMessage } from '@/lib/utils/api-error';
 import type { DatasetFilters } from '@/lib/types/dataset';
 
 export function useDatasets(projectId: string, filters?: DatasetFilters) {
@@ -23,9 +25,13 @@ export function useBulkCurateDataset(projectId: string) {
   return useMutation({
     mutationFn: (data: { dataset_ids: number[]; curation_status: string; exclusion_reason?: string }) =>
       datasetsApi.bulkCurate(projectId, data).then(r => r.data),
-    onSuccess: () => {
+    onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['datasets', projectId] });
       queryClient.invalidateQueries({ queryKey: ['projects', projectId] });
+      toast.success(`${data.updated} datasets atualizados`);
+    },
+    onError: (err) => {
+      toast.error(extractApiErrorMessage(err, 'Falha na curadoria em lote'));
     },
   });
 }
@@ -40,6 +46,10 @@ export function useCurateDataset(projectId: string) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['datasets', projectId] });
       queryClient.invalidateQueries({ queryKey: ['projects', projectId] });
+      toast.success('Curadoria atualizada');
+    },
+    onError: (err) => {
+      toast.error(extractApiErrorMessage(err, 'Falha ao atualizar curadoria'));
     },
   });
 }

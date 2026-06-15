@@ -33,26 +33,30 @@ Rust Engine
 ### `copy_papers(papers: Vec<PaperData>, conn: &Client) → Result<usize>`
 
 ```sql
--- Estrutura do COPY
-COPY core_paper (
-    pmid, title, abstract_text, journal,
-    pub_year, pub_month, pub_type, pmc_id, doi,
-    free_full_text, raw_xml_hash, search_vector,
-    created_at, updated_at
+-- Estrutura do COPY (via staging table _staging_paper)
+COPY _staging_paper (
+    pmid, pmc_id, doi, title, abstract, journal,
+    pub_year, pub_month, pub_type, raw_xml_hash,
+    ingested_at, updated_at
 )
-FROM STDIN WITH (FORMAT BINARY)
+FROM STDIN (FORMAT CSV)
 
--- ON CONFLICT: upsert inteligente
-INSERT ... ON CONFLICT (pmid) DO UPDATE SET
+-- Upsert para core_paper
+INSERT INTO core_paper (pmid, pmc_id, doi, title, "abstract", journal,
+    pub_year, pub_month, pub_type, raw_xml_hash, ingested_at, updated_at)
+SELECT ... FROM _staging_paper
+ON CONFLICT (pmid) DO UPDATE SET
     title = EXCLUDED.title,
-    abstract_text = EXCLUDED.abstract_text,
+    "abstract" = EXCLUDED."abstract",
     raw_xml_hash = EXCLUDED.raw_xml_hash,
-    -- só atualiza se hash mudou (detecção de mudança)
     updated_at = now()
 WHERE core_paper.raw_xml_hash != EXCLUDED.raw_xml_hash
 ```
 
-**Nota:** `search_vector` é atualizado automaticamente pelo trigger PostgreSQL após o INSERT/UPDATE — o Rust não precisa calculá-lo.
+**Notas:**
+- Coluna no banco é `abstract` (não `abstract_text`). O Rust struct interno usa `abstract_text`; o mapeamento é feito explicitamente no COPY writer.
+- `search_vector` é atualizado automaticamente pelo trigger PostgreSQL após INSERT/UPDATE.
+- Não há coluna `free_full_text` no modelo atual.
 
 ---
 
@@ -86,12 +90,12 @@ ON CONFLICT (unique_constraint) DO NOTHING  -- deduplicação silenciosa
 
 ```sql
 COPY core_omicdataset (
-    accession, source_db, title, summary,
+    accession, source_db, bioproject_id, title, summary,
     omic_type, omic_subcategory, organism, tax_id,
-    n_samples, platform, pub_date, extra_metadata,
-    created_at, updated_at
+    n_samples, platform, extra_metadata, is_active,
+    ingested_at, updated_at
 )
-FROM STDIN WITH (FORMAT BINARY)
+FROM STDIN (FORMAT CSV)
 
 ON CONFLICT (accession) DO UPDATE SET
     title = EXCLUDED.title,
@@ -195,14 +199,13 @@ WHERE id = $1
 pub struct PaperData {
     pub pmid: String,
     pub title: String,
-    pub abstract_text: Option<String>,
+    pub abstract_text: String,       // Mapeado para coluna "abstract" no banco
     pub journal: String,
     pub pub_year: i32,
     pub pub_month: Option<i32>,
     pub pub_type: Option<String>,
     pub pmc_id: Option<String>,
     pub doi: Option<String>,
-    pub free_full_text: bool,
     pub raw_xml_hash: String,        // SHA-256 do XML original
     pub authors: Vec<AuthorData>,
     pub keywords: Vec<String>,
@@ -218,7 +221,7 @@ pub struct PaperData {
 ```rust
 pub struct OmicDatasetData {
     pub accession: String,
-    pub source_db: String,
+    pub source_db: String,           // 'geo' | 'sra' | 'bioproject' | 'gwas_catalog'
     pub title: String,
     pub summary: Option<String>,
     pub omic_type: String,           // Classificado por type_classifier
@@ -227,9 +230,8 @@ pub struct OmicDatasetData {
     pub tax_id: Option<String>,
     pub n_samples: Option<i32>,
     pub platform: Option<String>,
-    pub pub_date: Option<NaiveDate>,
     pub extra_metadata: serde_json::Value,
-    pub linked_pmids: Vec<String>,   // PMIDs vinculados
+    // Nota: pub_date foi removido — não há coluna correspondente no schema Django
 }
 ```
 
@@ -267,6 +269,7 @@ Mesmo padrão para datasets: `accession → dataset.id`.
 | `0003_paper_pub_type.py` | Adiciona `pub_type` ao Paper |
 | `0004_alter_omicdataset_omic_type.py` | Atualiza choices de omic_type |
 | `0005_projectstats_omic_subcategory_and_more.py` | Adiciona subcategoria e campos Phase 4 |
+| `0006_datasetpaperlinkpending.py` | Adiciona staging table para links dataset ↔ paper pendentes |
 
 ### Triggers e Índices Especiais (RunSQL)
 
@@ -278,7 +281,8 @@ migrations.RunSQL(
     CREATE TRIGGER paper_search_vector_update
     BEFORE INSERT OR UPDATE ON core_paper
     FOR EACH ROW EXECUTE FUNCTION
-    tsvector_update_trigger(search_vector, 'pg_catalog.english', title, abstract_text);
+    tsvector_update_trigger(search_vector, 'pg_catalog.english', title, abstract);
+    -- Coluna é "abstract", não "abstract_text"
 
     -- Trigger FTS para OmicDataset
     CREATE TRIGGER dataset_search_vector_update

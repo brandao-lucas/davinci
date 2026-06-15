@@ -19,3 +19,7 @@ rust_src/target/
 # Environment
 .env
 .env.local
+
+
+#ia
+.claude/

@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from 'next/server';
 
-const DJANGO = process.env.DJANGO_INTERNAL_URL ?? 'http://localhost:8000';
+const DJANGO = process.env.DJANGO_INTERNAL_URL ?? 'http://localhost:8001';
 
 async function proxy(req: NextRequest): Promise<NextResponse> {
   // Build the Django URL — Next.js strips trailing slashes from pathname,

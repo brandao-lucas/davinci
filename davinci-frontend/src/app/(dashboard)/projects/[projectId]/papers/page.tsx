@@ -7,6 +7,7 @@ import { PaperDetailPanel } from '@/components/papers/paper-detail-panel';
 import { PaperFiltersPanel } from '@/components/papers/paper-filters';
 import { BulkCurationBar } from '@/components/papers/bulk-curation-bar';
 import { Input } from '@/components/ui/input';
+import { QueryErrorState } from '@/components/ui/query-error-state';
 import { usePapers } from '@/lib/hooks/use-papers';
 import { useDebounce } from '@/lib/hooks/use-debounce';
 import { useFilterStore } from '@/lib/stores/filter-store';
@@ -28,7 +29,7 @@ export default function PapersPage({ params }: { params: Promise<{ projectId: st
     search: debouncedQuery || undefined,
   };
 
-  const { data, isLoading } = usePapers(projectId, activeFilters);
+  const { data, isLoading, isError, error, refetch } = usePapers(projectId, activeFilters);
   const papers = data?.results ?? [];
 
   return (
@@ -56,6 +57,8 @@ export default function PapersPage({ params }: { params: Promise<{ projectId: st
 
           {isLoading ? (
             <div className="h-64 bg-muted rounded-lg animate-pulse" />
+          ) : isError ? (
+            <QueryErrorState error={error} onRetry={() => refetch()} />
           ) : (
             <PapersTable
               papers={papers}

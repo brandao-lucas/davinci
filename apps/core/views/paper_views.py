@@ -167,7 +167,7 @@ class ProjectPaperViewSet(
         valid_statuses = [s.value for s in ProjectPaper.CurationStatus]
         if new_status not in valid_statuses:
             return Response(
-                {'detail': f'Invalid status. Choose from {valid_statuses}.'},
+                {'detail': f"Invalid status {new_status!r}. Choose from {valid_statuses}."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if not paper_ids:

@@ -1,7 +1,7 @@
 from django.db.models import Count, Sum, Q
 
 from apps.core.models import (
-    DaVinciProject, ProjectStats, ProjectPaper, ProjectDataset,
+    DaVinciProject, ProjectStats, ProjectPaper, ProjectDataset, ProjectSample,
     PaperAuthor, PaperGene, PaperDrug, PaperMeSHTerm,
     ProjectPaperClinicalCategory,
 )
@@ -38,10 +38,23 @@ class StatsService:
             project=project,
             curation_status=ProjectDataset.CurationStatus.INCLUDED,
         ).count()
-        total_samples = (
-            ProjectDataset.objects.filter(project=project)
-            .aggregate(s=Sum('dataset__n_samples'))['s'] or 0
-        )
+
+        # total_samples: usa ProjectSample reais quando disponíveis; caso contrário
+        # cai de volta na soma de OmicDataset.n_samples (estimativa do esummary).
+        # Isso garante que o número não regrida enquanto samples ainda não foram ingeridos.
+        real_sample_count = ProjectSample.objects.filter(project=project).count()
+        if real_sample_count > 0:
+            total_samples = real_sample_count
+        else:
+            total_samples = (
+                ProjectDataset.objects.filter(project=project)
+                .aggregate(s=Sum('dataset__n_samples'))['s'] or 0
+            )
+
+        included_samples = ProjectSample.objects.filter(
+            project=project,
+            curation_status=ProjectSample.CurationStatus.INCLUDED,
+        ).count()
 
         # ── Papers by year ────────────────────────────────────────────
         papers_by_year = {}
@@ -152,6 +165,7 @@ class StatsService:
                 'total_datasets': total_datasets,
                 'included_datasets': included_datasets,
                 'total_samples': total_samples,
+                'included_samples': included_samples,
                 'papers_by_year': papers_by_year,
                 'papers_by_journal': papers_by_journal,
                 'papers_by_country': papers_by_country,

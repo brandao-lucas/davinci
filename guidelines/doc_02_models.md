@@ -74,18 +74,18 @@ Registro global de paper do PubMed/PMC. Chave natural = PMID.
 | `pmc_id` | CharField optional | PubMed Central ID |
 | `doi` | CharField optional | Digital Object Identifier |
 | `title` | TextField | Título do paper |
-| `abstract_text` | TextField | Abstract completo |
+| `abstract` | TextField | Abstract completo |
 | `journal` | CharField | Nome do periódico |
 | `pub_year` | IntegerField | Ano de publicação |
 | `pub_month` | IntegerField optional | Mês de publicação |
 | `pub_type` | CharField optional | Tipo: Review, RCT, Systematic Review, etc. |
-| `free_full_text` | BooleanField | Se há texto completo livre (PMC) |
 | `search_vector` | SearchVectorField | FTS do PostgreSQL (auto-atualizado via trigger) |
 | `raw_xml_hash` | CharField | SHA-256 do XML para detecção de mudanças |
-| `created_at` | DateTimeField auto | |
+| `ingested_at` | DateTimeField auto | Timestamp de primeira ingestão |
 | `updated_at` | DateTimeField auto | |
 
-**Índices:** GIN em `search_vector`, `pmid` (unique)
+**Índices:** GIN em `search_vector`, `pmid` (unique), `pub_year`, `journal`
+**Nota:** O Rust struct usa o nome `abstract_text`; o mapeamento para a coluna `abstract` é feito no COPY writer.
 **Conexões:** `PaperAuthor` (1:N), `PaperKeyword` (1:N), `PaperMeSHTerm` (1:N), `PaperGene` (1:N), `PaperDrug` (1:N), `PaperVariant` (1:N), `EntityContext` (1:N), `DatasetPaperLink` (M2M → OmicDataset)
 
 ---
@@ -219,20 +219,21 @@ Registro global de dataset ômico (GEO, SRA, BioProject, etc.). Chave natural = 
 | `source_db` | CharField | `geo`, `sra`, `arrayexpress`, `tcga`, `bioproject`, `gwas_catalog` |
 | `title` | TextField | Título do dataset |
 | `summary` | TextField optional | Resumo/descrição |
-| `omic_type` | CharField | `genomic`, `transcriptomic`, `proteomic`, `metabolomic`, `epigenomic`, `metagenomic`, `microbiome`, `multi_omic`, `other` |
+| `omic_type` | CharField | `genomic`, `transcriptomic`, `proteomic`, `metabolomic`, `epigenomic`, `metagenomic`, `microbiome`, `multi_omic`, `other` — multi-valor separado por vírgula |
 | `omic_subcategory` | CharField optional | Ex: "RNA-Seq", "WGS", "ChIP-Seq", "16S rRNA" |
 | `organism` | CharField optional | Organismo (ex: "Homo sapiens") |
-| `tax_id` | CharField optional | NCBI Taxonomy ID |
+| `tax_id` | IntegerField optional | NCBI Taxonomy ID |
 | `n_samples` | IntegerField optional | Número de amostras |
 | `platform` | CharField optional | Plataforma experimental |
-| `pub_date` | DateField optional | Data de publicação |
 | `extra_metadata` | JSONField | Campos específicos da fonte (traits, p-values, etc.) |
+| `is_active` | BooleanField | Soft-delete |
 | `search_vector` | SearchVectorField | FTS em título + summary (trigger) |
-| `created_at` | DateTimeField auto | |
+| `ingested_at` | DateTimeField auto | Timestamp de primeira ingestão |
 | `updated_at` | DateTimeField auto | |
 
-**Índices:** GIN em `search_vector`, `(source_db, omic_type)`, `accession` (unique)
-**Conexões:** `DatasetPaperLink` (M2M → Paper), `ProjectDataset` (1:N)
+**Índices:** GIN em `search_vector`, `omic_type`, `organism`, `source_db`, `n_samples`, `accession` (unique)
+**Nota:** ArrayExpress e TCGA existem como `SourceDB` choices mas não têm parser de ingestão implementado.
+**Conexões:** `DatasetPaperLink` (M2M → Paper via through), `DatasetPaperLinkPending` (staging), `ProjectDataset` (1:N)
 
 ---
 
@@ -249,6 +250,21 @@ Relacionamento M2M entre `OmicDataset` e `Paper`.
 
 ---
 
+### `DatasetPaperLinkPending`
+Staging table para links dataset ↔ paper aguardando resolução de FK. Criada na migration 0006.
+
+| Campo | Tipo | Descrição |
+|-------|------|-----------|
+| `dataset_accession` | CharField | Accession do dataset (ainda sem FK resolvida) |
+| `paper_pmid` | BigIntegerField | PMID do paper (ainda sem FK resolvida) |
+| `link_source` | CharField | `elink`, `geo_xml`, etc. |
+| `created_at` | DateTimeField auto | |
+
+**Unique:** `(dataset_accession, paper_pmid)`
+**Fluxo:** Rust popula durante ingestão ômica; Django resolve após ingestão de papers quando ambos os FKs existirem.
+
+---
+
 ## Configurações Globais
 
 ### `OmicCategory`
@@ -257,7 +273,6 @@ Categorias ômicas pré-definidas. Usadas pelo Rust para classificação automá
 | Campo | Tipo | Descrição |
 |-------|------|-----------|
 | `omic_type` | CharField unique | `genomic`, `transcriptomic`, etc. |
-| `display_name` | CharField | Nome de exibição |
 | `keywords` | JSONField | Keywords para classificação heurística |
 | `priority` | IntegerField | Ordem de verificação (mais específico primeiro) |
 | `is_active` | BooleanField | Habilita/desabilita |
@@ -336,7 +351,7 @@ Curadoria de um dataset ômico dentro de um projeto.
 |-------|------|-----------|
 | `project` | FK → DaVinciProject (CASCADE) | |
 | `dataset` | FK → OmicDataset (CASCADE) | |
-| `curation_status` | CharField | `pending`, `included`, `excluded`, `queued`, `downloaded` |
+| `curation_status` | CharField | `pending`, `included`, `excluded`, `maybe`, `queued` (fila de download), `downloaded` |
 | `exclusion_reason` | CharField optional | |
 | `notes` | TextField optional | |
 | `relevance_score` | FloatField | 0.0–1.0 |
@@ -449,8 +464,9 @@ DaVinciProject (user FK)
 CREATE TRIGGER paper_fts_update
 BEFORE INSERT OR UPDATE ON core_paper
 FOR EACH ROW EXECUTE FUNCTION tsvector_update_trigger(
-  search_vector, 'pg_catalog.english', title, abstract_text
+  search_vector, 'pg_catalog.english', title, abstract
 );
+-- Nota: coluna é "abstract" (não abstract_text)
 ```
 
 ### Trigger FTS — `OmicDataset`

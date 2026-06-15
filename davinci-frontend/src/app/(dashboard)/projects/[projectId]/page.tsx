@@ -8,6 +8,7 @@ import { Badge } from '@/components/ui/badge';
 import { useProject, useProjectStats, useDispatchSearch } from '@/lib/hooks/use-projects';
 import { useJobs, useJobPolling } from '@/lib/hooks/use-jobs';
 import { JobStatusCard } from '@/components/jobs/job-status-card';
+import { descriptorsChangedSinceLastSearch } from '@/lib/utils/descriptor-diff';
 import { Loader2, Play } from 'lucide-react';
 
 export default function ProjectOverviewPage({ params }: { params: Promise<{ projectId: string }> }) {
@@ -26,6 +27,21 @@ export default function ProjectOverviewPage({ params }: { params: Promise<{ proj
   const jobIsActive = latestJob?.status === 'pending' || latestJob?.status === 'running';
   const isProcessing = dispatchSearch.isPending || jobIsActive;
 
+  // Desabilita o botão quando os descritores não mudaram desde a última busca concluída
+  const descriptorsChanged = project
+    ? descriptorsChangedSinceLastSearch(project, jobs?.results, 'pubmed_search')
+    : true;
+  const alreadySearched = !descriptorsChanged;
+
+  const isSearchDisabled = isProcessing || alreadySearched;
+
+  let searchButtonTitle: string | undefined;
+  if (dispatchSearch.isError) {
+    searchButtonTitle = 'Failed to start search — check if Celery worker is running';
+  } else if (alreadySearched && !isProcessing) {
+    searchButtonTitle = 'Já buscado com os descritores atuais. Altere termo/sinônimos/datas para rebuscar.';
+  }
+
   if (isLoading) {
     return <div className="h-40 bg-muted rounded-lg animate-pulse" />;
   }
@@ -42,9 +58,9 @@ export default function ProjectOverviewPage({ params }: { params: Promise<{ proj
             <Badge variant="outline">{project.status}</Badge>
             <Button
               onClick={() => dispatchSearch.mutate()}
-              disabled={isProcessing}
+              disabled={isSearchDisabled}
               variant={dispatchSearch.isError ? 'destructive' : 'default'}
-              title={dispatchSearch.isError ? 'Failed to start search — check if Celery worker is running' : undefined}
+              title={searchButtonTitle}
             >
               {isProcessing
                 ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" />Processing request…</>
@@ -57,7 +73,7 @@ export default function ProjectOverviewPage({ params }: { params: Promise<{ proj
         }
       />
 
-      {stats && <ProjectStatsOverview stats={stats} />}
+      {stats && <ProjectStatsOverview stats={stats} projectId={projectId} />}
 
       {latestJob && (
         <div>

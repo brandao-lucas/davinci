@@ -30,8 +30,9 @@ Hoje, esse processo é manual, fragmentado e lento. O DaVinci automatiza as etap
 | **Banco de Dados** | PostgreSQL | Armazenamento principal + FTS nativo |
 | **Filas Assíncronas** | Celery + Redis | Processamento em background |
 | **Autenticação** | Firebase Authentication | SSO (Google, OrcID, email/senha) |
-| **Frontend** | Next.js 15 + TypeScript | Interface do pesquisador |
+| **Frontend** | Next.js 16.2 + React 19 + TypeScript | Interface do pesquisador |
 | **UI** | Tailwind CSS + Shadcn/ui | Componentes de interface |
+| **Desktop** | Tauri 2 | Wrapper desktop (planejado) |
 
 ---
 
@@ -81,9 +82,9 @@ Pesquisador → exportação (JSON/CSV para IA generativa)
 | **GEO** | Dados ômicos (transcriptômica, etc.) | NCBI E-utilities |
 | **SRA** | Dados de sequenciamento bruto | NCBI E-utilities |
 | **BioProject** | Projetos de pesquisa ômicos | NCBI E-utilities |
-| **GWAS Catalog** | Associações genéticas | NHGRI API |
-| **ArrayExpress** | Dados de expressão gênica | EBI |
-| **TCGA** | Dados de câncer | NCI GDC |
+| **GWAS Catalog** | Associações genéticas | EBI REST API |
+| **ArrayExpress** | Dados de expressão gênica | _Schema previsto — parser não implementado_ |
+| **TCGA** | Dados de câncer | _Schema previsto — parser não implementado_ |
 
 ---
 
@@ -112,7 +113,7 @@ Pesquisador → exportação (JSON/CSV para IA generativa)
 - Curadoria em lote via `bulk_curate` endpoint
 - Links literatura ↔ ômica com confirmação manual (`confirmed / rejected / auto`)
 
-### Análise e Exportação
+### Análise e Exportação _(Fase 5 — não implementado)_
 - `ProjectStats` com cache de agregações (genes top, MeSH top, distribuição por ano/journal/país)
 - Export em JSON ou CSV dos papers e datasets incluídos
 - Dados estruturados para uso como base de conhecimento de IA generativa
@@ -181,7 +182,7 @@ davinci/
 │       │   └── stats_service.py    — Cálculo de estatísticas
 │       └── tasks/
 │           └── ingestion_tasks.py  — Celery tasks
-├── rust_engine/
+├── rust_src/
 │   └── src/
 │       ├── lib.rs              — Entry point PyO3
 │       ├── ncbi/               — NCBI E-utilities client

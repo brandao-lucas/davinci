@@ -68,13 +68,13 @@ pub async fn fetch_sra_datasets(
         return Ok((vec![], vec![]));
     }
 
-    // Step 2 — esummary in batches of 100
+    // Step 2 — esummary in batches of 25 (NCBI GET URL length limit ~4KB)
     // Deduplicate by Study accession (SRP) — multiple UIDs can belong to the same study
     let mut study_map: HashMap<String, OmicDatasetData> = HashMap::new();
     let mut uid_to_acc: HashMap<String, String> = HashMap::new();
     let mut all_links: Vec<DatasetPaperLinkData> = Vec::new();
 
-    for chunk in uids.chunks(100) {
+    for chunk in uids.chunks(25) {
         let ids_csv = chunk.join(",");
         let summary_params = [
             ("db", "sra"),

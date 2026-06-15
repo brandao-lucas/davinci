@@ -1,6 +1,25 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+/// Mirrors the core_omicsample columns written via COPY.
+///
+/// `dataset_id` is the PK integer of the parent OmicDataset row (FK).
+/// `accession` is the natural key: GSM*, SRX*/SRS*, etc.
+/// `ingested_at` and `updated_at` are set by the COPY writer; `ingested_at`
+/// is never overwritten on conflict (only `updated_at` changes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OmicSampleData {
+    pub dataset_id: i64,           // FK → core_omicdataset.id (PK integer)
+    pub accession: String,         // GSM*, SRX*/SRS*/SRR* — natural key, globally unique
+    pub title: String,
+    pub source_name: String,       // tissue / cell line / condition
+    pub organism: String,
+    pub tax_id: Option<i32>,
+    pub platform: String,          // GPL* for GEO, instrument model for SRA
+    pub characteristics: JsonValue, // key→value JSONB (e.g. {"age": "25", "tissue": "liver"})
+    pub extra_metadata: JsonValue,  // raw fields not mapped above
+}
+
 /// Mirrors the core_omicdataset columns written via COPY.
 /// `id`, `search_vector`, `ingested_at`, `updated_at` are omitted —
 /// Postgres fills them via DEFAULT and the FTS trigger.

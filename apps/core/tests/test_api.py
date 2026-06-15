@@ -2,11 +2,11 @@ from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 
 from apps.core.models import (
-    ClinicalCategory, DaVinciProject, IngestionJob, OmicDataset,
-    Paper, ProjectDataset, ProjectPaper, ProjectPaperDataset,
+    ClinicalCategory, DaVinciProject, IngestionJob, OmicDataset, OmicSample,
+    Paper, ProjectDataset, ProjectPaper, ProjectPaperDataset, ProjectSample,
     UserCategory,
 )
 
@@ -421,3 +421,503 @@ class OmicsSearchActionTests(APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         self.assertIn('job_id', response.data)
+
+
+# ─── Phase 4 — Auditoria de curadoria e shape de erros ────────────────────────
+# Testes focados em lacunas NÃO cobertas por PaperApiTests. Cada teste
+# referencia um ponto do mapa de falhas em
+# .claude/plans/2026-04-19-testes-pipeline-artigos.md
+
+class PaperAuditAndErrorShapeTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='audituser', password='pw')
+        self.client.force_authenticate(user=self.user)
+        self.project = make_project(self.user, title='Audit Project')
+        self.paper1 = make_paper(pmid=7001, title='Paper 7001')
+        self.paper2 = make_paper(pmid=7002, title='Paper 7002')
+        self.pp1 = make_project_paper(self.project, self.paper1, curation_status='pending')
+        self.pp2 = make_project_paper(self.project, self.paper2, curation_status='pending')
+        self.base = f'/api/v1/projects/{self.project.id}/papers/'
+
+    # ── Auditoria (curation-audit-trail) ─────────────────────────────────────
+
+    def test_patch_sets_curated_at(self):
+        """✅ Skill curation-audit-trail: PATCH de status preenche curated_at."""
+        self.assertIsNone(self.pp1.curated_at)
+
+        response = self.client.patch(
+            f'{self.base}{self.pp1.id}/',
+            {'curation_status': 'included', 'notes': 'primeira nota'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.pp1.refresh_from_db()
+        self.assertEqual(self.pp1.curation_status, 'included')
+        self.assertIsNotNone(self.pp1.curated_at, 'curated_at deve ser preenchido ao mudar status')
+
+    def test_patch_preserves_notes_across_transitions(self):
+        """
+        ✅ Invariante crítica: transições pending → included → excluded → included
+        preservam notes. Perder notes é inaceitável (skill curation-audit-trail).
+        """
+        # 1. inclui com nota
+        self.client.patch(
+            f'{self.base}{self.pp1.id}/',
+            {'curation_status': 'included', 'notes': 'nota original'},
+            format='json',
+        )
+        # 2. exclui sem tocar notes
+        self.client.patch(
+            f'{self.base}{self.pp1.id}/',
+            {'curation_status': 'excluded', 'exclusion_reason': 'fora do escopo'},
+            format='json',
+        )
+        self.pp1.refresh_from_db()
+        self.assertEqual(self.pp1.notes, 'nota original', 'notes foi perdida na transição included→excluded')
+
+        # 3. volta para included
+        self.client.patch(
+            f'{self.base}{self.pp1.id}/',
+            {'curation_status': 'included'},
+            format='json',
+        )
+        self.pp1.refresh_from_db()
+        self.assertEqual(self.pp1.notes, 'nota original', 'notes foi perdida na transição excluded→included')
+
+    def test_bulk_curate_sets_curated_at_for_all(self):
+        """
+        ✅ Skill curation-audit-trail: bulk_curate preserva auditoria para todos os registros.
+        Caso ausente em PaperApiTests.test_bulk_curate original.
+        """
+        self.assertIsNone(self.pp1.curated_at)
+        self.assertIsNone(self.pp2.curated_at)
+
+        response = self.client.post(
+            f'{self.base}bulk_curate/',
+            {'paper_ids': [self.pp1.id, self.pp2.id], 'curation_status': 'excluded'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['updated'], 2)
+
+        self.pp1.refresh_from_db()
+        self.pp2.refresh_from_db()
+        self.assertIsNotNone(self.pp1.curated_at)
+        self.assertIsNotNone(self.pp2.curated_at)
+
+    # ── Shape dos erros (input para o front) ─────────────────────────────────
+
+    def test_bulk_curate_invalid_status_returns_detail_key(self):
+        """
+        ✅ Documenta SHAPE do erro 400 para o front. O cliente axios vai ler
+        err.response.data.detail — garantir que essa chave existe.
+        """
+        response = self.client.post(
+            f'{self.base}bulk_curate/',
+            {'paper_ids': [self.pp1.id], 'curation_status': 'not_a_real_status'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        body = response.json()
+        self.assertIn('detail', body, 'front espera chave "detail" no erro 400')
+        self.assertIsInstance(body['detail'], str)
+        self.assertIn('valid', body['detail'].lower() + body['detail'])  # "Invalid status..."
+
+    def test_bulk_curate_invalid_status_does_not_echo_input(self):
+        """
+        ❌ LACUNA E6 extra (falha intencional — UX): a mensagem de erro 400 NÃO
+        inclui o valor inválido que o usuário mandou. Ex: usuário digita
+        "includd" (typo) e recebe apenas a lista de valores válidos, sem dica
+        do que ele mandou de errado.
+
+        Comportamento desejado: "Invalid status 'includd'. Choose from [...]"
+        para o front conseguir mostrar toast claro.
+        """
+        response = self.client.post(
+            f'{self.base}bulk_curate/',
+            {'paper_ids': [self.pp1.id], 'curation_status': 'includd'},
+            format='json',
+        )
+        body = response.json()
+        self.assertIn(
+            'includd',
+            body['detail'],
+            'E6: mensagem deveria ecoar o valor inválido para UX. '
+            'Hoje não ecoa — toast no front fica genérico.'
+        )
+
+    def test_bulk_curate_without_paper_ids_returns_400(self):
+        """✅ Erro controlado com mensagem específica quando paper_ids está vazio."""
+        response = self.client.post(
+            f'{self.base}bulk_curate/',
+            {'paper_ids': [], 'curation_status': 'included'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('detail', response.json())
+
+    # ── Auth / isolamento (firebase-auth-guard) ───────────────────────────────
+
+    def test_list_without_auth_returns_401(self):
+        """✅ Skill firebase-auth-guard: endpoint exige autenticação."""
+        anon_client = APIClient()
+        response = anon_client.get(self.base)
+        self.assertIn(response.status_code, (401, 403))
+
+    def test_user_b_cannot_patch_paper_of_user_a(self):
+        """
+        ✅ Skill firebase-auth-guard: User B recebe 404 (não 403) ao tentar
+        editar paper do projeto de User A — não vazar existência do recurso.
+        """
+        user_b = User.objects.create_user(username='userB', password='pw')
+        other_client = APIClient()
+        other_client.force_authenticate(user=user_b)
+
+        response = other_client.patch(
+            f'{self.base}{self.pp1.id}/',
+            {'curation_status': 'included'},
+            format='json',
+        )
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_404_NOT_FOUND,
+            'User B tentando patch em projeto de User A deve receber 404, não 403 '
+            '(não vazar existência — skill firebase-auth-guard).',
+        )
+
+
+# ─── Op 4.3 — Samples ────────────────────────────────────────────────────────
+
+def make_sample(dataset, accession='GSM001', title='Sample 001', organism='Homo sapiens'):
+    return OmicSample.objects.create(
+        dataset=dataset,
+        accession=accession,
+        title=title,
+        organism=organism,
+    )
+
+
+def make_project_sample(project, sample, curation_status='pending'):
+    return ProjectSample.objects.create(
+        project=project, sample=sample, curation_status=curation_status
+    )
+
+
+class SampleApiTests(APITestCase):
+    """
+    Testes de listagem, detalhe e curadoria individual de ProjectSample.
+    Cobre: list, retrieve, partial_update (curated_at), filtros.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='sampleuser', password='pw')
+        self.client.force_authenticate(user=self.user)
+        self.project = make_project(self.user)
+        self.dataset = make_dataset(accession='GSE100')
+        # ProjectDataset necessário para a validação de isolamento do achado #1
+        make_project_dataset(self.project, self.dataset)
+        self.sample = make_sample(self.dataset, accession='GSM100')
+        self.ps = make_project_sample(self.project, self.sample)
+        self.base = f'/api/v1/projects/{self.project.id}/samples/'
+        self.dataset_base = f'/api/v1/projects/{self.project.id}/datasets/{self.dataset.id}/samples/'
+
+    def test_list_samples_of_project(self):
+        response = self.client.get(self.base)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['results']), 1)
+        self.assertEqual(response.data['results'][0]['accession'], 'GSM100')
+
+    def test_list_samples_by_dataset_route(self):
+        """Rota aninhada /datasets/{dataset_pk}/samples/ lista só os samples do dataset."""
+        other_ds = make_dataset(accession='GSE200')
+        make_project_dataset(self.project, other_ds)
+        other_sample = make_sample(other_ds, accession='GSM200')
+        make_project_sample(self.project, other_sample)
+
+        response = self.client.get(self.dataset_base)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        accessions = [r['accession'] for r in response.data['results']]
+        self.assertIn('GSM100', accessions)
+        self.assertNotIn('GSM200', accessions)
+
+    def test_list_samples_filter_curation_status(self):
+        s2 = make_sample(self.dataset, accession='GSM101')
+        make_project_sample(self.project, s2, curation_status='included')
+        response = self.client.get(self.base, {'curation_status': 'included'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['results']), 1)
+        self.assertEqual(response.data['results'][0]['curation_status'], 'included')
+
+    def test_list_samples_filter_by_dataset_query_param(self):
+        """Filtro ?dataset=<id> na rota plana /samples/ restringe ao dataset."""
+        other_ds = make_dataset(accession='GSE300')
+        make_project_dataset(self.project, other_ds)
+        other_sample = make_sample(other_ds, accession='GSM300')
+        make_project_sample(self.project, other_sample)
+
+        response = self.client.get(self.base, {'dataset': self.dataset.id})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        accessions = [r['accession'] for r in response.data['results']]
+        self.assertIn('GSM100', accessions)
+        self.assertNotIn('GSM300', accessions)
+
+    def test_retrieve_sample_detail(self):
+        response = self.client.get(f'{self.base}{self.ps.id}/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('sample', response.data)
+        self.assertEqual(response.data['sample']['accession'], 'GSM100')
+
+    def test_patch_sample_curation_sets_curated_at(self):
+        """curation-audit-trail: PATCH preenche curated_at."""
+        self.assertIsNone(self.ps.curated_at)
+        response = self.client.patch(
+            f'{self.base}{self.ps.id}/',
+            {'curation_status': 'included', 'notes': 'boa amostra'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.ps.refresh_from_db()
+        self.assertEqual(self.ps.curation_status, 'included')
+        self.assertEqual(self.ps.notes, 'boa amostra')
+        self.assertIsNotNone(self.ps.curated_at)
+
+    def test_patch_preserves_notes_across_transitions(self):
+        """curation-audit-trail: notes não é perdida em transições de status."""
+        self.client.patch(
+            f'{self.base}{self.ps.id}/',
+            {'curation_status': 'included', 'notes': 'nota preservada'},
+            format='json',
+        )
+        self.client.patch(
+            f'{self.base}{self.ps.id}/',
+            {'curation_status': 'excluded', 'exclusion_reason': 'fora do escopo'},
+            format='json',
+        )
+        self.ps.refresh_from_db()
+        self.assertEqual(self.ps.notes, 'nota preservada')
+
+
+class SampleBulkCurateTests(APITestCase):
+    """
+    Testes de bulk_curate de samples: auditoria, erros, idempotência.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='bulksampleuser', password='pw')
+        self.client.force_authenticate(user=self.user)
+        self.project = make_project(self.user)
+        self.dataset = make_dataset(accession='GSE400')
+        self.s1 = make_sample(self.dataset, accession='GSM400')
+        self.s2 = make_sample(self.dataset, accession='GSM401')
+        self.ps1 = make_project_sample(self.project, self.s1)
+        self.ps2 = make_project_sample(self.project, self.s2)
+        self.base = f'/api/v1/projects/{self.project.id}/samples/'
+
+    def test_bulk_curate_sets_curated_at_for_all(self):
+        """curation-audit-trail: bulk_curate preenche curated_at em todos os registros."""
+        self.assertIsNone(self.ps1.curated_at)
+        self.assertIsNone(self.ps2.curated_at)
+        response = self.client.post(
+            f'{self.base}bulk_curate/',
+            {'sample_ids': [self.ps1.id, self.ps2.id], 'curation_status': 'included'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['updated'], 2)
+        self.ps1.refresh_from_db()
+        self.ps2.refresh_from_db()
+        self.assertIsNotNone(self.ps1.curated_at)
+        self.assertIsNotNone(self.ps2.curated_at)
+
+    def test_bulk_curate_invalid_status_returns_detail(self):
+        """Shape do erro 400 — chave 'detail' com o status inválido ecoado."""
+        response = self.client.post(
+            f'{self.base}bulk_curate/',
+            {'sample_ids': [self.ps1.id], 'curation_status': 'invalid_status'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        body = response.json()
+        self.assertIn('detail', body)
+        self.assertIn('invalid_status', body['detail'])
+
+    def test_bulk_curate_empty_sample_ids_returns_400(self):
+        response = self.client.post(
+            f'{self.base}bulk_curate/',
+            {'sample_ids': [], 'curation_status': 'included'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('detail', response.json())
+
+
+class SampleIsolationTests(APITestCase):
+    """
+    Testes de isolamento entre usuários (firebase-auth-guard).
+    Usuário B não pode listar nem curar samples do projeto de Usuário A.
+    """
+
+    def setUp(self):
+        self.user_a = User.objects.create_user(username='isolation_a', password='pw')
+        self.user_b = User.objects.create_user(username='isolation_b', password='pw')
+        self.client_a = APIClient()
+        self.client_b = APIClient()
+        self.client_a.force_authenticate(user=self.user_a)
+        self.client_b.force_authenticate(user=self.user_b)
+
+        self.project_a = make_project(self.user_a, title='Project A', query_term='x')
+        dataset = make_dataset(accession='GSE500')
+        sample = make_sample(dataset, accession='GSM500')
+        self.ps = make_project_sample(self.project_a, sample)
+
+    def test_user_b_cannot_list_samples_of_user_a_project(self):
+        """firebase-auth-guard: 404 ao listar samples de projeto alheio."""
+        response = self.client_b.get(
+            f'/api/v1/projects/{self.project_a.id}/samples/'
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_user_b_cannot_patch_sample_of_user_a(self):
+        """firebase-auth-guard: 404 ao tentar curar sample de projeto alheio."""
+        response = self.client_b.patch(
+            f'/api/v1/projects/{self.project_a.id}/samples/{self.ps.id}/',
+            {'curation_status': 'included'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_user_b_cannot_bulk_curate_sample_of_user_a(self):
+        """firebase-auth-guard: bulk_curate em projeto alheio → 0 registros alterados (404 no projeto)."""
+        response = self.client_b.post(
+            f'/api/v1/projects/{self.project_a.id}/samples/bulk_curate/',
+            {'sample_ids': [self.ps.id], 'curation_status': 'included'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_dataset_pk_outside_project_returns_404(self):
+        """
+        Achado #1 (007): dataset_pk da rota aninhada validado contra o projeto.
+
+        Usuário A possui projeto_a com dataset_a. Usuário B possui projeto_b
+        com dataset_b (dataset_b NÃO está no projeto_a). Acessar
+        /projects/{projeto_a}/datasets/{dataset_b}/samples/ deve retornar 404
+        — não lista vazia — para não vazar existência do dataset.
+        """
+        project_b = make_project(self.user_b, title='Project B', query_term='y')
+        dataset_b = make_dataset(accession='GSE501')
+        # dataset_b está no projeto_b (do user_b), mas NÃO no projeto_a (do user_a)
+        make_project_dataset(project_b, dataset_b)
+
+        response = self.client_a.get(
+            f'/api/v1/projects/{self.project_a.id}/datasets/{dataset_b.id}/samples/'
+        )
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_404_NOT_FOUND,
+            'Achado #1: dataset_pk fora do projeto deve retornar 404, não lista vazia.',
+        )
+
+    def test_dataset_query_param_outside_project_returns_404(self):
+        """
+        Achado #1 (007): query param ?dataset=<id> validado contra o projeto.
+
+        Mesmo cenário do teste anterior, mas usando a rota plana com ?dataset=<id>.
+        """
+        project_b = make_project(self.user_b, title='Project B2', query_term='z')
+        dataset_b = make_dataset(accession='GSE502')
+        make_project_dataset(project_b, dataset_b)
+
+        response = self.client_a.get(
+            f'/api/v1/projects/{self.project_a.id}/samples/',
+            {'dataset': dataset_b.id},
+        )
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_404_NOT_FOUND,
+            'Achado #1: ?dataset=<id> fora do projeto deve retornar 404, não lista vazia.',
+        )
+
+
+class SampleIngestionTriggerTests(APITestCase):
+    """
+    Testa o trigger de ingestão sob demanda:
+    - PATCH de dataset para 'included' dispara run_sample_ingestion.delay
+    - bulk_curate de dataset para 'included' dispara run_sample_ingestion.delay
+    - Não redispara se já há OmicSamples para o dataset (idempotência)
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='triggeruser', password='pw')
+        self.client.force_authenticate(user=self.user)
+        self.project = make_project(self.user)
+        self.dataset = make_dataset(accession='GSE600')
+        self.pd = make_project_dataset(self.project, self.dataset)
+        self.base = f'/api/v1/projects/{self.project.id}/datasets/'
+
+    def test_patch_dataset_to_included_dispatches_sample_ingestion(self):
+        """Trigger: PATCH curation_status=included dispara run_sample_ingestion.delay."""
+        with patch(
+            'apps.core.views.dataset_views.run_sample_ingestion'
+        ) as mock_task:
+            response = self.client.patch(
+                f'{self.base}{self.pd.id}/',
+                {'curation_status': 'included'},
+                format='json',
+            )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.pd.refresh_from_db()
+        self.assertEqual(self.pd.curation_status, 'included')
+        mock_task.delay.assert_called_once_with(str(self.project.id), self.dataset.id)
+
+    def test_patch_dataset_to_included_no_dispatch_if_samples_exist(self):
+        """Idempotência: se já há OmicSamples para o dataset, .delay() não é chamado."""
+        make_sample(self.dataset, accession='GSM600')
+        with patch(
+            'apps.core.views.dataset_views.run_sample_ingestion'
+        ) as mock_task:
+            self.client.patch(
+                f'{self.base}{self.pd.id}/',
+                {'curation_status': 'included'},
+                format='json',
+            )
+            mock_task.delay.assert_not_called()
+
+    def test_bulk_curate_datasets_to_included_dispatches_sample_ingestion(self):
+        """Trigger: bulk_curate curation_status=included dispara run_sample_ingestion.delay."""
+        with patch(
+            'apps.core.views.dataset_views.run_sample_ingestion'
+        ) as mock_task:
+            response = self.client.post(
+                f'{self.base}bulk_curate/',
+                {'dataset_ids': [self.pd.id], 'curation_status': 'included'},
+                format='json',
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            mock_task.delay.assert_called_once_with(str(self.project.id), self.dataset.id)
+
+    def test_bulk_curate_datasets_no_dispatch_if_samples_exist(self):
+        """Idempotência: bulk_curate não redispara se já há OmicSamples."""
+        make_sample(self.dataset, accession='GSM601')
+        with patch(
+            'apps.core.views.dataset_views.run_sample_ingestion'
+        ) as mock_task:
+            self.client.post(
+                f'{self.base}bulk_curate/',
+                {'dataset_ids': [self.pd.id], 'curation_status': 'included'},
+                format='json',
+            )
+            mock_task.delay.assert_not_called()
+
+    def test_patch_dataset_to_excluded_does_not_dispatch(self):
+        """Trigger só dispara para 'included' — outros status não disparam."""
+        with patch(
+            'apps.core.views.dataset_views.run_sample_ingestion'
+        ) as mock_task:
+            self.client.patch(
+                f'{self.base}{self.pd.id}/',
+                {'curation_status': 'excluded'},
+                format='json',
+            )
+            mock_task.delay.assert_not_called()

@@ -1,5 +1,6 @@
 'use client';
 
+import Link from 'next/link';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, PieChart, Pie, Cell, ResponsiveContainer } from 'recharts';
 import { formatNumber } from '@/lib/utils/format';
@@ -13,11 +14,12 @@ interface StatsCardProps {
   label: string;
   value: number | string;
   sub?: string;
+  href?: string;
 }
 
-function StatsCard({ label, value, sub }: StatsCardProps) {
-  return (
-    <Card>
+function StatsCard({ label, value, sub, href }: StatsCardProps) {
+  const content = (
+    <Card className={href ? 'transition-colors hover:bg-accent/50 cursor-pointer' : undefined}>
       <CardContent className="pt-6">
         <p className="text-2xl font-bold">{typeof value === 'number' ? formatNumber(value) : value}</p>
         <p className="text-sm font-medium">{label}</p>
@@ -25,9 +27,25 @@ function StatsCard({ label, value, sub }: StatsCardProps) {
       </CardContent>
     </Card>
   );
+
+  if (href) {
+    return (
+      <Link href={href} className="block">
+        {content}
+      </Link>
+    );
+  }
+
+  return content;
 }
 
-export function ProjectStatsOverview({ stats }: { stats: ProjectStats }) {
+interface ProjectStatsOverviewProps {
+  stats: ProjectStats;
+  /** Quando fornecido, os cards de papers e datasets viram links de navegação */
+  projectId?: string;
+}
+
+export function ProjectStatsOverview({ stats, projectId }: ProjectStatsOverviewProps) {
   const yearData = Object.entries(stats.papers_by_year)
     .map(([year, count]) => ({ year, count }))
     .sort((a, b) => a.year.localeCompare(b.year));
@@ -35,12 +53,16 @@ export function ProjectStatsOverview({ stats }: { stats: ProjectStats }) {
   const omicData = Object.entries(stats.datasets_by_omic_type)
     .map(([name, value]) => ({ name, value }));
 
+  const papersHref = projectId ? `/projects/${projectId}/papers` : undefined;
+  const datasetsHref = projectId ? `/projects/${projectId}/datasets` : undefined;
+
   return (
     <div className="space-y-6">
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <StatsCard label="Total Papers" value={stats.total_papers} />
-        <StatsCard label="Included" value={stats.included_papers} sub="papers" />
-        <StatsCard label="Total Datasets" value={stats.total_datasets} />
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+        <StatsCard label="Total Papers" value={stats.total_papers} href={papersHref} />
+        <StatsCard label="Included Papers" value={stats.included_papers} sub="papers" href={papersHref} />
+        <StatsCard label="Total Datasets" value={stats.total_datasets} href={datasetsHref} />
+        <StatsCard label="Included Datasets" value={stats.included_datasets} sub="datasets" href={datasetsHref} />
         <StatsCard label="Total Samples" value={stats.total_samples} />
       </div>
 

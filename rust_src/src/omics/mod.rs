@@ -3,5 +3,6 @@ pub mod elink;
 pub mod geo_parser;
 pub mod gwas_parser;
 pub mod models;
+pub mod sample_parser;
 pub mod sra_parser;
 pub mod type_classifier;

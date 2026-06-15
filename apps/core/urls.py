@@ -4,6 +4,7 @@ from rest_framework.routers import DefaultRouter
 from .views.project_views import DaVinciProjectViewSet
 from .views.paper_views import ProjectPaperViewSet
 from .views.dataset_views import ProjectDatasetViewSet
+from .views.sample_views import ProjectSampleViewSet
 from .views.category_views import ClinicalCategoryViewSet, UserCategoryViewSet
 from .views.link_views import ProjectPaperDatasetViewSet
 from .views.job_views import IngestionJobViewSet
@@ -24,6 +25,13 @@ dataset_list = ProjectDatasetViewSet.as_view({'get': 'list'})
 dataset_detail = ProjectDatasetViewSet.as_view({'get': 'retrieve', 'patch': 'partial_update'})
 dataset_bulk_curate = ProjectDatasetViewSet.as_view({'post': 'bulk_curate'})
 dataset_search = ProjectDatasetViewSet.as_view({'get': 'search'})
+
+# Samples — rota plana (todos os samples do projeto) e rota por dataset
+sample_list = ProjectSampleViewSet.as_view({'get': 'list'})
+sample_detail = ProjectSampleViewSet.as_view({'get': 'retrieve', 'patch': 'partial_update'})
+sample_bulk_curate = ProjectSampleViewSet.as_view({'post': 'bulk_curate'})
+# Rota aninhada sob dataset (mesmo view, dataset_pk capturado no kwargs)
+dataset_sample_list = ProjectSampleViewSet.as_view({'get': 'list'})
 
 category_list = UserCategoryViewSet.as_view({'get': 'list', 'post': 'create'})
 category_detail = UserCategoryViewSet.as_view({
@@ -56,6 +64,18 @@ urlpatterns = [
     path(f'{PROJECT_PREFIX}datasets/search/', dataset_search, name='project-dataset-search'),
     path(f'{PROJECT_PREFIX}datasets/bulk_curate/', dataset_bulk_curate, name='project-dataset-bulk-curate'),
     path(f'{PROJECT_PREFIX}datasets/<int:pk>/', dataset_detail, name='project-dataset-detail'),
+
+    # Samples por dataset — para a página de samples de um dataset específico (Op 4.4)
+    path(
+        f'{PROJECT_PREFIX}datasets/<int:dataset_pk>/samples/',
+        dataset_sample_list,
+        name='project-dataset-sample-list',
+    ),
+
+    # Samples do projeto (todos) — filtros ?curation_status=included, ?dataset=<id> (Op 5b)
+    path(f'{PROJECT_PREFIX}samples/', sample_list, name='project-sample-list'),
+    path(f'{PROJECT_PREFIX}samples/bulk_curate/', sample_bulk_curate, name='project-sample-bulk-curate'),
+    path(f'{PROJECT_PREFIX}samples/<int:pk>/', sample_detail, name='project-sample-detail'),
 
     # Custom categories
     path(f'{PROJECT_PREFIX}categories/', category_list, name='project-category-list'),

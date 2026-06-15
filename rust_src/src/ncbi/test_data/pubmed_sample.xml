@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation Status="MEDLINE" Owner="NLM">
+      <PMID Version="1">9999001</PMID>
+      <Article PubModel="Print">
+        <Journal>
+          <ISSN IssnType="Print">1234-5678</ISSN>
+          <JournalIssue CitedMedium="Print">
+            <Volume>42</Volume>
+            <Issue>3</Issue>
+            <PubDate>
+              <Year>2023</Year>
+              <Month>Mar</Month>
+            </PubDate>
+          </JournalIssue>
+          <Title>Journal of Test Cardiology</Title>
+        </Journal>
+        <ArticleTitle>Cardiovascular disease associated with BRCA1 variants in humans.</ArticleTitle>
+        <Abstract>
+          <AbstractText Label="BACKGROUND">Cardiovascular disease (CVD) is a major cause of mortality.</AbstractText>
+          <AbstractText Label="METHODS">We analyzed BRCA1 variants in 1000 patients with coronary artery disease.</AbstractText>
+          <AbstractText Label="RESULTS">BRCA1 mutations showed significant association with CVD risk.</AbstractText>
+        </Abstract>
+        <AuthorList CompleteYN="Y">
+          <Author ValidYN="Y">
+            <LastName>Silva</LastName>
+            <Initials>JA</Initials>
+            <AffiliationInfo>
+              <Affiliation>Department of Cardiology, University of São Paulo, Brazil.</Affiliation>
+            </AffiliationInfo>
+          </Author>
+          <Author ValidYN="Y">
+            <LastName>Smith</LastName>
+            <Initials>BJ</Initials>
+            <AffiliationInfo>
+              <Affiliation>Harvard Medical School, Boston, USA.</Affiliation>
+            </AffiliationInfo>
+          </Author>
+        </AuthorList>
+        <PublicationTypeList>
+          <PublicationType UI="D016428">Journal Article</PublicationType>
+          <PublicationType UI="D016449">Randomized Controlled Trial</PublicationType>
+        </PublicationTypeList>
+        <ELocationID EIdType="doi" ValidYN="Y">10.1234/test.2023.001</ELocationID>
+        <KeywordList Owner="NOTNLM">
+          <Keyword MajorTopicYN="N">cardiovascular disease</Keyword>
+          <Keyword MajorTopicYN="N">BRCA1</Keyword>
+        </KeywordList>
+        <MeshHeadingList>
+          <MeshHeading>
+            <DescriptorName UI="D002318" MajorTopicYN="Y">Cardiovascular Diseases</DescriptorName>
+            <QualifierName UI="Q000235" MajorTopicYN="N">genetics</QualifierName>
+          </MeshHeading>
+          <MeshHeading>
+            <DescriptorName UI="D006801" MajorTopicYN="N">Humans</DescriptorName>
+          </MeshHeading>
+        </MeshHeadingList>
+      </Article>
+    </MedlineCitation>
+    <PubmedData>
+      <ArticleIdList>
+        <ArticleId IdType="pubmed">9999001</ArticleId>
+        <ArticleId IdType="doi">10.1234/test.2023.001</ArticleId>
+        <ArticleId IdType="pmc">PMC9999001</ArticleId>
+      </ArticleIdList>
+    </PubmedData>
+  </PubmedArticle>
+
+  <PubmedArticle>
+    <MedlineCitation Status="MEDLINE" Owner="NLM">
+      <PMID Version="1">9999002</PMID>
+      <Article PubModel="Print">
+        <Journal>
+          <ISSN IssnType="Print">9876-5432</ISSN>
+          <JournalIssue CitedMedium="Print">
+            <PubDate>
+              <Year>2022</Year>
+            </PubDate>
+          </JournalIssue>
+          <Title>Test Oncology Letters</Title>
+        </Journal>
+        <ArticleTitle>A letter on TP53 without abstract.</ArticleTitle>
+        <AuthorList CompleteYN="Y">
+          <Author ValidYN="Y">
+            <LastName>Einsamkeit</LastName>
+            <Initials>U</Initials>
+            <AffiliationInfo>
+              <Affiliation>Independent Researcher, Unknownland.</Affiliation>
+            </AffiliationInfo>
+          </Author>
+        </AuthorList>
+        <PublicationTypeList>
+          <PublicationType UI="D016422">Letter</PublicationType>
+        </PublicationTypeList>
+      </Article>
+    </MedlineCitation>
+    <PubmedData>
+      <ArticleIdList>
+        <ArticleId IdType="pubmed">9999002</ArticleId>
+      </ArticleIdList>
+    </PubmedData>
+  </PubmedArticle>
+
+  <PubmedArticle>
+    <MedlineCitation Status="MEDLINE" Owner="NLM">
+      <PMID Version="1">9999003</PMID>
+      <Article PubModel="Print">
+        <Journal>
+          <ISSN IssnType="Print">0000-1111</ISSN>
+          <JournalIssue CitedMedium="Print">
+            <PubDate>
+              <Year>2024</Year>
+              <Month>July</Month>
+            </PubDate>
+          </JournalIssue>
+          <Title>Systematic Review Journal</Title>
+        </Journal>
+        <ArticleTitle>A systematic review of atorvastatin in CVD.</ArticleTitle>
+        <Abstract>
+          <AbstractText>This systematic review evaluates atorvastatin efficacy across 42 trials.</AbstractText>
+        </Abstract>
+        <AuthorList CompleteYN="Y">
+          <Author ValidYN="Y">
+            <LastName>Tanaka</LastName>
+            <Initials>KM</Initials>
+            <AffiliationInfo>
+              <Affiliation>Kyoto University, Kyoto, Japan.</Affiliation>
+            </AffiliationInfo>
+          </Author>
+        </AuthorList>
+        <PublicationTypeList>
+          <PublicationType UI="D000078182">Systematic Review</PublicationType>
+          <PublicationType UI="D016428">Journal Article</PublicationType>
+        </PublicationTypeList>
+        <MeshHeadingList>
+          <MeshHeading>
+            <DescriptorName UI="D000924" MajorTopicYN="N">Anticholesteremic Agents</DescriptorName>
+            <QualifierName UI="Q000493" MajorTopicYN="Y">pharmacology</QualifierName>
+          </MeshHeading>
+        </MeshHeadingList>
+      </Article>
+    </MedlineCitation>
+    <PubmedData>
+      <ArticleIdList>
+        <ArticleId IdType="pubmed">9999003</ArticleId>
+      </ArticleIdList>
+    </PubmedData>
+  </PubmedArticle>
+</PubmedArticleSet>

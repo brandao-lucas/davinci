@@ -1,5 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { toast } from 'sonner';
 import { jobsApi } from '@/lib/api/jobs';
+import { extractApiErrorMessage } from '@/lib/utils/api-error';
 
 export function useJobs(projectId: string) {
   return useQuery({
@@ -28,6 +30,10 @@ export function useCancelJob(projectId: string) {
     mutationFn: (jobId: string) => jobsApi.cancel(projectId, jobId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['jobs', projectId] });
+      toast.success('Job cancelado');
+    },
+    onError: (err) => {
+      toast.error(extractApiErrorMessage(err, 'Falha ao cancelar job'));
     },
   });
 }

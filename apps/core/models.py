@@ -527,6 +527,89 @@ class OmicDataset(models.Model):
         return f"{self.accession} — {self.omic_type} ({self.organism})"
 
 
+class OmicSample(models.Model):
+    """
+    Amostra (sample) de um dataset ômico — TABELA COMPARTILHADA.
+
+    Espelha o padrão de OmicDataset: uma amostra existe uma única vez no banco,
+    independente de quantos projetos referenciam o dataset pai. O Rust faz upsert
+    via COPY com ON CONFLICT (accession) DO UPDATE.
+
+    O `accession` é a chave natural estável da amostra (GSM*/SRR*/SRS*) e, por ser
+    `unique` (mesma convenção de OmicDataset.accession), serve diretamente ao
+    ON CONFLICT DO UPDATE do COPY writer do Rust.
+
+    Ingestão sob demanda: as amostras são populadas quando o dataset pai entra em
+    curadoria (espelha o ciclo de ProjectDataset → ProjectSample).
+    """
+
+    dataset = models.ForeignKey(
+        OmicDataset,
+        on_delete=models.CASCADE,
+        related_name='samples'
+    )
+
+    # Identificação — accession como chave natural (igual a OmicDataset)
+    accession = models.CharField(
+        'Accession',
+        max_length=50,
+        unique=True,
+        db_index=True,
+        help_text='GSM, SRR, SRS, etc. — chave natural da amostra'
+    )
+
+    # Conteúdo
+    title = models.TextField('Título', blank=True, default='')
+    source_name = models.CharField(
+        'Source Name',
+        max_length=500,
+        blank=True,
+        default='',
+        help_text='Tecido/fonte declarada da amostra (ex: "blood", "tumor biopsy")'
+    )
+
+    # Metadados biológicos
+    organism = models.CharField('Organismo', max_length=200, blank=True, default='')
+    tax_id = models.PositiveIntegerField('Taxonomy ID', blank=True, null=True)
+    platform = models.CharField(
+        'Plataforma',
+        max_length=200,
+        blank=True,
+        default='',
+        help_text='GPL number ou nome da tecnologia'
+    )
+
+    # Características key/value da amostra (characteristics_ch* no SOFT/MINiML)
+    characteristics = models.JSONField(
+        'Características',
+        default=dict,
+        blank=True,
+        help_text='Metadados key/value da amostra (ex: {"age": "45", "sex": "F"})'
+    )
+
+    # Metadados extras (campos específicos de cada fonte)
+    extra_metadata = models.JSONField(
+        'Metadados Extras',
+        default=dict,
+        blank=True,
+        help_text='Campos específicos da fonte que não justificam colunas próprias'
+    )
+
+    # Controle (mesma convenção de OmicDataset)
+    ingested_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['dataset']),
+            models.Index(fields=['accession']),
+            models.Index(fields=['organism']),
+        ]
+
+    def __str__(self):
+        return f"{self.accession} — {self.title[:60]}"
+
+
 class DatasetPaperLink(models.Model):
     """
     Relação entre um dataset ômico e papers que o referenciam.
@@ -880,6 +963,62 @@ class ProjectDataset(models.Model):
         return f"{self.dataset.accession} → {self.project.title} [{self.curation_status}]"
 
 
+class ProjectSample(models.Model):
+    """
+    Relação Amostra Ômica ↔ Projeto do Usuário.
+
+    Espelha ProjectDataset: mesma lógica de curadoria auditável por projeto.
+    A mesma OmicSample pode estar em N projetos, mas cada projeto mantém seu
+    próprio status de curadoria, motivo de exclusão e notas.
+
+    Ingestão sob demanda: ProjectSample é criado quando o dataset pai é curado
+    como `included` (espelha o ciclo de ProjectDataset).
+
+    As choices de curadoria seguem ProjectPaper (pending/included/excluded/maybe),
+    pois amostras são apenas metadados — não têm ciclo de download como datasets.
+    """
+
+    class CurationStatus(models.TextChoices):
+        PENDING = 'pending', 'Pendente'
+        INCLUDED = 'included', 'Incluído'
+        EXCLUDED = 'excluded', 'Excluído'
+        MAYBE = 'maybe', 'Talvez'
+
+    project = models.ForeignKey(
+        DaVinciProject,
+        on_delete=models.CASCADE,
+        related_name='project_samples'
+    )
+    sample = models.ForeignKey(
+        OmicSample,
+        on_delete=models.CASCADE,
+        related_name='in_projects'
+    )
+
+    # Curadoria (idêntico a ProjectDataset)
+    curation_status = models.CharField(
+        max_length=20,
+        choices=CurationStatus.choices,
+        default=CurationStatus.PENDING
+    )
+    exclusion_reason = models.CharField(max_length=500, blank=True, default='')
+    notes = models.TextField(blank=True, default='')
+    relevance_score = models.FloatField(blank=True, null=True)
+
+    # Controle (idêntico a ProjectDataset)
+    added_at = models.DateTimeField(auto_now_add=True)
+    curated_at = models.DateTimeField(blank=True, null=True)
+
+    class Meta:
+        unique_together = ['project', 'sample']
+        indexes = [
+            models.Index(fields=['project', 'curation_status']),
+        ]
+
+    def __str__(self):
+        return f"{self.sample.accession} → {self.project.title} [{self.curation_status}]"
+
+
 class ProjectPaperDataset(models.Model):
     """
     PONTE entre literatura e ômicas dentro de um projeto.
@@ -943,6 +1082,7 @@ class ProjectStats(models.Model):
     total_datasets = models.PositiveIntegerField(default=0)
     included_datasets = models.PositiveIntegerField(default=0)
     total_samples = models.PositiveIntegerField(default=0)
+    included_samples = models.PositiveIntegerField(default=0)
 
     # Agregações (populadas como JSON para flexibilidade)
     papers_by_year = models.JSONField(default=dict, blank=True)
@@ -1003,6 +1143,7 @@ class IngestionJob(models.Model):
         GEO_SEARCH = 'geo_search', 'Busca GEO'
         SRA_SEARCH = 'sra_search', 'Busca SRA'
         GWAS_SEARCH = 'gwas_search', 'Busca GWAS Catalog'
+        SAMPLE_FETCH = 'sample_fetch', 'Fetch de Amostras'
         VARIANT_ANNOTATION = 'variant_annotation', 'Anotação de Variantes'
         GENE_NER = 'gene_ner', 'Extração de Genes'
         DRUG_NER = 'drug_ner', 'Extração de Drogas'

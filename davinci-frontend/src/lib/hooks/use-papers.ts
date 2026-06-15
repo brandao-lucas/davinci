@@ -1,5 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { toast } from 'sonner';
 import { papersApi } from '@/lib/api/papers';
+import { extractApiErrorMessage } from '@/lib/utils/api-error';
 import type { PaperFilters } from '@/lib/types/paper';
 
 export function usePapers(projectId: string, filters?: PaperFilters) {
@@ -28,6 +30,10 @@ export function useCuratePaper(projectId: string) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['papers', projectId] });
       queryClient.invalidateQueries({ queryKey: ['projects', projectId] });
+      toast.success('Curadoria atualizada');
+    },
+    onError: (err) => {
+      toast.error(extractApiErrorMessage(err, 'Falha ao atualizar curadoria'));
     },
   });
 }
@@ -37,9 +43,13 @@ export function useBulkCurate(projectId: string) {
   return useMutation({
     mutationFn: (data: { paper_ids: number[]; curation_status: string; exclusion_reason?: string }) =>
       papersApi.bulkCurate(projectId, data).then(r => r.data),
-    onSuccess: () => {
+    onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['papers', projectId] });
       queryClient.invalidateQueries({ queryKey: ['projects', projectId] });
+      toast.success(`${data.updated} papers atualizados`);
+    },
+    onError: (err) => {
+      toast.error(extractApiErrorMessage(err, 'Falha na curadoria em lote'));
     },
   });
 }

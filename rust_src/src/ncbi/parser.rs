@@ -414,3 +414,131 @@ pub fn parse_pubmed_xml(xml: &str) -> Result<Vec<PaperData>, String> {
 
     Ok(papers)
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = include_str!("test_data/pubmed_sample.xml");
+
+    // ── Sucesso ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_valid_xml_extracts_pmids() {
+        let papers = parse_pubmed_xml(SAMPLE).expect("parse ok");
+        assert_eq!(papers.len(), 3, "fixture has 3 <PubmedArticle> entries");
+        let pmids: Vec<i64> = papers.iter().map(|p| p.pmid).collect();
+        assert_eq!(pmids, vec![9999001, 9999002, 9999003]);
+    }
+
+    #[test]
+    fn test_parse_extracts_abstract_and_year() {
+        let papers = parse_pubmed_xml(SAMPLE).expect("parse ok");
+        let first = &papers[0];
+        assert_eq!(first.pub_year, Some(2023));
+        assert_eq!(first.pub_month, Some(3));
+        assert!(first.abstract_text.contains("Cardiovascular disease (CVD)"));
+        assert!(first.abstract_text.contains("BRCA1 variants"));
+        // Labelled AbstractText sections must be concatenated with space.
+        assert!(first.abstract_text.contains("BRCA1 mutations"));
+    }
+
+    #[test]
+    fn test_parse_handles_paper_without_abstract() {
+        let papers = parse_pubmed_xml(SAMPLE).expect("parse ok");
+        let second = &papers[1];
+        assert_eq!(second.pmid, 9999002);
+        assert_eq!(second.abstract_text, "", "missing abstract → empty string (not panic)");
+        assert_eq!(second.pub_year, Some(2022));
+        assert_eq!(second.pub_month, None, "no <Month> → None");
+    }
+
+    #[test]
+    fn test_parse_extracts_mesh_with_major_topic() {
+        let papers = parse_pubmed_xml(SAMPLE).expect("parse ok");
+        let first = &papers[0];
+        let major = first.mesh_terms.iter().find(|m| m.descriptor == "Cardiovascular Diseases");
+        assert!(major.is_some(), "Cardiovascular Diseases MeSH term present");
+        assert!(major.unwrap().is_major, "MajorTopicYN=Y should propagate to is_major");
+
+        let not_major = first.mesh_terms.iter().find(|m| m.descriptor == "Humans");
+        assert!(not_major.is_some());
+        assert!(!not_major.unwrap().is_major);
+    }
+
+    #[test]
+    fn test_extract_country_from_affiliation_known_country() {
+        let papers = parse_pubmed_xml(SAMPLE).expect("parse ok");
+        let first = &papers[0];
+        let silva = first.authors.iter().find(|a| a.last_name == "Silva").unwrap();
+        assert_eq!(silva.country, "Brazil");
+        let smith = first.authors.iter().find(|a| a.last_name == "Smith").unwrap();
+        assert_eq!(smith.country, "USA");
+    }
+
+    #[test]
+    fn test_pub_type_priority_picks_highest() {
+        // Artigo 1 tem "Journal Article" + "Randomized Controlled Trial" → RCT tem prioridade maior.
+        // Artigo 3 tem "Systematic Review" + "Journal Article" → Systematic Review vence.
+        let papers = parse_pubmed_xml(SAMPLE).expect("parse ok");
+        assert_eq!(papers[0].pub_type, "Randomized Controlled Trial");
+        assert_eq!(papers[2].pub_type, "Systematic Review");
+    }
+
+    #[test]
+    fn test_article_id_doi_and_pmc_extracted() {
+        let papers = parse_pubmed_xml(SAMPLE).expect("parse ok");
+        let first = &papers[0];
+        assert_eq!(first.doi.as_deref(), Some("10.1234/test.2023.001"));
+        assert_eq!(first.pmc_id.as_deref(), Some("PMC9999001"));
+        assert!(papers[1].doi.is_none(), "second article has no DOI");
+        assert!(papers[1].pmc_id.is_none(), "second article has no PMC ID");
+    }
+
+    // ── Falhas / casos de borda ──────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_malformed_xml_returns_err_not_panic() {
+        // XML truncado no meio de uma tag.
+        let malformed = r#"<?xml version="1.0"?>
+<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID>42</PMID>
+      <Article><ArticleTi"#;
+        // Comportamento esperado: parser retorna Err(..) de forma controlada,
+        // e NÃO panica. Esse teste **passa** se a função devolver Result::Err.
+        let result = parse_pubmed_xml(malformed);
+        assert!(
+            result.is_err(),
+            "malformed XML deve retornar Err; recebeu: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_extract_country_unknown_returns_empty() {
+        // Segundo artigo do sample: afiliação "Independent Researcher, Unknownland."
+        // Espera-se string vazia (sem país reconhecido). Se alguém introduzir um default
+        // tipo "Unknown", este teste falha.
+        let papers = parse_pubmed_xml(SAMPLE).expect("parse ok");
+        let einsamkeit = papers[1]
+            .authors
+            .iter()
+            .find(|a| a.last_name == "Einsamkeit")
+            .expect("autor sem país conhecido");
+        assert_eq!(
+            einsamkeit.country, "",
+            "país desconhecido deve permanecer string vazia (não 'Unknown')"
+        );
+    }
+
+    #[test]
+    fn test_parse_empty_xml_returns_empty_vec() {
+        let xml = r#"<?xml version="1.0"?><PubmedArticleSet></PubmedArticleSet>"#;
+        let papers = parse_pubmed_xml(xml).expect("parse ok");
+        assert!(papers.is_empty());
+    }
+}

@@ -75,11 +75,11 @@ pub async fn fetch_bioproject_datasets(
         return Ok((vec![], vec![]));
     }
 
-    // Step 2 — esummary in batches of 100
+    // Step 2 — esummary in batches of 25 (NCBI GET URL length limit ~4KB)
     let mut all_datasets: Vec<OmicDatasetData> = Vec::with_capacity(uids.len());
     let mut all_links: Vec<DatasetPaperLinkData> = Vec::new();
 
-    for chunk in uids.chunks(100) {
+    for chunk in uids.chunks(25) {
         let ids_csv = chunk.join(",");
         let summary_params = [
             ("db", "bioproject"),

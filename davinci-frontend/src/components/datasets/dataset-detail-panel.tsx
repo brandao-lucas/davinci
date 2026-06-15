@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import Link from 'next/link';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -112,6 +113,15 @@ export function DatasetDetailPanel({ dataset, projectId, onClose }: DatasetDetai
                 <p className="truncate" title={dataset.platform}>{dataset.platform}</p>
               </div>
             )}
+          </div>
+
+          {/* View samples link */}
+          <div>
+            <Button size="sm" variant="outline" asChild>
+              <Link href={`/projects/${projectId}/datasets/${dataset.id}/samples`}>
+                View samples
+              </Link>
+            </Button>
           </div>
 
           <Separator />

@@ -43,7 +43,7 @@ POST /api/v1/auth/verify/   — verifica token Firebase (teste)
   │   ├── {id}/search/                            ← despacha busca PubMed
   │   ├── {id}/omics_search/                      ← despacha busca ômica
   │   ├── {id}/stats/                             ← estatísticas do projeto
-  │   ├── {id}/export/                            ← exportação JSON/CSV
+  │   ├── {id}/export/                            ← exportação JSON/CSV (Fase 5, não implementado)
   │   │
   │   ├── {project_pk}/papers/                    ← listagem + filtros
   │   │   ├── search/?q=                          ← FTS
@@ -82,7 +82,7 @@ POST /api/v1/auth/verify/   — verifica token Firebase (teste)
 | `search` | POST | `/projects/{id}/search/` | Despacha job PubMed |
 | `omics_search` | POST | `/projects/{id}/omics_search/` | Despacha job ômica |
 | `stats` | GET | `/projects/{id}/stats/` | Computa + retorna estatísticas |
-| `export` | GET | `/projects/{id}/export/?format=json\|csv` | Exporta papers incluídos |
+| `export` | GET | `/projects/{id}/export/?format=json\|csv` | _Fase 5 — não implementado_ |
 
 **Permissões:** `IsAuthenticated`. Queryset filtrado por `user=request.user`.
 
@@ -188,12 +188,11 @@ def omics_search(self, request, pk=None):
     "paper": {
         "pmid": "37124580",
         "title": "...",
-        "abstract_text": "...",    // incluído para detail panel
+        "abstract": "...",
         "journal": "Nature",
         "pub_year": 2023,
         "pub_type": "Research Article",
-        "doi": "10.1038/...",
-        "free_full_text": true
+        "doi": "10.1038/..."
     },
     "curation_status": "pending",
     "relevance_score": 0.85,
@@ -209,7 +208,7 @@ def omics_search(self, request, pk=None):
     "paper": {
         "pmid": "37124580",
         "title": "...",
-        "abstract_text": "...",
+        "abstract": "...",
         "authors": [
             {"position": 1, "last_name": "Smith", "initials": "JA", "country": "USA"}
         ],
@@ -371,8 +370,8 @@ src/app/
             ├── papers/page.tsx    — Tabela de papers + filtros + curadoria
             ├── datasets/page.tsx  — Tabela de datasets
             ├── links/page.tsx     — Links literatura ↔ ômica
-            ├── analysis/page.tsx  — Gráficos e visualizações
-            ├── export/page.tsx    — Exportação
+            ├── analysis/page.tsx  — Gráficos e visualizações (Fase 5, não implementado)
+            ├── export/page.tsx    — Exportação (Fase 5, não implementado)
             └── jobs/page.tsx      — Monitoramento de jobs
 ```
 
@@ -465,11 +464,10 @@ export function useProjectDatasets(projectId: string, filters: DatasetFilters) {
 interface Paper {
     pmid: string;
     title: string;
-    abstract_text?: string;
+    abstract?: string;
     journal: string;
     pub_year: number;
     pub_type?: string;
-    free_full_text: boolean;
     genes: PaperGene[];
     drugs: PaperDrug[];
     mesh_terms: PaperMeSHTerm[];

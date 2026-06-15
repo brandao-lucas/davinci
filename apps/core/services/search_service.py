@@ -1,3 +1,5 @@
+from django.db import transaction
+
 from apps.core.models import DaVinciProject, IngestionJob
 from apps.core.tasks.ingestion_tasks import run_omics_ingestion, run_pubmed_ingestion
 
@@ -21,19 +23,30 @@ class SearchService:
         if project.query_synonyms:
             combined_query = f"{project.query_term} OR {' OR '.join(project.query_synonyms)}"
 
-        job = IngestionJob.objects.create(
-            project=project,
-            job_type=IngestionJob.JobType.PUBMED_SEARCH,
-            parameters={
-                'query': combined_query,
-                'date_from': project.date_from,
-                'date_to': project.date_to,
-                'synonyms': project.query_synonyms,
-                'ncbi_api_key': ncbi_key or None,
-            }
-        )
-        # Despacha para Celery (não bloqueia)
-        run_pubmed_ingestion.delay(str(job.id))
+        with transaction.atomic():
+            job = IngestionJob.objects.create(
+                project=project,
+                job_type=IngestionJob.JobType.PUBMED_SEARCH,
+                parameters={
+                    'query': combined_query,
+                    'date_from': project.date_from,
+                    'date_to': project.date_to,
+                    'synonyms': project.query_synonyms,
+                    'ncbi_api_key': ncbi_key or None,
+                }
+            )
+
+        # Fora da transação: se .delay() falhar, marcamos o Job como FAILED
+        # para não deixar órfãos em PENDING.
+        try:
+            run_pubmed_ingestion.delay(str(job.id))
+        except Exception as exc:
+            IngestionJob.objects.filter(id=job.id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=f'Failed to dispatch Celery task: {exc}',
+            )
+            raise
+
         return job
 
     @staticmethod
@@ -62,17 +75,29 @@ class SearchService:
         if project.query_synonyms:
             combined_query = f"{project.query_term} OR {' OR '.join(project.query_synonyms)}"
 
-        job = IngestionJob.objects.create(
-            project=project,
-            job_type=IngestionJob.JobType.GEO_SEARCH,
-            parameters={
-                'query': combined_query,
-                'sources': sources,
-                'max_per_source': max_per_source,
-                'synonyms': project.query_synonyms,
-                'ncbi_api_key': ncbi_key or None,
-            },
-        )
-        run_omics_ingestion.delay(str(job.id))
+        with transaction.atomic():
+            job = IngestionJob.objects.create(
+                project=project,
+                job_type=IngestionJob.JobType.GEO_SEARCH,
+                parameters={
+                    'query': combined_query,
+                    'sources': sources,
+                    'max_per_source': max_per_source,
+                    'synonyms': project.query_synonyms,
+                    'ncbi_api_key': ncbi_key or None,
+                },
+            )
+
+        # Fora da transação: se .delay() falhar, marcamos o Job como FAILED
+        # para não deixar órfãos em PENDING.
+        try:
+            run_omics_ingestion.delay(str(job.id))
+        except Exception as exc:
+            IngestionJob.objects.filter(id=job.id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=f'Failed to dispatch Celery task: {exc}',
+            )
+            raise
+
         return job
 

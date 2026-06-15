@@ -67,11 +67,11 @@ pub async fn fetch_geo_datasets(
         return Ok((vec![], vec![]));
     }
 
-    // Step 2 — esummary in batches of 100
+    // Step 2 — esummary in batches of 25 (NCBI GET URL length limit ~4KB)
     let mut all_datasets: Vec<OmicDatasetData> = Vec::with_capacity(uids.len());
     let mut all_links: Vec<DatasetPaperLinkData> = Vec::new();
 
-    for chunk in uids.chunks(100) {
+    for chunk in uids.chunks(25) {
         let ids_csv = chunk.join(",");
         let summary_params = [
             ("db", "gds"),
@@ -108,7 +108,16 @@ pub async fn fetch_geo_datasets(
 
             let gpl = entry.gpl.unwrap_or_default();
             let bioproject_id = entry.bioproject.unwrap_or_default();
-            let original_accession = entry.gse.or(entry.accession).unwrap_or_default();
+            // GEO can return semicolon-separated GSE accessions — take only the first
+            let original_accession = entry
+                .gse
+                .or(entry.accession)
+                .unwrap_or_default()
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
 
             if original_accession.is_empty() {
                 continue;
@@ -117,7 +126,7 @@ pub async fn fetch_geo_datasets(
             // Unification: if bioproject_id is present, use it as the primary accession.
             // This allows merging GEO and BioProject records on the same study ID.
             let accession = if !bioproject_id.is_empty() {
-                bioproject_id.clone()
+                bioproject_id.split(';').next().unwrap_or_default().trim().to_string()
             } else {
                 original_accession.clone()
             };

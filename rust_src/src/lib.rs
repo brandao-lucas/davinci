@@ -489,14 +489,146 @@ fn resolve_pending_links(db_url: String) -> PyResult<u64> {
     }
 }
 
+// ─── Sample ingestion (Op 4.2) ────────────────────────────────────────────────
+
+/// Result type returned by `ingest_samples_for_dataset`.
+#[pyclass]
+#[derive(Clone)]
+pub struct SampleIngestionResult {
+    /// Number of samples fetched from the remote API before deduplication.
+    #[pyo3(get, set)]
+    pub samples_fetched: u64,
+    /// Number of rows written (inserted + updated) in `core_omicsample`.
+    #[pyo3(get, set)]
+    pub samples_written: u64,
+    /// Non-fatal errors encountered during fetch/parse/write.
+    #[pyo3(get, set)]
+    pub errors: Vec<String>,
+}
+
+#[pymethods]
+impl SampleIngestionResult {
+    #[new]
+    fn new() -> Self {
+        SampleIngestionResult {
+            samples_fetched: 0,
+            samples_written: 0,
+            errors: Vec::new(),
+        }
+    }
+}
+
+/// Fetch and ingest per-sample metadata for a single OmicDataset.
+///
+/// Designed to be called **on demand** by the backend when a dataset is curated
+/// as `included` (Op 4.3 — `run_sample_ingestion` Celery task).
+///
+/// # Arguments
+///
+/// | Parameter           | Type           | Description |
+/// |---------------------|----------------|-------------|
+/// | `dataset_id`        | `i64`          | Integer PK of the OmicDataset row in `core_omicdataset`. Written as FK in every `core_omicsample` row. |
+/// | `dataset_accession` | `str`          | External accession (e.g. "GSE12345", "SRP123456"). Drives the NCBI fetch. |
+/// | `source_db`         | `str`          | One of "geo", "sra", "bioproject", "gwas_catalog". Selects the fetch/parse path. |
+/// | `db_url`            | `str`          | PostgreSQL connection string (same as the other functions). |
+/// | `ncbi_api_key`      | `Option[str]`  | NCBI API key (raises rate limit 3→10 req/s). Pass `None` when absent. |
+///
+/// # Returns
+///
+/// `SampleIngestionResult` with:
+/// - `samples_fetched`: count of samples returned by the remote API.
+/// - `samples_written`: rows inserted or updated in `core_omicsample` (COPY result).
+/// - `errors`: list of non-fatal error strings (empty on full success).
+///
+/// On fatal error (DB connection, COPY failure) raises `PyRuntimeError`.
+///
+/// # Notes on fetch strategy
+///
+/// - **GEO:** `efetch db=gse acc=GSExxxxx rettype=soft retmode=text`
+///   SOFT is line-delimited and compact; one download per dataset.
+/// - **SRA:** `efetch db=sra acc=SRPxxxxxx rettype=xml retmode=xml`
+///   Returns `<EXPERIMENT_PACKAGE_SET>`; each package has a `<SAMPLE>` element.
+/// - **bioproject / gwas_catalog:** no per-sample API exists; returns empty, no error.
+#[pyfunction]
+#[pyo3(signature = (dataset_id, dataset_accession, source_db, db_url, ncbi_api_key=None))]
+fn ingest_samples_for_dataset(
+    dataset_id: i64,
+    dataset_accession: String,
+    source_db: String,
+    db_url: String,
+    ncbi_api_key: Option<String>,
+) -> PyResult<SampleIngestionResult> {
+    let rt = Runtime::new().unwrap();
+
+    let result: Result<SampleIngestionResult, String> = rt.block_on(async {
+        // 1. Connect to DB
+        let db_client = match crate::db::connection::connect_db(&db_url).await {
+            Ok(c) => c,
+            Err(e) => return Err(format!("DB connection failed: {e}")),
+        };
+
+        let mut errors: Vec<String> = Vec::new();
+
+        // 2. Fetch samples from NCBI (or return empty for unsupported sources)
+        let ncbi = crate::ncbi::client::NcbiClient::new(ncbi_api_key);
+        let samples = match crate::omics::sample_parser::fetch_samples_for_dataset(
+            &ncbi,
+            dataset_id,
+            &dataset_accession,
+            &source_db,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                // Fetch failed — non-fatal, return empty with error recorded
+                errors.push(format!("sample fetch error: {e}"));
+                vec![]
+            }
+        };
+
+        let samples_fetched = samples.len() as u64;
+
+        if samples.is_empty() {
+            return Ok(SampleIngestionResult {
+                samples_fetched: 0,
+                samples_written: 0,
+                errors,
+            });
+        }
+
+        // 3. COPY samples into core_omicsample (fatal on DB error)
+        let samples_written =
+            match crate::db::copy_writer::copy_omic_samples(&db_client, &samples).await {
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(format!("copy_omic_samples failed: {:?}", e));
+                }
+            };
+
+        Ok(SampleIngestionResult {
+            samples_fetched,
+            samples_written,
+            errors,
+        })
+    });
+
+    match result {
+        Ok(res) => Ok(res),
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
 // ─── Python module registration ───────────────────────────────────────────────
 
 #[pymodule]
 fn rust_engine(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IngestionResult>()?;
     m.add_class::<OmicsResult>()?;
+    m.add_class::<SampleIngestionResult>()?;
     m.add_function(wrap_pyfunction!(search_and_ingest_pubmed, m)?)?;
     m.add_function(wrap_pyfunction!(search_and_ingest_omics, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_pending_links, m)?)?;
+    m.add_function(wrap_pyfunction!(ingest_samples_for_dataset, m)?)?;
     Ok(())
 }

@@ -8,12 +8,14 @@ import { DatasetBulkCurationBar } from '@/components/datasets/dataset-bulk-curat
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { QueryErrorState } from '@/components/ui/query-error-state';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useDatasets } from '@/lib/hooks/use-datasets';
 import { useJobs, useJobPolling } from '@/lib/hooks/use-jobs';
-import { useDispatchOmicsSearch } from '@/lib/hooks/use-projects';
+import { useDispatchOmicsSearch, useProject } from '@/lib/hooks/use-projects';
 import { useDebounce } from '@/lib/hooks/use-debounce';
+import { descriptorsChangedSinceLastSearch } from '@/lib/utils/descriptor-diff';
 import { useFilterStore } from '@/lib/stores/filter-store';
 import type { OmicDataset } from '@/lib/types/dataset';
 import { Loader2, Search, Database } from 'lucide-react';
@@ -37,6 +39,9 @@ export default function DatasetsPage({ params }: { params: Promise<{ projectId: 
   const { datasetFilters, setDatasetFilters } = useFilterStore();
   const filters = datasetFilters[projectId] ?? {};
 
+  // Dados do projeto (para comparar descritores com o último job)
+  const { data: project } = useProject(projectId);
+
   // Omics search dispatch + job polling
   const dispatchOmics = useDispatchOmicsSearch(projectId);
   const { data: jobs } = useJobs(projectId);
@@ -46,8 +51,22 @@ export default function DatasetsPage({ params }: { params: Promise<{ projectId: 
   const jobIsActive = latestOmicsJob?.status === 'pending' || latestOmicsJob?.status === 'running';
   const isSearching = dispatchOmics.isPending || jobIsActive;
 
+  // Desabilita o botão quando os descritores não mudaram desde a última busca omics concluída
+  const descriptorsChanged = project
+    ? descriptorsChangedSinceLastSearch(project, jobs?.results, 'geo_search')
+    : true;
+  const alreadySearched = !descriptorsChanged;
+  const isSearchDisabled = isSearching || alreadySearched;
+
+  let searchButtonTitle: string | undefined;
+  if (dispatchOmics.isError) {
+    searchButtonTitle = 'Failed to start search — check if Celery worker is running';
+  } else if (alreadySearched && !isSearching) {
+    searchButtonTitle = 'Já buscado com os descritores atuais. Altere termo/sinônimos/datas para rebuscar.';
+  }
+
   const activeFilters = { ...filters, search: debouncedQuery || undefined };
-  const { data, isLoading } = useDatasets(projectId, activeFilters);
+  const { data, isLoading, isError, error, refetch } = useDatasets(projectId, activeFilters);
   const datasets = data?.results ?? [];
 
   return (
@@ -58,9 +77,9 @@ export default function DatasetsPage({ params }: { params: Promise<{ projectId: 
         actions={
           <Button
             onClick={() => dispatchOmics.mutate({})}
-            disabled={isSearching}
+            disabled={isSearchDisabled}
             variant={dispatchOmics.isError ? 'destructive' : 'default'}
-            title={dispatchOmics.isError ? 'Failed to start search — check if Celery worker is running' : undefined}
+            title={searchButtonTitle}
           >
             {isSearching
               ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" />Searching datasets…</>
@@ -152,6 +171,8 @@ export default function DatasetsPage({ params }: { params: Promise<{ projectId: 
 
           {isLoading ? (
             <div className="h-64 bg-muted rounded-lg animate-pulse" />
+          ) : isError ? (
+            <QueryErrorState error={error} onRetry={() => refetch()} />
           ) : (
             <DatasetsTable
               datasets={datasets}

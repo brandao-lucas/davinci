@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use tokio_postgres::Client;
 
 use crate::ncbi::models::PaperData;
-use crate::omics::models::{DatasetPaperLinkData, OmicDatasetData};
+use crate::omics::models::{DatasetPaperLinkData, OmicDatasetData, OmicSampleData};
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -714,7 +714,8 @@ pub async fn copy_paper_genes(
     let affected = client
         .execute(
             "INSERT INTO core_papergene (paper_id, gene_symbol, mention_count)
-             SELECT paper_id, gene_symbol, mention_count FROM _staging_gene
+             SELECT paper_id, gene_symbol, SUM(mention_count) FROM _staging_gene
+             GROUP BY paper_id, gene_symbol
              ON CONFLICT (paper_id, gene_symbol) DO UPDATE SET mention_count = EXCLUDED.mention_count",
             &[],
         )
@@ -781,7 +782,8 @@ pub async fn copy_paper_drugs(
     let affected = client
         .execute(
             "INSERT INTO core_paperdrug (paper_id, drug_name, drug_name_lower, mention_count, drugbank_id)
-             SELECT paper_id, drug_name, drug_name_lower, mention_count, drugbank_id FROM _staging_drug
+             SELECT paper_id, MIN(drug_name), drug_name_lower, SUM(mention_count), MIN(drugbank_id) FROM _staging_drug
+             GROUP BY paper_id, drug_name_lower
              ON CONFLICT (paper_id, drug_name_lower) DO UPDATE SET mention_count = EXCLUDED.mention_count",
             &[],
         )
@@ -839,7 +841,8 @@ pub async fn store_pending_links(
     let affected = client
         .execute(
             "INSERT INTO core_datasetpaperlinkpending (dataset_accession, paper_pmid, link_source, created_at)
-             SELECT dataset_accession, paper_pmid, link_source, NOW() FROM _staging_pending_link
+             SELECT dataset_accession, paper_pmid, MIN(link_source), NOW() FROM _staging_pending_link
+             GROUP BY dataset_accession, paper_pmid
              ON CONFLICT (dataset_accession, paper_pmid) DO NOTHING",
             &[],
         )
@@ -948,4 +951,130 @@ pub async fn link_project_papers(
         .await?;
 
     Ok(affected)
+}
+
+// ─── OmicSample bulk writer ───────────────────────────────────────────────────
+
+/// Bulk-upsert omics samples into `core_omicsample`.
+///
+/// Uses a temp staging table + COPY FROM STDIN + INSERT … ON CONFLICT DO UPDATE.
+///
+/// Conflict key: `accession` (globally unique natural key for GSM/SRS).
+/// On conflict: update mutable fields (title, source_name, organism, tax_id,
+/// platform, characteristics, extra_metadata, updated_at).
+/// `ingested_at` is intentionally excluded from the UPDATE clause — it records
+/// the first time this sample was seen and must not be overwritten.
+///
+/// Returns the number of rows inserted or updated.
+pub async fn copy_omic_samples(
+    client: &Client,
+    samples: &[OmicSampleData],
+) -> Result<u64, tokio_postgres::Error> {
+    if samples.is_empty() {
+        return Ok(0);
+    }
+
+    // --- Dedup within batch by accession ---
+    // In practice each accession should appear once, but guard just in case.
+    let mut seen: HashSet<&str> = HashSet::with_capacity(samples.len());
+    let deduped: Vec<&OmicSampleData> = samples
+        .iter()
+        .filter(|s| seen.insert(s.accession.as_str()))
+        .collect();
+
+    // Create temp staging table
+    client
+        .execute("DROP TABLE IF EXISTS _staging_omicsample", &[])
+        .await?;
+    client
+        .execute(
+            "CREATE TEMP TABLE _staging_omicsample (
+                dataset_id      BIGINT,
+                accession       VARCHAR(100),
+                title           TEXT,
+                source_name     TEXT,
+                organism        VARCHAR(200),
+                tax_id          INTEGER,
+                platform        VARCHAR(200),
+                characteristics JSONB,
+                extra_metadata  JSONB,
+                ingested_at     TIMESTAMPTZ,
+                updated_at      TIMESTAMPTZ
+            )",
+            &[],
+        )
+        .await?;
+
+    // Build CSV and COPY into staging
+    let csv = build_sample_csv(&deduped);
+    bulk_insert_csv(
+        client,
+        "COPY _staging_omicsample (
+            dataset_id, accession, title, source_name, organism, tax_id,
+            platform, characteristics, extra_metadata, ingested_at, updated_at
+        ) FROM STDIN WITH (FORMAT csv, NULL 'NULL')",
+        &csv,
+    )
+    .await?;
+
+    // Upsert from staging into core_omicsample
+    let affected = client
+        .execute(
+            "INSERT INTO core_omicsample (
+                dataset_id, accession, title, source_name, organism, tax_id,
+                platform, characteristics, extra_metadata, ingested_at, updated_at
+            )
+            SELECT
+                dataset_id, accession, title, source_name, organism, tax_id,
+                platform, characteristics, extra_metadata, ingested_at, updated_at
+            FROM _staging_omicsample
+            ON CONFLICT (accession) DO UPDATE SET
+                title           = CASE
+                    WHEN length(EXCLUDED.title) > length(core_omicsample.title)
+                    THEN EXCLUDED.title
+                    ELSE core_omicsample.title END,
+                source_name     = COALESCE(NULLIF(EXCLUDED.source_name, ''), core_omicsample.source_name),
+                organism        = COALESCE(NULLIF(EXCLUDED.organism, ''), core_omicsample.organism),
+                tax_id          = COALESCE(EXCLUDED.tax_id, core_omicsample.tax_id),
+                platform        = COALESCE(NULLIF(EXCLUDED.platform, ''), core_omicsample.platform),
+                characteristics = core_omicsample.characteristics || EXCLUDED.characteristics,
+                extra_metadata  = core_omicsample.extra_metadata  || EXCLUDED.extra_metadata,
+                updated_at      = NOW()",
+            &[],
+        )
+        .await?;
+
+    client
+        .execute("DROP TABLE IF EXISTS _staging_omicsample", &[])
+        .await?;
+
+    Ok(affected)
+}
+
+/// Emit a CSV row for each `OmicSampleData`.
+fn build_sample_csv(samples: &[&OmicSampleData]) -> String {
+    let now = Utc::now().format("%Y-%m-%d %H:%M:%S%.6f+00").to_string();
+    let mut csv = String::new();
+    for s in samples {
+        let char_str =
+            serde_json::to_string(&s.characteristics).unwrap_or_else(|_| "{}".to_string());
+        let extra_str =
+            serde_json::to_string(&s.extra_metadata).unwrap_or_else(|_| "{}".to_string());
+        let row = format!(
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            s.dataset_id,
+            escape_csv_field(&sanitize_str(&s.accession, 100)),
+            escape_csv_field(&s.title),
+            escape_csv_field(&s.source_name),
+            escape_csv_field(&sanitize_str(&s.organism, 200)),
+            s.tax_id.map_or("NULL".to_string(), |v| v.to_string()),
+            escape_csv_field(&sanitize_str(&s.platform, 200)),
+            escape_csv_field(&char_str),
+            escape_csv_field(&extra_str),
+            &now,
+            &now,
+        );
+        csv.push_str(&row);
+    }
+    csv
 }

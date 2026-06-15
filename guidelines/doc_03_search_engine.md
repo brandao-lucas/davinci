@@ -18,7 +18,7 @@ SearchService (apps/core/services/search_service.py)
 Celery (apps/core/tasks/ingestion_tasks.py)
     → chama rust_engine via PyO3
     ↓
-Rust Engine (rust_engine/src/lib.rs)
+Rust Engine (rust_src/src/lib.rs)
     → esearch → efetch → parse → NER → COPY
 ```
 
@@ -98,7 +98,7 @@ result = rust_engine.search_and_ingest_omics(
 
 ## Rust Engine — Busca de Literatura
 
-### Entry Point: `search_and_ingest_pubmed(...)` em `rust_engine/src/lib.rs`
+### Entry Point: `search_and_ingest_pubmed(...)` em `rust_src/src/lib.rs`
 
 ```rust
 #[pyfunction]
@@ -154,7 +154,7 @@ pub fn search_and_ingest_pubmed(
 
 ## Rust Engine — Busca de Ômica
 
-### Entry Point: `search_and_ingest_omics(...)` em `rust_engine/src/lib.rs`
+### Entry Point: `search_and_ingest_omics(...)` em `rust_src/src/lib.rs`
 
 ```rust
 #[pyfunction]
@@ -211,9 +211,12 @@ omics::type_classifier::classify_omic_type(title, summary, platform)
 
 db::copy_writer::copy_omic_datasets(datasets, conn)
   → COPY INTO core_omicdataset (ON CONFLICT DO UPDATE)
+  → Deduplicação intra-batch: agrega omic_type, mantém título/summary mais longo
 
 db::copy_writer::copy_dataset_paper_links(links, conn)
-  → COPY INTO core_datasetpaperlink (ON CONFLICT DO NOTHING)
+  → Tenta COPY INTO core_datasetpaperlink (ON CONFLICT DO NOTHING)
+  → Links com paper ainda não ingerido vão para core_datasetpaperlinkpending (staging)
+  → Resolução pendente feita após ingestion de papers pela Celery task
 
 db::copy_writer::link_project_datasets(accessions, project_id, conn)
   → Insere ProjectDataset para cada dataset encontrado
@@ -238,7 +241,7 @@ pub struct NcbiClient {
 - `max_retries = 5`
 - Backoff exponencial: 1s → 2s → 4s → 8s → 16s
 - Respeita header `Retry-After` quando presente (HTTP 429)
-- Timeout por requisição: 30s
+- Timeout por requisição: 120s
 
 ### E-utilities Usadas
 
@@ -317,6 +320,7 @@ qs = ProjectPaper.objects.filter(
 ).annotate(
     rank=SearchRank('paper__search_vector', query)
 ).order_by('-rank')
+# FTS indexado sobre title (peso A) e abstract (peso B)
 ```
 
 ### Endpoints de FTS
@@ -340,7 +344,6 @@ Além do FTS, os endpoints de listagem suportam filtros:
 | `journal` | Nome exato do periódico |
 | `pub_type` | Tipo de publicação |
 | `has_abstract` | Boolean — tem abstract? |
-| `free_full_text` | Boolean — PMC disponível? |
 | `clinical_category` | Slug da ClinicalCategory |
 
 ### Datasets (`/datasets/`)
