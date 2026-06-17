@@ -122,15 +122,15 @@ export function ProjectCard({ project }: { project: DaVinciProject }) {
           <Link href={`/projects/${project.id}`} className="block">
             <p className="text-sm text-muted-foreground font-mono">{project.query_term}</p>
 
-            {project.stats && (
+            {(project.total_papers > 0 || project.total_datasets > 0) && (
               <div className="flex items-center gap-4 text-sm text-muted-foreground mt-3">
                 <span className="flex items-center gap-1">
                   <FileText className="h-3.5 w-3.5" />
-                  {project.stats.total_papers} papers
+                  {project.total_papers} papers
                 </span>
                 <span className="flex items-center gap-1">
                   <Database className="h-3.5 w-3.5" />
-                  {project.stats.total_datasets} datasets
+                  {project.total_datasets} datasets
                 </span>
               </div>
             )}

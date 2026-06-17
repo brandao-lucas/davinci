@@ -1,4 +1,5 @@
 from django.shortcuts import get_object_or_404
+from drf_spectacular.utils import extend_schema
 from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -16,6 +17,8 @@ class ProjectPaperDatasetViewSet(mixins.ListModelMixin, viewsets.GenericViewSet)
     reject:  POST /projects/{project_pk}/links/{id}/reject/
     """
     serializer_class = ProjectPaperDatasetSerializer
+    # stub para drf-spectacular; get_queryset() prevalece em runtime
+    queryset = ProjectPaperDataset.objects.none()
 
     def _get_project(self):
         return get_object_or_404(
@@ -35,6 +38,12 @@ class ProjectPaperDatasetViewSet(mixins.ListModelMixin, viewsets.GenericViewSet)
             .order_by('-created_at')
         )
 
+    @extend_schema(
+        request=None,
+        responses={200: ProjectPaperDatasetSerializer},
+        summary="Confirmar link literatura-ômica",
+        description="Define confidence=confirmed no link entre paper e dataset.",
+    )
     @action(detail=True, methods=['post'])
     def confirm(self, request, project_pk=None, pk=None):
         link = self.get_object()
@@ -42,6 +51,12 @@ class ProjectPaperDatasetViewSet(mixins.ListModelMixin, viewsets.GenericViewSet)
         link.save(update_fields=['confidence'])
         return Response(ProjectPaperDatasetSerializer(link).data)
 
+    @extend_schema(
+        request=None,
+        responses={200: ProjectPaperDatasetSerializer},
+        summary="Rejeitar link literatura-ômica",
+        description="Define confidence=rejected no link entre paper e dataset.",
+    )
     @action(detail=True, methods=['post'])
     def reject(self, request, project_pk=None, pk=None):
         link = self.get_object()

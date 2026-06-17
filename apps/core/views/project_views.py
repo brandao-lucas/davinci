@@ -4,14 +4,20 @@ import io
 import uuid
 
 from django.db import IntegrityError
+from django.db.models import Count
 from django.http import JsonResponse, StreamingHttpResponse
 from django.utils.text import slugify
+from drf_spectacular.utils import extend_schema, OpenApiResponse
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from apps.core.models import DaVinciProject, ProjectPaper
-from apps.core.serializers.project import DaVinciProjectSerializer
+from apps.core.serializers.project import (
+    DaVinciProjectSerializer,
+    JobDispatchResponseSerializer,
+    OmicsSearchRequestSerializer,
+)
 from apps.core.serializers.stats import ProjectStatsSerializer
 from apps.core.services.search_service import SearchService
 from apps.core.services.stats_service import StatsService
@@ -19,9 +25,15 @@ from apps.core.services.stats_service import StatsService
 
 class DaVinciProjectViewSet(viewsets.ModelViewSet):
     serializer_class = DaVinciProjectSerializer
+    # queryset stub para que o drf-spectacular consiga inspecionar o modelo
+    # sem disparar _get_project(); get_queryset() prevalece em runtime.
+    queryset = DaVinciProject.objects.none()
 
     def get_queryset(self):
-        return DaVinciProject.objects.filter(user=self.request.user)
+        return DaVinciProject.objects.filter(user=self.request.user).annotate(
+            total_papers=Count('project_papers', distinct=True),
+            total_datasets=Count('project_datasets', distinct=True),
+        )
 
     def perform_create(self, serializer):
         title = serializer.validated_data.get('title', 'project')
@@ -37,6 +49,12 @@ class DaVinciProjectViewSet(viewsets.ModelViewSet):
                 continue
         raise IntegrityError(f"Could not generate unique slug for '{title}'")
 
+    @extend_schema(
+        request=None,
+        responses={202: JobDispatchResponseSerializer},
+        summary="Disparar busca PubMed",
+        description="Cria e enfileira um job de busca de literatura no PubMed para o projeto.",
+    )
     @action(detail=True, methods=['post'])
     def search(self, request, pk=None):
         """Dispara busca no PubMed."""
@@ -47,6 +65,12 @@ class DaVinciProjectViewSet(viewsets.ModelViewSet):
             status=status.HTTP_202_ACCEPTED,
         )
 
+    @extend_schema(
+        request=OmicsSearchRequestSerializer,
+        responses={202: JobDispatchResponseSerializer},
+        summary="Disparar busca ômica",
+        description="Cria e enfileira um job de busca em GEO/SRA/BioProject/GWAS para o projeto.",
+    )
     @action(detail=True, methods=['post'], url_path='omics_search')
     def omics_search(self, request, pk=None):
         """Dispara busca em GEO/SRA/BioProject/GWAS."""
@@ -61,6 +85,11 @@ class DaVinciProjectViewSet(viewsets.ModelViewSet):
             status=status.HTTP_202_ACCEPTED,
         )
 
+    @extend_schema(
+        responses={200: ProjectStatsSerializer},
+        summary="Estatísticas do projeto",
+        description="Retorna ProjectStats calculadas on-the-fly se ausentes.",
+    )
     @action(detail=True, methods=['get'])
     def stats(self, request, pk=None):
         """Return ProjectStats, computing on the fly if missing."""
@@ -69,6 +98,14 @@ class DaVinciProjectViewSet(viewsets.ModelViewSet):
         serializer = ProjectStatsSerializer(project_stats)
         return Response(serializer.data)
 
+    @extend_schema(
+        responses={
+            200: OpenApiResponse(description="JSON com papers incluídos"),
+            200: OpenApiResponse(description="CSV com papers incluídos (quando export_format=csv)"),
+        },
+        summary="Exportar papers incluídos",
+        description="Exporta papers com curation_status=included em JSON (padrão) ou CSV (?export_format=csv).",
+    )
     @action(detail=True, methods=['get'])
     def export(self, request, pk=None):
         """

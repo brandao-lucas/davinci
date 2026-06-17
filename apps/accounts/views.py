@@ -1,9 +1,23 @@
+from drf_spectacular.utils import extend_schema
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 
 from apps.accounts.models import UserProfile
 from apps.accounts.serializers import UserProfileSerializer, UserProfileUpdateSerializer
+
+
+class _VerifyTokenResponseSerializer(UserProfileSerializer):
+    """Alias interno usado apenas para declaração de schema."""
+    pass
+
+
+import rest_framework.serializers as _s
+
+
+class _VerifyTokenOkSerializer(_s.Serializer):
+    status = _s.CharField()
+    uid = _s.CharField()
 
 
 class MeView(APIView):
@@ -16,6 +30,11 @@ class MeView(APIView):
     """
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        responses={200: UserProfileSerializer},
+        summary="Perfil do usuário autenticado",
+        description="Retorna (criando se necessário) o UserProfile do usuário Firebase autenticado.",
+    )
     def get(self, request):
         profile, _created = UserProfile.objects.select_related('user').get_or_create(
             user=request.user,
@@ -26,6 +45,12 @@ class MeView(APIView):
         )
         return Response(UserProfileSerializer(profile).data)
 
+    @extend_schema(
+        request=UserProfileUpdateSerializer,
+        responses={200: UserProfileSerializer},
+        summary="Atualizar perfil do usuário",
+        description="Atualiza campos de perfil (institution, research_area, orcid_id, first_name, last_name).",
+    )
     def patch(self, request):
         profile, _created = UserProfile.objects.select_related('user').get_or_create(
             user=request.user,
@@ -49,6 +74,12 @@ class VerifyTokenView(APIView):
     """
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        request=None,
+        responses={200: _VerifyTokenOkSerializer},
+        summary="Verificar token Firebase",
+        description="Retorna 200 com status=valid se o token Bearer é válido. 401 caso contrário.",
+    )
     def post(self, request):
         return Response({
             'status': 'valid',

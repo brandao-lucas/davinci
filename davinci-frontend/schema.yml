@@ -1,0 +1,3307 @@
+openapi: 3.0.3
+info:
+  title: DaVinci API
+  version: 1.0.0
+  description: API da plataforma DaVinci — ingestão, curadoria e exportação de literatura
+    e metadados ômicos.
+paths:
+  /api/v1/auth/me/:
+    get:
+      operationId: auth_me_retrieve
+      description: Retorna (criando se necessário) o UserProfile do usuário Firebase
+        autenticado.
+      summary: Perfil do usuário autenticado
+      tags:
+      - auth
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+          description: ''
+    patch:
+      operationId: auth_me_partial_update
+      description: Atualiza campos de perfil (institution, research_area, orcid_id,
+        first_name, last_name).
+      summary: Atualizar perfil do usuário
+      tags:
+      - auth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedUserProfileUpdate'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedUserProfileUpdate'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedUserProfileUpdate'
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+          description: ''
+  /api/v1/auth/verify/:
+    post:
+      operationId: auth_verify_create
+      description: Retorna 200 com status=valid se o token Bearer é válido. 401 caso
+        contrário.
+      summary: Verificar token Firebase
+      tags:
+      - auth
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/_VerifyTokenOk'
+          description: ''
+  /api/v1/clinical-categories/:
+    get:
+      operationId: clinical_categories_list
+      description: |-
+        Read-only global clinical categories.
+        GET /api/v1/clinical-categories/
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - clinical-categories
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedClinicalCategoryList'
+          description: ''
+  /api/v1/projects/:
+    get:
+      operationId: projects_list
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedDaVinciProjectList'
+          description: ''
+    post:
+      operationId: projects_create
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DaVinciProject'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/DaVinciProject'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/DaVinciProject'
+        required: true
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DaVinciProject'
+          description: ''
+  /api/v1/projects/{id}/:
+    get:
+      operationId: projects_retrieve
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        description: A UUID string identifying this da vinci project.
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DaVinciProject'
+          description: ''
+    put:
+      operationId: projects_update
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        description: A UUID string identifying this da vinci project.
+        required: true
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DaVinciProject'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/DaVinciProject'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/DaVinciProject'
+        required: true
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DaVinciProject'
+          description: ''
+    patch:
+      operationId: projects_partial_update
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        description: A UUID string identifying this da vinci project.
+        required: true
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedDaVinciProject'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedDaVinciProject'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedDaVinciProject'
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DaVinciProject'
+          description: ''
+    delete:
+      operationId: projects_destroy
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        description: A UUID string identifying this da vinci project.
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '204':
+          description: No response body
+  /api/v1/projects/{id}/export/:
+    get:
+      operationId: projects_export_retrieve
+      description: Exporta papers com curation_status=included em JSON (padrão) ou
+        CSV (?export_format=csv).
+      summary: Exportar papers incluídos
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        description: A UUID string identifying this da vinci project.
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          description: CSV com papers incluídos (quando export_format=csv)
+  /api/v1/projects/{id}/omics_search/:
+    post:
+      operationId: projects_omics_search_create
+      description: Cria e enfileira um job de busca em GEO/SRA/BioProject/GWAS para
+        o projeto.
+      summary: Disparar busca ômica
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        description: A UUID string identifying this da vinci project.
+        required: true
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OmicsSearchRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/OmicsSearchRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/OmicsSearchRequest'
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobDispatchResponse'
+          description: ''
+  /api/v1/projects/{id}/search/:
+    post:
+      operationId: projects_search_create
+      description: Cria e enfileira um job de busca de literatura no PubMed para o
+        projeto.
+      summary: Disparar busca PubMed
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        description: A UUID string identifying this da vinci project.
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobDispatchResponse'
+          description: ''
+  /api/v1/projects/{id}/stats/:
+    get:
+      operationId: projects_stats_retrieve
+      description: Retorna ProjectStats calculadas on-the-fly se ausentes.
+      summary: Estatísticas do projeto
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        description: A UUID string identifying this da vinci project.
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectStats'
+          description: ''
+  /api/v1/projects/{project_pk}/categories/:
+    get:
+      operationId: projects_categories_list
+      description: |-
+        CRUD for project-scoped custom categories.
+        /projects/{project_pk}/categories/
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedUserCategoryList'
+          description: ''
+    post:
+      operationId: projects_categories_create
+      description: |-
+        CRUD for project-scoped custom categories.
+        /projects/{project_pk}/categories/
+      parameters:
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCategory'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/UserCategory'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/UserCategory'
+        required: true
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserCategory'
+          description: ''
+  /api/v1/projects/{project_pk}/categories/{id}/:
+    patch:
+      operationId: projects_categories_partial_update
+      description: |-
+        CRUD for project-scoped custom categories.
+        /projects/{project_pk}/categories/
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedUserCategory'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedUserCategory'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedUserCategory'
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserCategory'
+          description: ''
+    delete:
+      operationId: projects_categories_destroy
+      description: |-
+        CRUD for project-scoped custom categories.
+        /projects/{project_pk}/categories/
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '204':
+          description: No response body
+  /api/v1/projects/{project_pk}/datasets/:
+    get:
+      operationId: projects_datasets_list
+      description: |-
+        Curadoria de datasets ômicos dentro de um projeto.
+
+        list:   GET  /projects/{project_pk}/datasets/
+        detail: GET  /projects/{project_pk}/datasets/{id}/
+        patch:  PATCH /projects/{project_pk}/datasets/{id}/
+        search: GET  /projects/{project_pk}/datasets/search/?q=term
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedProjectDatasetListList'
+          description: ''
+  /api/v1/projects/{project_pk}/datasets/{dataset_pk}/samples/:
+    get:
+      operationId: projects_datasets_samples_list
+      description: |-
+        Curadoria de amostras ômicas dentro de um projeto.
+
+        Rotas registradas em urls.py:
+          list/filter:  GET  /projects/{project_pk}/samples/
+          detail:       GET  /projects/{project_pk}/samples/{id}/
+          patch:        PATCH /projects/{project_pk}/samples/{id}/
+          bulk_curate:  POST /projects/{project_pk}/samples/bulk_curate/
+
+        Rota por dataset (para a página de samples de um dataset específico):
+          GET  /projects/{project_pk}/datasets/{dataset_pk}/samples/
+          (mesma view, parâmetro dataset_pk opcional tratado em get_queryset)
+
+        firebase-auth-guard: _get_project filtra sempre por request.user.
+        curation-audit-trail: perform_update e bulk_curate setam curated_at;
+          sem DELETE — exclusão é curation_status='excluded'.
+        postgres-fts-patterns: select_related em todos os querysets (sem N+1).
+      parameters:
+      - in: path
+        name: dataset_pk
+        schema:
+          type: integer
+        required: true
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedProjectSampleListList'
+          description: ''
+  /api/v1/projects/{project_pk}/datasets/{id}/:
+    get:
+      operationId: projects_datasets_retrieve
+      description: |-
+        Curadoria de datasets ômicos dentro de um projeto.
+
+        list:   GET  /projects/{project_pk}/datasets/
+        detail: GET  /projects/{project_pk}/datasets/{id}/
+        patch:  PATCH /projects/{project_pk}/datasets/{id}/
+        search: GET  /projects/{project_pk}/datasets/search/?q=term
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectDatasetDetail'
+          description: ''
+    patch:
+      operationId: projects_datasets_partial_update
+      description: |-
+        Curadoria de datasets ômicos dentro de um projeto.
+
+        list:   GET  /projects/{project_pk}/datasets/
+        detail: GET  /projects/{project_pk}/datasets/{id}/
+        patch:  PATCH /projects/{project_pk}/datasets/{id}/
+        search: GET  /projects/{project_pk}/datasets/search/?q=term
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedProjectDatasetCurate'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedProjectDatasetCurate'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedProjectDatasetCurate'
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectDatasetCurate'
+          description: ''
+  /api/v1/projects/{project_pk}/datasets/bulk_curate/:
+    post:
+      operationId: projects_datasets_bulk_curate_create
+      description: Atualiza curation_status de múltiplos ProjectDatasets. Dispara
+        SAMPLE_FETCH para os incluídos.
+      summary: Curadoria em massa de datasets
+      parameters:
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasetBulkCurateRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/DatasetBulkCurateRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/DatasetBulkCurateRequest'
+        required: true
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BulkCurateResponse'
+          description: ''
+  /api/v1/projects/{project_pk}/datasets/search/:
+    get:
+      operationId: projects_datasets_search_list
+      description: 'Busca full-text em datasets do projeto via search_vector. Parâmetro
+        obrigatório: ?q=termo.'
+      summary: Busca FTS em datasets do projeto
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedProjectDatasetListList'
+          description: ''
+  /api/v1/projects/{project_pk}/jobs/:
+    get:
+      operationId: projects_jobs_list
+      description: |-
+        Read + cancel ingestion jobs for a project.
+
+        list:   GET  /projects/{project_pk}/jobs/
+        detail: GET  /projects/{project_pk}/jobs/{id}/
+        cancel: POST /projects/{project_pk}/jobs/{id}/cancel/
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedIngestionJobList'
+          description: ''
+  /api/v1/projects/{project_pk}/jobs/{id}/:
+    get:
+      operationId: projects_jobs_retrieve
+      description: |-
+        Read + cancel ingestion jobs for a project.
+
+        list:   GET  /projects/{project_pk}/jobs/
+        detail: GET  /projects/{project_pk}/jobs/{id}/
+        cancel: POST /projects/{project_pk}/jobs/{id}/cancel/
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestionJob'
+          description: ''
+  /api/v1/projects/{project_pk}/jobs/{id}/cancel/:
+    post:
+      operationId: projects_jobs_cancel_create
+      description: Cancela um job que ainda não atingiu estado terminal (completed/failed).
+      summary: Cancelar job de ingestão
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestionJob'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobCancelError'
+          description: ''
+  /api/v1/projects/{project_pk}/links/:
+    get:
+      operationId: projects_links_list
+      description: |-
+        Literature ↔ Omics links within a project.
+
+        list:    GET  /projects/{project_pk}/links/
+        confirm: POST /projects/{project_pk}/links/{id}/confirm/
+        reject:  POST /projects/{project_pk}/links/{id}/reject/
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedProjectPaperDatasetList'
+          description: ''
+  /api/v1/projects/{project_pk}/links/{id}/confirm/:
+    post:
+      operationId: projects_links_confirm_create
+      description: Define confidence=confirmed no link entre paper e dataset.
+      summary: Confirmar link literatura-ômica
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectPaperDataset'
+          description: ''
+  /api/v1/projects/{project_pk}/links/{id}/reject/:
+    post:
+      operationId: projects_links_reject_create
+      description: Define confidence=rejected no link entre paper e dataset.
+      summary: Rejeitar link literatura-ômica
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectPaperDataset'
+          description: ''
+  /api/v1/projects/{project_pk}/papers/:
+    get:
+      operationId: projects_papers_list
+      description: |-
+        Curadoria de papers dentro de um projeto.
+
+        list:   GET  /projects/{project_pk}/papers/
+        detail: GET  /projects/{project_pk}/papers/{id}/
+        patch:  PATCH /projects/{project_pk}/papers/{id}/
+        categorize: POST /projects/{project_pk}/papers/{id}/categorize/
+        bulk_curate: POST /projects/{project_pk}/papers/bulk_curate/
+        search: GET  /projects/{project_pk}/papers/search/?q=term
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedProjectPaperListList'
+          description: ''
+  /api/v1/projects/{project_pk}/papers/{id}/:
+    get:
+      operationId: projects_papers_retrieve
+      description: |-
+        Curadoria de papers dentro de um projeto.
+
+        list:   GET  /projects/{project_pk}/papers/
+        detail: GET  /projects/{project_pk}/papers/{id}/
+        patch:  PATCH /projects/{project_pk}/papers/{id}/
+        categorize: POST /projects/{project_pk}/papers/{id}/categorize/
+        bulk_curate: POST /projects/{project_pk}/papers/bulk_curate/
+        search: GET  /projects/{project_pk}/papers/search/?q=term
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectPaperDetail'
+          description: ''
+    patch:
+      operationId: projects_papers_partial_update
+      description: |-
+        Curadoria de papers dentro de um projeto.
+
+        list:   GET  /projects/{project_pk}/papers/
+        detail: GET  /projects/{project_pk}/papers/{id}/
+        patch:  PATCH /projects/{project_pk}/papers/{id}/
+        categorize: POST /projects/{project_pk}/papers/{id}/categorize/
+        bulk_curate: POST /projects/{project_pk}/papers/bulk_curate/
+        search: GET  /projects/{project_pk}/papers/search/?q=term
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedProjectPaperCurate'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedProjectPaperCurate'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedProjectPaperCurate'
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectPaperCurate'
+          description: ''
+  /api/v1/projects/{project_pk}/papers/{id}/categorize/:
+    post:
+      operationId: projects_papers_categorize_create
+      description: Adiciona ou remove categorias clínicas e de usuário de um ProjectPaper.
+      summary: Categorizar paper
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaperCategorizeRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PaperCategorizeRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PaperCategorizeRequest'
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectPaperDetail'
+          description: ''
+  /api/v1/projects/{project_pk}/papers/bulk_curate/:
+    post:
+      operationId: projects_papers_bulk_curate_create
+      description: Atualiza curation_status de múltiplos ProjectPapers em uma operação.
+      summary: Curadoria em massa de papers
+      parameters:
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaperBulkCurateRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PaperBulkCurateRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PaperBulkCurateRequest'
+        required: true
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaperBulkCurateResponse'
+          description: ''
+  /api/v1/projects/{project_pk}/papers/search/:
+    get:
+      operationId: projects_papers_search_list
+      description: 'Busca full-text em papers do projeto via search_vector. Parâmetro
+        obrigatório: ?q=termo.'
+      summary: Busca FTS em papers do projeto
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedProjectPaperListList'
+          description: ''
+  /api/v1/projects/{project_pk}/samples/:
+    get:
+      operationId: projects_samples_list
+      description: |-
+        Curadoria de amostras ômicas dentro de um projeto.
+
+        Rotas registradas em urls.py:
+          list/filter:  GET  /projects/{project_pk}/samples/
+          detail:       GET  /projects/{project_pk}/samples/{id}/
+          patch:        PATCH /projects/{project_pk}/samples/{id}/
+          bulk_curate:  POST /projects/{project_pk}/samples/bulk_curate/
+
+        Rota por dataset (para a página de samples de um dataset específico):
+          GET  /projects/{project_pk}/datasets/{dataset_pk}/samples/
+          (mesma view, parâmetro dataset_pk opcional tratado em get_queryset)
+
+        firebase-auth-guard: _get_project filtra sempre por request.user.
+        curation-audit-trail: perform_update e bulk_curate setam curated_at;
+          sem DELETE — exclusão é curation_status='excluded'.
+        postgres-fts-patterns: select_related em todos os querysets (sem N+1).
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedProjectSampleListList'
+          description: ''
+  /api/v1/projects/{project_pk}/samples/{id}/:
+    get:
+      operationId: projects_samples_retrieve
+      description: |-
+        Curadoria de amostras ômicas dentro de um projeto.
+
+        Rotas registradas em urls.py:
+          list/filter:  GET  /projects/{project_pk}/samples/
+          detail:       GET  /projects/{project_pk}/samples/{id}/
+          patch:        PATCH /projects/{project_pk}/samples/{id}/
+          bulk_curate:  POST /projects/{project_pk}/samples/bulk_curate/
+
+        Rota por dataset (para a página de samples de um dataset específico):
+          GET  /projects/{project_pk}/datasets/{dataset_pk}/samples/
+          (mesma view, parâmetro dataset_pk opcional tratado em get_queryset)
+
+        firebase-auth-guard: _get_project filtra sempre por request.user.
+        curation-audit-trail: perform_update e bulk_curate setam curated_at;
+          sem DELETE — exclusão é curation_status='excluded'.
+        postgres-fts-patterns: select_related em todos os querysets (sem N+1).
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectSampleDetail'
+          description: ''
+    patch:
+      operationId: projects_samples_partial_update
+      description: |-
+        Curadoria de amostras ômicas dentro de um projeto.
+
+        Rotas registradas em urls.py:
+          list/filter:  GET  /projects/{project_pk}/samples/
+          detail:       GET  /projects/{project_pk}/samples/{id}/
+          patch:        PATCH /projects/{project_pk}/samples/{id}/
+          bulk_curate:  POST /projects/{project_pk}/samples/bulk_curate/
+
+        Rota por dataset (para a página de samples de um dataset específico):
+          GET  /projects/{project_pk}/datasets/{dataset_pk}/samples/
+          (mesma view, parâmetro dataset_pk opcional tratado em get_queryset)
+
+        firebase-auth-guard: _get_project filtra sempre por request.user.
+        curation-audit-trail: perform_update e bulk_curate setam curated_at;
+          sem DELETE — exclusão é curation_status='excluded'.
+        postgres-fts-patterns: select_related em todos os querysets (sem N+1).
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedProjectSampleCurate'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedProjectSampleCurate'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedProjectSampleCurate'
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectSampleCurate'
+          description: ''
+  /api/v1/projects/{project_pk}/samples/bulk_curate/:
+    post:
+      operationId: projects_samples_bulk_curate_create
+      description: Atualiza curation_status de múltiplos ProjectSamples em uma operação.
+      summary: Curadoria em massa de samples
+      parameters:
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SampleBulkCurateRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/SampleBulkCurateRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/SampleBulkCurateRequest'
+        required: true
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BulkCurateResponse'
+          description: ''
+components:
+  schemas:
+    BlankEnum:
+      enum:
+      - ''
+    BulkCurateResponse:
+      type: object
+      description: 'Resposta genérica de operações bulk: quantidade de registros atualizados.'
+      properties:
+        updated:
+          type: integer
+      required:
+      - updated
+    ClinicalCategory:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        slug:
+          type: string
+          maxLength: 50
+          pattern: ^[-a-zA-Z0-9_]+$
+        name:
+          type: string
+          title: Nome
+          maxLength: 100
+        description:
+          type: string
+          title: Descrição
+        keywords:
+          title: Keywords de Classificação
+          description: Termos usados pelo Rust para detectar esta categoria no abstract
+        is_default:
+          type: boolean
+          title: Categoria Padrão
+          description: True para os 5 eixos padrão (não deletável)
+        priority:
+          type: integer
+          maximum: 32767
+          minimum: 0
+          title: Prioridade
+      required:
+      - id
+      - name
+      - slug
+    ClinicalCategoryBrief:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        slug:
+          type: string
+          maxLength: 50
+          pattern: ^[-a-zA-Z0-9_]+$
+        name:
+          type: string
+          title: Nome
+          maxLength: 100
+      required:
+      - id
+      - name
+      - slug
+    ConfidenceEnum:
+      enum:
+      - auto
+      - confirmed
+      - rejected
+      type: string
+      description: |-
+        * `auto` - Automático (elink/co-ocorrência)
+        * `confirmed` - Confirmado pelo Pesquisador
+        * `rejected` - Rejeitado pelo Pesquisador
+    CurationStatusEnum:
+      enum:
+      - pending
+      - included
+      - excluded
+      - maybe
+      type: string
+      description: |-
+        * `pending` - Pendente
+        * `included` - Incluído
+        * `excluded` - Excluído
+        * `maybe` - Talvez
+    DaVinciProject:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        query_synonyms:
+          type: array
+          items:
+            type: string
+        target_organisms:
+          type: array
+          items:
+            type: string
+        target_tissues:
+          type: array
+          items:
+            type: string
+        total_papers:
+          type: integer
+          readOnly: true
+          default: 0
+        total_datasets:
+          type: integer
+          readOnly: true
+          default: 0
+        slug:
+          type: string
+          readOnly: true
+          title: Identificador
+          description: 'Gerado automaticamente: {titulo}_{user}_davinci'
+          pattern: ^[-a-zA-Z0-9_]+$
+        title:
+          type: string
+          title: Título do Projeto
+          maxLength: 255
+        description:
+          type: string
+          title: Descrição
+        query_term:
+          type: string
+          title: Termo de Busca Principal
+          description: 'Ex: "hidradenitis AND cancer", "cardiovascular disease"'
+          maxLength: 500
+        date_from:
+          type: integer
+          maximum: 32767
+          minimum: 0
+          nullable: true
+          title: Ano Inicial
+        date_to:
+          type: integer
+          maximum: 32767
+          minimum: 0
+          nullable: true
+          title: Ano Final
+        status:
+          allOf:
+          - $ref: '#/components/schemas/DaVinciProjectStatusEnum'
+          readOnly: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+        user:
+          type: integer
+          readOnly: true
+      required:
+      - created_at
+      - id
+      - query_term
+      - slug
+      - status
+      - title
+      - total_datasets
+      - total_papers
+      - updated_at
+      - user
+    DaVinciProjectStatusEnum:
+      enum:
+      - draft
+      - searching
+      - curating
+      - analyzing
+      - complete
+      type: string
+      description: |-
+        * `draft` - Rascunho
+        * `searching` - Buscando
+        * `curating` - Em Curadoria
+        * `analyzing` - Analisando
+        * `complete` - Completo
+    DatasetBulkCurateRequest:
+      type: object
+      description: Body de bulk_curate de datasets.
+      properties:
+        dataset_ids:
+          type: array
+          items:
+            type: integer
+          description: Lista de IDs de ProjectDataset a atualizar.
+        curation_status:
+          allOf:
+          - $ref: '#/components/schemas/DatasetCurationStatusEnum'
+          description: |-
+            Status de curadoria a aplicar.
+
+            * `pending` - Pendente
+            * `included` - Incluído
+            * `excluded` - Excluído
+            * `queued` - Na Fila de Download
+            * `downloaded` - Baixado
+        exclusion_reason:
+          type: string
+          default: ''
+          description: Motivo de exclusão (usado quando curation_status=excluded).
+      required:
+      - curation_status
+      - dataset_ids
+    DatasetCurationStatusEnum:
+      enum:
+      - pending
+      - included
+      - excluded
+      - queued
+      - downloaded
+      type: string
+      description: |-
+        * `pending` - Pendente
+        * `included` - Incluído
+        * `excluded` - Excluído
+        * `queued` - Na Fila de Download
+        * `downloaded` - Baixado
+    EntityContext:
+      type: object
+      properties:
+        entity_type:
+          $ref: '#/components/schemas/EntityTypeEnum'
+        entity_name:
+          type: string
+          title: Nome da Entidade
+          maxLength: 255
+        sentence:
+          type: string
+          title: Sentença Contexto
+          description: Sentença do abstract contendo a entidade
+        sentence_position:
+          type: integer
+          maximum: 32767
+          minimum: 0
+          title: Posição no Abstract
+          description: Índice da sentença no abstract (0-based)
+      required:
+      - entity_name
+      - entity_type
+      - sentence
+    EntityTypeEnum:
+      enum:
+      - gene
+      - drug
+      - variant
+      - disease
+      - pathway
+      type: string
+      description: |-
+        * `gene` - Gene
+        * `drug` - Droga
+        * `variant` - Variante
+        * `disease` - Doença
+        * `pathway` - Pathway
+    IngestionJob:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        job_type:
+          allOf:
+          - $ref: '#/components/schemas/JobTypeEnum'
+          readOnly: true
+        status:
+          allOf:
+          - $ref: '#/components/schemas/IngestionJobStatusEnum'
+          readOnly: true
+        parameters:
+          readOnly: true
+          description: Query, date range, PMIDs, etc.
+        records_processed:
+          type: integer
+          readOnly: true
+        records_inserted:
+          type: integer
+          readOnly: true
+        records_updated:
+          type: integer
+          readOnly: true
+        error_message:
+          type: string
+          readOnly: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        started_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+        completed_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+      required:
+      - completed_at
+      - created_at
+      - error_message
+      - id
+      - job_type
+      - parameters
+      - records_inserted
+      - records_processed
+      - records_updated
+      - started_at
+      - status
+    IngestionJobStatusEnum:
+      enum:
+      - pending
+      - running
+      - completed
+      - failed
+      - cancelled
+      type: string
+      description: |-
+        * `pending` - Pendente
+        * `running` - Executando
+        * `completed` - Completo
+        * `failed` - Falhou
+        * `cancelled` - Cancelado
+    JobCancelError:
+      type: object
+      description: Resposta de erro quando o job já está em estado terminal.
+      properties:
+        detail:
+          type: string
+      required:
+      - detail
+    JobDispatchResponse:
+      type: object
+      description: Resposta de ações que despacham um job de ingestão (202 Accepted).
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+      required:
+      - job_id
+      - status
+    JobTypeEnum:
+      enum:
+      - pubmed_search
+      - pubmed_fetch
+      - geo_search
+      - sra_search
+      - gwas_search
+      - sample_fetch
+      - variant_annotation
+      - gene_ner
+      - drug_ner
+      - context_extraction
+      type: string
+      description: |-
+        * `pubmed_search` - Busca PubMed
+        * `pubmed_fetch` - Fetch PubMed XML
+        * `geo_search` - Busca GEO
+        * `sra_search` - Busca SRA
+        * `gwas_search` - Busca GWAS Catalog
+        * `sample_fetch` - Fetch de Amostras
+        * `variant_annotation` - Anotação de Variantes
+        * `gene_ner` - Extração de Genes
+        * `drug_ner` - Extração de Drogas
+        * `context_extraction` - Extração de Contextos
+    OmicDataset:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        accession:
+          type: string
+          description: GSE, SRP, PRJNA, E-MTAB, etc.
+          maxLength: 50
+        source_db:
+          allOf:
+          - $ref: '#/components/schemas/SourceDbEnum'
+          title: Banco de Origem
+        bioproject_id:
+          type: string
+          maxLength: 50
+        title:
+          type: string
+          title: Título
+        summary:
+          type: string
+          title: Resumo/Descrição
+        omic_type:
+          title: Tipo Ômico
+          oneOf:
+          - $ref: '#/components/schemas/OmicTypeEnum'
+          - $ref: '#/components/schemas/BlankEnum'
+        omic_subcategory:
+          type: string
+          title: Subcategoria
+          description: 'Ex: RNA-Seq, WGS, ChIP-Seq, 16S'
+          maxLength: 500
+        organism:
+          type: string
+          title: Organismo
+          maxLength: 200
+        tax_id:
+          type: integer
+          maximum: 2147483647
+          minimum: 0
+          nullable: true
+          title: Taxonomy ID
+        n_samples:
+          type: integer
+          maximum: 2147483647
+          minimum: 0
+          nullable: true
+          title: Número de Amostras
+        platform:
+          type: string
+          title: Plataforma
+          description: GPL number ou nome da tecnologia
+          maxLength: 200
+        extra_metadata:
+          type: object
+          readOnly: true
+        is_active:
+          type: boolean
+        ingested_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - accession
+      - extra_metadata
+      - id
+      - ingested_at
+      - source_db
+      - title
+    OmicSample:
+      type: object
+      description: Serializer read-only do dado compartilhado OmicSample.
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        accession:
+          type: string
+          description: GSM, SRR, SRS, etc. — chave natural da amostra
+          maxLength: 50
+        title:
+          type: string
+          title: Título
+        source_name:
+          type: string
+          description: 'Tecido/fonte declarada da amostra (ex: "blood", "tumor biopsy")'
+          maxLength: 500
+        organism:
+          type: string
+          title: Organismo
+          maxLength: 200
+        tax_id:
+          type: integer
+          maximum: 2147483647
+          minimum: 0
+          nullable: true
+          title: Taxonomy ID
+        platform:
+          type: string
+          title: Plataforma
+          description: GPL number ou nome da tecnologia
+          maxLength: 200
+        characteristics:
+          type: object
+          additionalProperties:
+            type: string
+          readOnly: true
+        extra_metadata:
+          type: object
+          readOnly: true
+        ingested_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - accession
+      - characteristics
+      - extra_metadata
+      - id
+      - ingested_at
+      - updated_at
+    OmicTypeEnum:
+      enum:
+      - genomic
+      - transcriptomic
+      - proteomic
+      - metabolomic
+      - epigenomic
+      - metagenomic
+      - microbiome
+      - multi_omic
+      - other
+      type: string
+      description: |-
+        * `genomic` - Genômica
+        * `transcriptomic` - Transcriptômica
+        * `proteomic` - Proteômica
+        * `metabolomic` - Metabolômica
+        * `epigenomic` - Epigenômica
+        * `metagenomic` - Metagenômica
+        * `microbiome` - Microbiômica
+        * `multi_omic` - Multi-ômica
+        * `other` - Outro
+    OmicsSearchRequest:
+      type: object
+      description: Body de /projects/{id}/omics_search/ — todos os campos são opcionais.
+      properties:
+        sources:
+          type: array
+          items:
+            type: string
+          nullable: true
+          description: Lista de fontes ômicas (GEO, SRA, BioProject, GWAS). Null =
+            todas.
+        max_per_source:
+          type: integer
+          default: 500
+          description: Máximo de registros por fonte.
+    PaginatedClinicalCategoryList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClinicalCategory'
+    PaginatedDaVinciProjectList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/DaVinciProject'
+    PaginatedIngestionJobList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/IngestionJob'
+    PaginatedProjectDatasetListList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProjectDatasetList'
+    PaginatedProjectPaperDatasetList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProjectPaperDataset'
+    PaginatedProjectPaperListList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProjectPaperList'
+    PaginatedProjectSampleListList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProjectSampleList'
+    PaginatedUserCategoryList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserCategory'
+    PaperAuthor:
+      type: object
+      properties:
+        position:
+          type: integer
+          maximum: 32767
+          minimum: 0
+          title: Posição na Lista
+          description: 1 = primeiro autor, último = senior author
+        last_name:
+          type: string
+          title: Sobrenome
+          maxLength: 255
+        initials:
+          type: string
+          title: Iniciais
+          maxLength: 20
+        affiliation:
+          type: string
+          title: Afiliação
+        country:
+          type: string
+          title: País
+          description: Extraído da afiliação via regex no Rust
+          maxLength: 100
+      required:
+      - last_name
+      - position
+    PaperBulkCurateRequest:
+      type: object
+      description: 'Body de bulk_curate: atualiza curation_status para múltiplos papers.'
+      properties:
+        paper_ids:
+          type: array
+          items:
+            type: integer
+          description: Lista de IDs de ProjectPaper a atualizar.
+        curation_status:
+          allOf:
+          - $ref: '#/components/schemas/CurationStatusEnum'
+          description: |-
+            Status de curadoria a aplicar.
+
+            * `pending` - Pendente
+            * `included` - Incluído
+            * `excluded` - Excluído
+            * `maybe` - Talvez
+      required:
+      - curation_status
+      - paper_ids
+    PaperBulkCurateResponse:
+      type: object
+      description: 'Resposta de bulk_curate: quantidade de registros atualizados.'
+      properties:
+        updated:
+          type: integer
+      required:
+      - updated
+    PaperCategorizeRequest:
+      type: object
+      description: 'Body de categorize: adiciona/remove categorias clínicas e de usuário.'
+      properties:
+        clinical_add:
+          type: array
+          items:
+            type: string
+          description: Slugs de categorias clínicas a adicionar.
+        clinical_remove:
+          type: array
+          items:
+            type: string
+          description: Slugs de categorias clínicas a remover.
+        user_add:
+          type: array
+          items:
+            type: integer
+          description: IDs de UserCategory a adicionar.
+        user_remove:
+          type: array
+          items:
+            type: integer
+          description: IDs de UserCategory a remover.
+    PaperDetail:
+      type: object
+      description: Full paper detail with all nested entities.
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        pmid:
+          type: integer
+          maximum: 9223372036854775807
+          minimum: -9223372036854775808
+          format: int64
+          title: PubMed ID
+          description: Identificador único no PubMed
+        pmc_id:
+          type: string
+          maxLength: 20
+        doi:
+          type: string
+          maxLength: 255
+        title:
+          type: string
+          title: Título
+        abstract:
+          type: string
+          title: Resumo
+        journal:
+          type: string
+          title: Periódico (ISO)
+          maxLength: 255
+        pub_year:
+          type: integer
+          maximum: 32767
+          minimum: 0
+          nullable: true
+          title: Ano de Publicação
+        pub_month:
+          type: integer
+          maximum: 32767
+          minimum: 0
+          nullable: true
+          title: Mês de Publicação
+        authors:
+          type: array
+          items:
+            $ref: '#/components/schemas/PaperAuthor'
+          readOnly: true
+        keywords:
+          type: array
+          items:
+            $ref: '#/components/schemas/PaperKeyword'
+          readOnly: true
+        mesh_terms:
+          type: array
+          items:
+            $ref: '#/components/schemas/PaperMeSHTerm'
+          readOnly: true
+        genes:
+          type: array
+          items:
+            $ref: '#/components/schemas/PaperGene'
+          readOnly: true
+        drugs:
+          type: array
+          items:
+            $ref: '#/components/schemas/PaperDrug'
+          readOnly: true
+        variants:
+          type: array
+          items:
+            $ref: '#/components/schemas/PaperVariant'
+          readOnly: true
+        contexts:
+          type: array
+          items:
+            $ref: '#/components/schemas/EntityContext'
+          readOnly: true
+        ingested_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - authors
+      - contexts
+      - drugs
+      - genes
+      - id
+      - ingested_at
+      - keywords
+      - mesh_terms
+      - pmid
+      - title
+      - variants
+    PaperDrug:
+      type: object
+      properties:
+        drug_name:
+          type: string
+          title: Nome da Droga
+          maxLength: 255
+        mention_count:
+          type: integer
+          maximum: 2147483647
+          minimum: 0
+          title: Menções no Abstract
+        drugbank_id:
+          type: string
+          description: Referência cruzada opcional com DrugBank
+          maxLength: 20
+      required:
+      - drug_name
+    PaperGene:
+      type: object
+      properties:
+        gene_symbol:
+          type: string
+          title: Símbolo do Gene
+          maxLength: 50
+        entrez_id:
+          type: integer
+          maximum: 9223372036854775807
+          minimum: -9223372036854775808
+          format: int64
+          nullable: true
+          title: Entrez Gene ID
+        mention_count:
+          type: integer
+          maximum: 2147483647
+          minimum: 0
+          title: Menções no Abstract
+      required:
+      - gene_symbol
+    PaperKeyword:
+      type: object
+      properties:
+        keyword:
+          type: string
+          maxLength: 255
+      required:
+      - keyword
+    PaperMeSHTerm:
+      type: object
+      properties:
+        descriptor:
+          type: string
+          title: MeSH Descriptor
+          maxLength: 255
+        qualifier:
+          type: string
+          title: MeSH Qualifier
+          maxLength: 255
+        is_major_topic:
+          type: boolean
+          title: Major Topic
+          description: MeSH MajorTopicYN="Y"
+      required:
+      - descriptor
+    PaperVariant:
+      type: object
+      properties:
+        rs_number:
+          type: string
+          maxLength: 20
+      required:
+      - rs_number
+    PatchedDaVinciProject:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        query_synonyms:
+          type: array
+          items:
+            type: string
+        target_organisms:
+          type: array
+          items:
+            type: string
+        target_tissues:
+          type: array
+          items:
+            type: string
+        total_papers:
+          type: integer
+          readOnly: true
+          default: 0
+        total_datasets:
+          type: integer
+          readOnly: true
+          default: 0
+        slug:
+          type: string
+          readOnly: true
+          title: Identificador
+          description: 'Gerado automaticamente: {titulo}_{user}_davinci'
+          pattern: ^[-a-zA-Z0-9_]+$
+        title:
+          type: string
+          title: Título do Projeto
+          maxLength: 255
+        description:
+          type: string
+          title: Descrição
+        query_term:
+          type: string
+          title: Termo de Busca Principal
+          description: 'Ex: "hidradenitis AND cancer", "cardiovascular disease"'
+          maxLength: 500
+        date_from:
+          type: integer
+          maximum: 32767
+          minimum: 0
+          nullable: true
+          title: Ano Inicial
+        date_to:
+          type: integer
+          maximum: 32767
+          minimum: 0
+          nullable: true
+          title: Ano Final
+        status:
+          allOf:
+          - $ref: '#/components/schemas/DaVinciProjectStatusEnum'
+          readOnly: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+        user:
+          type: integer
+          readOnly: true
+    PatchedProjectDatasetCurate:
+      type: object
+      description: 'Write-only: update curation fields.'
+      properties:
+        curation_status:
+          $ref: '#/components/schemas/DatasetCurationStatusEnum'
+        exclusion_reason:
+          type: string
+          maxLength: 500
+        notes:
+          type: string
+        relevance_score:
+          type: number
+          format: double
+          nullable: true
+    PatchedProjectPaperCurate:
+      type: object
+      description: 'Write-only: update curation fields.'
+      properties:
+        curation_status:
+          $ref: '#/components/schemas/CurationStatusEnum'
+        exclusion_reason:
+          type: string
+          title: Motivo da Exclusão
+          description: 'Auditável: por que o pesquisador excluiu este paper'
+          maxLength: 500
+        notes:
+          type: string
+          title: Notas do Pesquisador
+        relevance_score:
+          type: number
+          format: double
+          nullable: true
+          title: Score de Relevância
+          description: 0.0 a 1.0 — calculado pelo Rust ou ajustado manualmente
+    PatchedProjectSampleCurate:
+      type: object
+      description: 'Write-only: atualiza apenas campos de curadoria.'
+      properties:
+        curation_status:
+          $ref: '#/components/schemas/CurationStatusEnum'
+        exclusion_reason:
+          type: string
+          maxLength: 500
+        notes:
+          type: string
+        relevance_score:
+          type: number
+          format: double
+          nullable: true
+    PatchedUserCategory:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        name:
+          type: string
+          title: Nome da Categoria
+          maxLength: 100
+        keywords:
+          description: Termos para classificação automática ou manual
+        color:
+          type: string
+          title: Cor (hex)
+          description: Para visualização no frontend
+          maxLength: 7
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+    PatchedUserProfileUpdate:
+      type: object
+      description: Para atualização de perfil pelo pesquisador.
+      properties:
+        orcid_id:
+          type: string
+          nullable: true
+          description: 'ORCID iD do pesquisador (formato: 0000-0000-0000-0000)'
+          maxLength: 50
+        institution:
+          type: string
+          maxLength: 255
+        research_area:
+          type: string
+          maxLength: 255
+        first_name:
+          type: string
+          writeOnly: true
+        last_name:
+          type: string
+          writeOnly: true
+        ncbi_api_key:
+          type: string
+          description: NCBI API Key pessoal (eleva rate limit de 3 para 10 req/s)
+          maxLength: 255
+    ProjectDatasetCurate:
+      type: object
+      description: 'Write-only: update curation fields.'
+      properties:
+        curation_status:
+          $ref: '#/components/schemas/DatasetCurationStatusEnum'
+        exclusion_reason:
+          type: string
+          maxLength: 500
+        notes:
+          type: string
+        relevance_score:
+          type: number
+          format: double
+          nullable: true
+    ProjectDatasetDetail:
+      type: object
+      description: 'Full detail: dataset content + curation fields.'
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        dataset:
+          allOf:
+          - $ref: '#/components/schemas/OmicDataset'
+          readOnly: true
+        curation_status:
+          $ref: '#/components/schemas/DatasetCurationStatusEnum'
+        exclusion_reason:
+          type: string
+          maxLength: 500
+        notes:
+          type: string
+        relevance_score:
+          type: number
+          format: double
+          nullable: true
+        added_at:
+          type: string
+          format: date-time
+          readOnly: true
+        curated_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+      required:
+      - added_at
+      - curated_at
+      - dataset
+      - id
+    ProjectDatasetList:
+      type: object
+      description: Compact list — includes summary and platform for the detail panel.
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        accession:
+          type: string
+          readOnly: true
+        source_db:
+          type: string
+          readOnly: true
+        bioproject_id:
+          type: string
+          readOnly: true
+        title:
+          type: string
+          readOnly: true
+        summary:
+          type: string
+          readOnly: true
+        omic_type:
+          type: string
+          readOnly: true
+        omic_subcategory:
+          type: string
+          readOnly: true
+        organism:
+          type: string
+          readOnly: true
+        n_samples:
+          type: integer
+          readOnly: true
+          nullable: true
+        platform:
+          type: string
+          readOnly: true
+        curation_status:
+          $ref: '#/components/schemas/DatasetCurationStatusEnum'
+        exclusion_reason:
+          type: string
+          maxLength: 500
+        notes:
+          type: string
+        relevance_score:
+          type: number
+          format: double
+          nullable: true
+        added_at:
+          type: string
+          format: date-time
+          readOnly: true
+        curated_at:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+      - accession
+      - added_at
+      - bioproject_id
+      - id
+      - n_samples
+      - omic_subcategory
+      - omic_type
+      - organism
+      - platform
+      - source_db
+      - summary
+      - title
+    ProjectPaperCurate:
+      type: object
+      description: 'Write-only: update curation fields.'
+      properties:
+        curation_status:
+          $ref: '#/components/schemas/CurationStatusEnum'
+        exclusion_reason:
+          type: string
+          title: Motivo da Exclusão
+          description: 'Auditável: por que o pesquisador excluiu este paper'
+          maxLength: 500
+        notes:
+          type: string
+          title: Notas do Pesquisador
+        relevance_score:
+          type: number
+          format: double
+          nullable: true
+          title: Score de Relevância
+          description: 0.0 a 1.0 — calculado pelo Rust ou ajustado manualmente
+    ProjectPaperDataset:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        pmid:
+          type: integer
+          readOnly: true
+        paper_title:
+          type: string
+          readOnly: true
+        accession:
+          type: string
+          readOnly: true
+        dataset_title:
+          type: string
+          readOnly: true
+        omic_type:
+          type: string
+          readOnly: true
+        confidence:
+          $ref: '#/components/schemas/ConfidenceEnum'
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - accession
+      - created_at
+      - dataset_title
+      - id
+      - omic_type
+      - paper_title
+      - pmid
+    ProjectPaperDetail:
+      type: object
+      description: 'Full detail: paper content + curation fields.'
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        paper:
+          allOf:
+          - $ref: '#/components/schemas/PaperDetail'
+          readOnly: true
+        curation_status:
+          $ref: '#/components/schemas/CurationStatusEnum'
+        exclusion_reason:
+          type: string
+          title: Motivo da Exclusão
+          description: 'Auditável: por que o pesquisador excluiu este paper'
+          maxLength: 500
+        notes:
+          type: string
+          title: Notas do Pesquisador
+        relevance_score:
+          type: number
+          format: double
+          nullable: true
+          title: Score de Relevância
+          description: 0.0 a 1.0 — calculado pelo Rust ou ajustado manualmente
+        clinical_categories:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClinicalCategoryBrief'
+          readOnly: true
+        user_categories:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserCategoryBrief'
+          readOnly: true
+        added_at:
+          type: string
+          format: date-time
+          readOnly: true
+        curated_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          title: Curado em
+      required:
+      - added_at
+      - clinical_categories
+      - curated_at
+      - id
+      - paper
+      - user_categories
+    ProjectPaperList:
+      type: object
+      description: Compact representation for list views — includes abstract for detail
+        panel.
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        pmid:
+          type: integer
+          readOnly: true
+        pmc_id:
+          type: string
+          readOnly: true
+        doi:
+          type: string
+          readOnly: true
+        title:
+          type: string
+          readOnly: true
+        abstract:
+          type: string
+          readOnly: true
+        journal:
+          type: string
+          readOnly: true
+        pub_year:
+          type: integer
+          readOnly: true
+        pub_month:
+          type: integer
+          readOnly: true
+          nullable: true
+        pub_type:
+          type: string
+          readOnly: true
+        curation_status:
+          $ref: '#/components/schemas/CurationStatusEnum'
+        exclusion_reason:
+          type: string
+          title: Motivo da Exclusão
+          description: 'Auditável: por que o pesquisador excluiu este paper'
+          maxLength: 500
+        notes:
+          type: string
+          title: Notas do Pesquisador
+        relevance_score:
+          type: number
+          format: double
+          nullable: true
+          title: Score de Relevância
+          description: 0.0 a 1.0 — calculado pelo Rust ou ajustado manualmente
+        clinical_categories:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClinicalCategoryBrief'
+          readOnly: true
+        user_categories:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserCategoryBrief'
+          readOnly: true
+        added_at:
+          type: string
+          format: date-time
+          readOnly: true
+        curated_at:
+          type: string
+          format: date-time
+          nullable: true
+          title: Curado em
+      required:
+      - abstract
+      - added_at
+      - clinical_categories
+      - doi
+      - id
+      - journal
+      - pmc_id
+      - pmid
+      - pub_month
+      - pub_type
+      - pub_year
+      - title
+      - user_categories
+    ProjectSampleCurate:
+      type: object
+      description: 'Write-only: atualiza apenas campos de curadoria.'
+      properties:
+        curation_status:
+          $ref: '#/components/schemas/CurationStatusEnum'
+        exclusion_reason:
+          type: string
+          maxLength: 500
+        notes:
+          type: string
+        relevance_score:
+          type: number
+          format: double
+          nullable: true
+    ProjectSampleDetail:
+      type: object
+      description: Detalhe completo — sample aninhado + campos de curadoria.
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        sample:
+          allOf:
+          - $ref: '#/components/schemas/OmicSample'
+          readOnly: true
+        curation_status:
+          $ref: '#/components/schemas/CurationStatusEnum'
+        exclusion_reason:
+          type: string
+          maxLength: 500
+        notes:
+          type: string
+        relevance_score:
+          type: number
+          format: double
+          nullable: true
+        added_at:
+          type: string
+          format: date-time
+          readOnly: true
+        curated_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+      required:
+      - added_at
+      - curated_at
+      - id
+      - sample
+    ProjectSampleList:
+      type: object
+      description: Lista compacta — campos do sample achatados para evitar N+1 com
+        select_related.
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        accession:
+          type: string
+          readOnly: true
+        title:
+          type: string
+          readOnly: true
+        source_name:
+          type: string
+          readOnly: true
+        organism:
+          type: string
+          readOnly: true
+        tax_id:
+          type: integer
+          readOnly: true
+          nullable: true
+        platform:
+          type: string
+          readOnly: true
+        dataset_id:
+          type: integer
+          readOnly: true
+        dataset_accession:
+          type: string
+          readOnly: true
+        curation_status:
+          $ref: '#/components/schemas/CurationStatusEnum'
+        exclusion_reason:
+          type: string
+          maxLength: 500
+        notes:
+          type: string
+        relevance_score:
+          type: number
+          format: double
+          nullable: true
+        added_at:
+          type: string
+          format: date-time
+          readOnly: true
+        curated_at:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+      - accession
+      - added_at
+      - dataset_accession
+      - dataset_id
+      - id
+      - organism
+      - platform
+      - source_name
+      - tax_id
+      - title
+    ProjectStats:
+      type: object
+      properties:
+        total_papers:
+          type: integer
+          readOnly: true
+        included_papers:
+          type: integer
+          readOnly: true
+        excluded_papers:
+          type: integer
+          readOnly: true
+        pending_papers:
+          type: integer
+          readOnly: true
+        total_datasets:
+          type: integer
+          readOnly: true
+        included_datasets:
+          type: integer
+          readOnly: true
+        total_samples:
+          type: integer
+          readOnly: true
+        included_samples:
+          type: integer
+          readOnly: true
+        papers_by_year:
+          type: object
+          additionalProperties:
+            type: integer
+          readOnly: true
+        papers_by_journal:
+          type: object
+          additionalProperties:
+            type: integer
+          readOnly: true
+        papers_by_country:
+          type: object
+          additionalProperties:
+            type: integer
+          readOnly: true
+        papers_by_clinical_category:
+          type: object
+          additionalProperties:
+            type: integer
+          readOnly: true
+        datasets_by_omic_type:
+          type: object
+          additionalProperties:
+            type: integer
+          readOnly: true
+        datasets_by_organism:
+          type: object
+          additionalProperties:
+            type: integer
+          readOnly: true
+        top_genes:
+          type: array
+          items:
+            type: object
+            properties:
+              gene:
+                type: string
+              count:
+                type: integer
+            required:
+            - gene
+            - count
+          readOnly: true
+        top_drugs:
+          type: array
+          items:
+            type: object
+            properties:
+              drug:
+                type: string
+              count:
+                type: integer
+            required:
+            - drug
+            - count
+          readOnly: true
+        top_mesh_terms:
+          type: array
+          items:
+            type: object
+            properties:
+              term:
+                type: string
+              count:
+                type: integer
+            required:
+            - term
+            - count
+          readOnly: true
+        top_variants:
+          type: array
+          items:
+            type: object
+          readOnly: true
+        last_computed:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - datasets_by_omic_type
+      - datasets_by_organism
+      - excluded_papers
+      - included_datasets
+      - included_papers
+      - included_samples
+      - last_computed
+      - papers_by_clinical_category
+      - papers_by_country
+      - papers_by_journal
+      - papers_by_year
+      - pending_papers
+      - top_drugs
+      - top_genes
+      - top_mesh_terms
+      - top_variants
+      - total_datasets
+      - total_papers
+      - total_samples
+    SampleBulkCurateRequest:
+      type: object
+      description: Body de bulk_curate de samples.
+      properties:
+        sample_ids:
+          type: array
+          items:
+            type: integer
+          description: Lista de IDs de ProjectSample a atualizar.
+        curation_status:
+          allOf:
+          - $ref: '#/components/schemas/CurationStatusEnum'
+          description: |-
+            Status de curadoria a aplicar.
+
+            * `pending` - Pendente
+            * `included` - Incluído
+            * `excluded` - Excluído
+            * `maybe` - Talvez
+        exclusion_reason:
+          type: string
+          default: ''
+          description: Motivo de exclusão (usado quando curation_status=excluded).
+      required:
+      - curation_status
+      - sample_ids
+    SourceDbEnum:
+      enum:
+      - geo
+      - sra
+      - arrayexpress
+      - tcga
+      - bioproject
+      - gwas_catalog
+      type: string
+      description: |-
+        * `geo` - GEO (Gene Expression Omnibus)
+        * `sra` - Sequence Read Archive
+        * `arrayexpress` - ArrayExpress
+        * `tcga` - TCGA
+        * `bioproject` - BioProject
+        * `gwas_catalog` - GWAS Catalog
+    UserCategory:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        name:
+          type: string
+          title: Nome da Categoria
+          maxLength: 100
+        keywords:
+          description: Termos para classificação automática ou manual
+        color:
+          type: string
+          title: Cor (hex)
+          description: Para visualização no frontend
+          maxLength: 7
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - created_at
+      - id
+      - name
+    UserCategoryBrief:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        name:
+          type: string
+          title: Nome da Categoria
+          maxLength: 100
+        color:
+          type: string
+          title: Cor (hex)
+          description: Para visualização no frontend
+          maxLength: 7
+      required:
+      - id
+      - name
+    UserProfile:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        email:
+          type: string
+          format: email
+          readOnly: true
+        first_name:
+          type: string
+          readOnly: true
+        last_name:
+          type: string
+          readOnly: true
+        firebase_uid:
+          type: string
+          readOnly: true
+          description: UID do Firebase Authentication
+        auth_provider:
+          type: string
+          readOnly: true
+          description: Provider usado no login (google.com, password, oidc.orcid)
+        orcid_id:
+          type: string
+          nullable: true
+          description: 'ORCID iD do pesquisador (formato: 0000-0000-0000-0000)'
+          maxLength: 50
+        institution:
+          type: string
+          maxLength: 255
+        research_area:
+          type: string
+          maxLength: 255
+        avatar_url:
+          type: string
+          format: uri
+          maxLength: 200
+        ncbi_api_key:
+          type: string
+          writeOnly: true
+          description: NCBI API Key pessoal (eleva rate limit de 3 para 10 req/s)
+          maxLength: 255
+      required:
+      - auth_provider
+      - email
+      - firebase_uid
+      - first_name
+      - id
+      - last_name
+    _VerifyTokenOk:
+      type: object
+      properties:
+        status:
+          type: string
+        uid:
+          type: string
+      required:
+      - status
+      - uid
+  securitySchemes:
+    FirebaseAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Firebase ID Token
+      description: Token Firebase obtido via Firebase Authentication SDK.
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: sessionid

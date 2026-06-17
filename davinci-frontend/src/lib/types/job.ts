@@ -1,14 +1,8 @@
-export interface IngestionJob {
-  id: string;
-  project: string;
-  job_type: 'pubmed_search' | 'pubmed_fetch' | 'geo_search' | 'sra_search' | 'variant_annotation' | 'gene_ner';
-  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
-  parameters: Record<string, unknown>;
-  records_processed: number;
-  records_inserted: number;
-  records_updated: number;
-  error_message: string | null;
-  started_at: string | null;
-  completed_at: string | null;
-  created_at: string;
-}
+// Tipos derivados do schema OpenAPI gerado pelo backend.
+// NÃO edite manualmente — altere o serializer Django e rode `npm run gen:types`.
+
+import type { components } from './api-schema';
+
+export type IngestionJob = components['schemas']['IngestionJob'];
+export type JobDispatchResponse = components['schemas']['JobDispatchResponse'];
+export type JobCancelError = components['schemas']['JobCancelError'];

@@ -1,45 +1,19 @@
-export interface Paper {
-  id: number;
-  pmid: string;
-  pmc_id: string | null;
-  doi: string | null;
-  title: string;
-  abstract: string;
-  journal: string;
-  pub_year: number;
-  pub_month: number | null;
-  pub_type: string;
-  authors?: PaperAuthor[];
-  keywords?: string[];
-  mesh_terms?: MeSHTerm[];
-  genes?: PaperGene[];
-  variants?: string[];
-  curation_status: 'pending' | 'included' | 'excluded' | 'maybe';
-  exclusion_reason: string | null;
-  notes: string;
-  relevance_score: number | null;
-}
+// Tipos derivados do schema OpenAPI gerado pelo backend.
+// NÃO edite manualmente — altere o serializer Django e rode `npm run gen:types`.
 
-export interface PaperAuthor {
-  position: number;
-  last_name: string;
-  initials: string;
-  affiliation: string;
-  country: string | null;
-}
+import type { components } from './api-schema';
 
-export interface MeSHTerm {
-  descriptor: string;
-  qualifier: string | null;
-  is_major_topic: boolean;
-}
+// Aliases diretos dos schemas gerados
+export type Paper = components['schemas']['ProjectPaperList'];
+export type PaperDetail = components['schemas']['ProjectPaperDetail'];
+export type PaperAuthor = components['schemas']['PaperAuthor'];
+export type MeSHTerm = components['schemas']['PaperMeSHTerm'];
+export type PaperGene = components['schemas']['PaperGene'];
+export type PaperDrug = components['schemas']['PaperDrug'];
+export type PaperVariant = components['schemas']['PaperVariant'];
+export type PaperKeyword = components['schemas']['PaperKeyword'];
 
-export interface PaperGene {
-  gene_symbol: string;
-  entrez_id: number | null;
-  mention_count: number;
-}
-
+// Filtros de listagem (parâmetros de query — não gerados pelo OpenAPI)
 export interface PaperFilters {
   curation_status?: string;
   pub_year_min?: number;

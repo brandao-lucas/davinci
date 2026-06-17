@@ -9,6 +9,28 @@ except ImportError:
 
 from apps.accounts.services.user_service import UserService
 
+try:
+    from drf_spectacular.extensions import OpenApiAuthenticationExtension
+
+    class FirebaseAuthenticationExtension(OpenApiAuthenticationExtension):
+        """
+        Registra FirebaseAuthentication no schema OpenAPI como Bearer (HTTP).
+        Elimina os warnings "could not resolve authenticator" do drf-spectacular.
+        """
+        target_class = 'apps.accounts.authentication.FirebaseAuthentication'
+        name = 'FirebaseAuth'
+
+        def get_security_definition(self, auto_schema):
+            return {
+                'type': 'http',
+                'scheme': 'bearer',
+                'bearerFormat': 'Firebase ID Token',
+                'description': 'Token Firebase obtido via Firebase Authentication SDK.',
+            }
+
+except ImportError:
+    pass  # drf-spectacular não instalado — extensão ignorada
+
 
 class FirebaseAuthentication(authentication.BaseAuthentication):
     """

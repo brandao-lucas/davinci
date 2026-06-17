@@ -3,6 +3,7 @@ import logging
 from django.contrib.postgres.search import SearchQuery
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from drf_spectacular.utils import extend_schema
 from rest_framework import mixins, viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -12,6 +13,8 @@ from apps.core.serializers.dataset import (
     ProjectDatasetListSerializer,
     ProjectDatasetDetailSerializer,
     ProjectDatasetCurateSerializer,
+    DatasetBulkCurateRequestSerializer,
+    BulkCurateResponseSerializer,
 )
 from apps.core.tasks.ingestion_tasks import run_sample_ingestion
 
@@ -85,6 +88,8 @@ class ProjectDatasetViewSet(
     search: GET  /projects/{project_pk}/datasets/search/?q=term
     """
     http_method_names = ['get', 'patch', 'post', 'head', 'options']
+    # stub para drf-spectacular; get_queryset() prevalece em runtime
+    queryset = ProjectDataset.objects.none()
 
     def _get_project(self):
         return get_object_or_404(
@@ -131,6 +136,12 @@ class ProjectDatasetViewSet(
         if instance.curation_status == ProjectDataset.CurationStatus.INCLUDED:
             _maybe_dispatch_sample_ingestion(instance)
 
+    @extend_schema(
+        request=DatasetBulkCurateRequestSerializer,
+        responses={200: BulkCurateResponseSerializer},
+        summary="Curadoria em massa de datasets",
+        description="Atualiza curation_status de múltiplos ProjectDatasets. Dispara SAMPLE_FETCH para os incluídos.",
+    )
     @action(detail=False, methods=['post'], url_path='bulk_curate')
     def bulk_curate(self, request, project_pk=None):
         """
@@ -167,6 +178,11 @@ class ProjectDatasetViewSet(
 
         return Response({'updated': updated})
 
+    @extend_schema(
+        responses={200: ProjectDatasetListSerializer(many=True)},
+        summary="Busca FTS em datasets do projeto",
+        description="Busca full-text em datasets do projeto via search_vector. Parâmetro obrigatório: ?q=termo.",
+    )
     @action(detail=False, methods=['get'], url_path='search')
     def search(self, request, project_pk=None):
         """FTS on project datasets via dataset.search_vector."""

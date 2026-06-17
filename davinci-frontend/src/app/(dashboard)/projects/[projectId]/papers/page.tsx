@@ -8,7 +8,7 @@ import { PaperFiltersPanel } from '@/components/papers/paper-filters';
 import { BulkCurationBar } from '@/components/papers/bulk-curation-bar';
 import { Input } from '@/components/ui/input';
 import { QueryErrorState } from '@/components/ui/query-error-state';
-import { usePapers } from '@/lib/hooks/use-papers';
+import { usePapers, usePaper } from '@/lib/hooks/use-papers';
 import { useDebounce } from '@/lib/hooks/use-debounce';
 import { useFilterStore } from '@/lib/stores/filter-store';
 import type { Paper } from '@/lib/types/paper';
@@ -16,7 +16,7 @@ import { Search } from 'lucide-react';
 
 export default function PapersPage({ params }: { params: Promise<{ projectId: string }> }) {
   const { projectId } = use(params);
-  const [selectedPaper, setSelectedPaper] = useState<Paper | null>(null);
+  const [selectedPaperId, setSelectedPaperId] = useState<number | null>(null);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const debouncedQuery = useDebounce(searchQuery, 300);
@@ -31,6 +31,16 @@ export default function PapersPage({ params }: { params: Promise<{ projectId: st
 
   const { data, isLoading, isError, error, refetch } = usePapers(projectId, activeFilters);
   const papers = data?.results ?? [];
+
+  // Busca o detalhe completo apenas quando um paper está selecionado.
+  // enabled=false quando selectedPaperId é null — nenhum fetch em idle.
+  const { data: paperDetail, isLoading: detailLoading } = usePaper(
+    projectId,
+    selectedPaperId ?? 0,
+  );
+
+  const handleSelectPaper = (paper: Paper) => setSelectedPaperId(paper.id);
+  const handleCloseDetail = () => setSelectedPaperId(null);
 
   return (
     <div className="space-y-4">
@@ -62,14 +72,19 @@ export default function PapersPage({ params }: { params: Promise<{ projectId: st
           ) : (
             <PapersTable
               papers={papers}
-              onSelect={setSelectedPaper}
+              onSelect={handleSelectPaper}
               onSelectionChange={setSelectedIds}
             />
           )}
         </div>
       </div>
 
-      <PaperDetailPanel paper={selectedPaper} onClose={() => setSelectedPaper(null)} />
+      <PaperDetailPanel
+        paperId={selectedPaperId}
+        detail={paperDetail}
+        isLoading={detailLoading}
+        onClose={handleCloseDetail}
+      />
 
       <BulkCurationBar
         projectId={projectId}

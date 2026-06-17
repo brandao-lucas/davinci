@@ -79,10 +79,18 @@ export function descriptorsChangedSinceLastSearch(
   const queryTermMatch =
     (project.query_term ?? '').trim() === jobQueryTerm;
 
+  // A busca de datasets (geo_search) NÃO usa date_from/date_to — o
+  // dispatch_omics_search não grava essas datas em `parameters` nem as
+  // repassa ao engine. Logo, datas só entram na comparação do pubmed_search;
+  // para geo_search, comparar datas faria o botão ficar sempre habilitado.
+  const compareDates = jobType === 'pubmed_search';
+
   const dateFromMatch =
+    !compareDates ||
     normalizeDate(project.date_from) === normalizeDate(params.date_from);
 
   const dateToMatch =
+    !compareDates ||
     normalizeDate(project.date_to) === normalizeDate(params.date_to);
 
   const allMatch = queryTermMatch && synonymsMatch && dateFromMatch && dateToMatch;

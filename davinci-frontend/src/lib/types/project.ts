@@ -1,41 +1,13 @@
-export interface DaVinciProject {
-  id: string;
-  slug: string;
-  title: string;
-  description: string;
-  query_term: string;
-  query_synonyms: string[];
-  date_from: number | null;
-  date_to: number | null;
-  target_organisms: string[];
-  target_tissues: string[];
-  status: 'draft' | 'searching' | 'curating' | 'analyzing' | 'complete';
-  created_at: string;
-  updated_at: string;
-  stats?: ProjectStats;
-}
+// Tipos derivados do schema OpenAPI gerado pelo backend.
+// NÃO edite manualmente — altere o serializer Django e rode `npm run gen:types`.
 
-export interface ProjectStats {
-  total_papers: number;
-  included_papers: number;
-  excluded_papers: number;
-  pending_papers: number;
-  total_datasets: number;
-  included_datasets: number;
-  total_samples: number;
-  papers_by_year: Record<string, number>;
-  papers_by_journal: Record<string, number>;
-  papers_by_country: Record<string, number>;
-  papers_by_clinical_category: Record<string, number>;
-  datasets_by_omic_type: Record<string, number>;
-  datasets_by_organism: Record<string, number>;
-  top_genes: Array<{ gene: string; count: number }>;
-  top_drugs: Array<{ drug: string; count: number }>;
-  top_mesh_terms: Array<{ term: string; count: number }>;
-  top_variants: Array<{ rs: string; count: number }>;
-  last_computed: string | null;
-}
+import type { components } from './api-schema';
 
+export type DaVinciProject = components['schemas']['DaVinciProject'];
+export type ProjectStats = components['schemas']['ProjectStats'];
+
+// CreateProjectInput: campos editáveis para criação (subconjunto de DaVinciProject)
+// Os campos readOnly (id, slug, status, created_at, updated_at, user) são excluídos.
 export interface CreateProjectInput {
   title: string;
   description?: string;

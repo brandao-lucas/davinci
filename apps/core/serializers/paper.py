@@ -127,3 +127,50 @@ class ProjectPaperCurateSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProjectPaper
         fields = ['curation_status', 'exclusion_reason', 'notes', 'relevance_score']
+
+
+# ── Serializers de schema para ações customizadas ─────────────────────────────
+
+class PaperBulkCurateRequestSerializer(serializers.Serializer):
+    """Body de bulk_curate: atualiza curation_status para múltiplos papers."""
+    paper_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        help_text="Lista de IDs de ProjectPaper a atualizar.",
+    )
+    curation_status = serializers.ChoiceField(
+        choices=ProjectPaper.CurationStatus.choices,
+        help_text="Status de curadoria a aplicar.",
+    )
+
+
+class PaperBulkCurateResponseSerializer(serializers.Serializer):
+    """Resposta de bulk_curate: quantidade de registros atualizados."""
+    updated = serializers.IntegerField()
+
+
+class PaperCategorizeRequestSerializer(serializers.Serializer):
+    """Body de categorize: adiciona/remove categorias clínicas e de usuário."""
+    clinical_add = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list,
+        help_text="Slugs de categorias clínicas a adicionar.",
+    )
+    clinical_remove = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list,
+        help_text="Slugs de categorias clínicas a remover.",
+    )
+    user_add = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        default=list,
+        help_text="IDs de UserCategory a adicionar.",
+    )
+    user_remove = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        default=list,
+        help_text="IDs de UserCategory a remover.",
+    )

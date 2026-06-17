@@ -2,6 +2,7 @@ from django.contrib.postgres.search import SearchQuery, SearchRank
 from django.contrib.postgres.aggregates import ArrayAgg
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from drf_spectacular.utils import extend_schema
 from rest_framework import mixins, viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -13,6 +14,9 @@ from apps.core.serializers.paper import (
     ProjectPaperListSerializer,
     ProjectPaperDetailSerializer,
     ProjectPaperCurateSerializer,
+    PaperBulkCurateRequestSerializer,
+    PaperBulkCurateResponseSerializer,
+    PaperCategorizeRequestSerializer,
 )
 
 
@@ -33,6 +37,8 @@ class ProjectPaperViewSet(
     search: GET  /projects/{project_pk}/papers/search/?q=term
     """
     http_method_names = ['get', 'patch', 'post', 'head', 'options']
+    # stub para drf-spectacular; get_queryset() prevalece em runtime
+    queryset = ProjectPaper.objects.none()
 
     def _get_project(self):
         return get_object_or_404(
@@ -92,6 +98,11 @@ class ProjectPaperViewSet(
     def perform_update(self, serializer):
         serializer.save(curated_at=timezone.now())
 
+    @extend_schema(
+        responses={200: ProjectPaperListSerializer(many=True)},
+        summary="Busca FTS em papers do projeto",
+        description="Busca full-text em papers do projeto via search_vector. Parâmetro obrigatório: ?q=termo.",
+    )
     @action(detail=False, methods=['get'], url_path='search')
     def search(self, request, project_pk=None):
         """FTS on project papers via paper.search_vector."""
@@ -111,6 +122,12 @@ class ProjectPaperViewSet(
         serializer = ProjectPaperListSerializer(qs, many=True)
         return Response(serializer.data)
 
+    @extend_schema(
+        request=PaperCategorizeRequestSerializer,
+        responses={200: ProjectPaperDetailSerializer},
+        summary="Categorizar paper",
+        description="Adiciona ou remove categorias clínicas e de usuário de um ProjectPaper.",
+    )
     @action(detail=True, methods=['post'], url_path='categorize')
     def categorize(self, request, project_pk=None, pk=None):
         """
@@ -154,6 +171,12 @@ class ProjectPaperViewSet(
         serializer = ProjectPaperDetailSerializer(project_paper)
         return Response(serializer.data)
 
+    @extend_schema(
+        request=PaperBulkCurateRequestSerializer,
+        responses={200: PaperBulkCurateResponseSerializer},
+        summary="Curadoria em massa de papers",
+        description="Atualiza curation_status de múltiplos ProjectPapers em uma operação.",
+    )
     @action(detail=False, methods=['post'], url_path='bulk_curate')
     def bulk_curate(self, request, project_pk=None):
         """

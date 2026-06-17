@@ -1,8 +1,16 @@
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 from apps.core.models import OmicDataset, ProjectDataset
 
 
 class OmicDatasetSerializer(serializers.ModelSerializer):
+    # extra_metadata: dict livre de campos específicos da fonte (BioProject, GEO, SRA…)
+    @extend_schema_field({'type': 'object'})
+    def get_extra_metadata(self, obj):
+        return obj.extra_metadata
+
+    extra_metadata = serializers.SerializerMethodField()
+
     class Meta:
         model = OmicDataset
         fields = [
@@ -55,3 +63,28 @@ class ProjectDatasetCurateSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProjectDataset
         fields = ['curation_status', 'exclusion_reason', 'notes', 'relevance_score']
+
+
+# ── Serializers de schema para ações customizadas ─────────────────────────────
+
+class DatasetBulkCurateRequestSerializer(serializers.Serializer):
+    """Body de bulk_curate de datasets."""
+    dataset_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        help_text="Lista de IDs de ProjectDataset a atualizar.",
+    )
+    curation_status = serializers.ChoiceField(
+        choices=ProjectDataset.CurationStatus.choices,
+        help_text="Status de curadoria a aplicar.",
+    )
+    exclusion_reason = serializers.CharField(
+        required=False,
+        default='',
+        allow_blank=True,
+        help_text="Motivo de exclusão (usado quando curation_status=excluded).",
+    )
+
+
+class BulkCurateResponseSerializer(serializers.Serializer):
+    """Resposta genérica de operações bulk: quantidade de registros atualizados."""
+    updated = serializers.IntegerField()

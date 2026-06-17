@@ -2,6 +2,7 @@ import logging
 
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from drf_spectacular.utils import extend_schema
 from rest_framework import mixins, viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -11,7 +12,9 @@ from apps.core.serializers.sample import (
     ProjectSampleListSerializer,
     ProjectSampleDetailSerializer,
     ProjectSampleCurateSerializer,
+    SampleBulkCurateRequestSerializer,
 )
+from apps.core.serializers.dataset import BulkCurateResponseSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +45,8 @@ class ProjectSampleViewSet(
     """
 
     http_method_names = ['get', 'patch', 'post', 'head', 'options']
+    # stub para drf-spectacular; get_queryset() prevalece em runtime
+    queryset = ProjectSample.objects.none()
 
     def _get_project(self) -> DaVinciProject:
         """
@@ -69,8 +74,14 @@ class ProjectSampleViewSet(
         # Espelha o padrão de _get_project(): "404 não vaza existência".
         dataset_pk = self.kwargs.get('dataset_pk') or self.request.query_params.get('dataset')
         if dataset_pk:
-            get_object_or_404(ProjectDataset, project=project, dataset_id=dataset_pk)
-            qs = qs.filter(sample__dataset_id=dataset_pk)
+            # dataset_pk é sempre o ProjectDataset.id (o identificador que a lista de datasets
+            # expõe como campo 'id' via ProjectDatasetListSerializer).
+            # O get_object_or_404 busca por pk= (ProjectDataset.pk), não por dataset_id=
+            # (OmicDataset.pk), garantindo que o mesmo id usado na lista seja válido aqui.
+            # Segurança (007 achado #1): filtra também por project= para garantir que o
+            # dataset pertence ao projeto do usuário — 404 para datasets de outro projeto.
+            project_dataset = get_object_or_404(ProjectDataset, pk=dataset_pk, project=project)
+            qs = qs.filter(sample__dataset_id=project_dataset.dataset_id)
 
         curation_status = self.request.query_params.get('curation_status')
         if curation_status:
@@ -96,6 +107,12 @@ class ProjectSampleViewSet(
         """
         serializer.save(curated_at=timezone.now())
 
+    @extend_schema(
+        request=SampleBulkCurateRequestSerializer,
+        responses={200: BulkCurateResponseSerializer},
+        summary="Curadoria em massa de samples",
+        description="Atualiza curation_status de múltiplos ProjectSamples em uma operação.",
+    )
     @action(detail=False, methods=['post'], url_path='bulk_curate')
     def bulk_curate(self, request, project_pk=None, dataset_pk=None):
         """

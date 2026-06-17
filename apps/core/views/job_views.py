@@ -1,10 +1,11 @@
 from django.shortcuts import get_object_or_404
+from drf_spectacular.utils import extend_schema
 from rest_framework import mixins, viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from apps.core.models import DaVinciProject, IngestionJob
-from apps.core.serializers.job import IngestionJobSerializer
+from apps.core.serializers.job import IngestionJobSerializer, JobCancelErrorSerializer
 
 
 class IngestionJobViewSet(
@@ -20,6 +21,8 @@ class IngestionJobViewSet(
     cancel: POST /projects/{project_pk}/jobs/{id}/cancel/
     """
     serializer_class = IngestionJobSerializer
+    # stub para drf-spectacular; get_queryset() prevalece em runtime
+    queryset = IngestionJob.objects.none()
 
     def _get_project(self):
         return get_object_or_404(
@@ -32,6 +35,15 @@ class IngestionJobViewSet(
         project = self._get_project()
         return IngestionJob.objects.filter(project=project).order_by('-created_at')
 
+    @extend_schema(
+        request=None,
+        responses={
+            200: IngestionJobSerializer,
+            400: JobCancelErrorSerializer,
+        },
+        summary="Cancelar job de ingestão",
+        description="Cancela um job que ainda não atingiu estado terminal (completed/failed).",
+    )
     @action(detail=True, methods=['post'])
     def cancel(self, request, project_pk=None, pk=None):
         job = self.get_object()

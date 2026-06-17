@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import Link from 'next/link';
-import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
@@ -53,7 +53,7 @@ export function DatasetDetailPanel({ dataset, projectId, onClose }: DatasetDetai
   const url = externalUrl(dataset);
 
   const openEdit = () => {
-    setEditStatus(dataset.curation_status);
+    setEditStatus(dataset.curation_status ?? 'pending');
     setNotes(dataset.notes ?? '');
     setEditing(true);
   };
@@ -68,6 +68,9 @@ export function DatasetDetailPanel({ dataset, projectId, onClose }: DatasetDetai
       <SheetContent className="w-full sm:max-w-xl overflow-y-auto">
         <SheetHeader>
           <SheetTitle className="text-base leading-tight pr-6">{dataset.title}</SheetTitle>
+          <SheetDescription>
+            {dataset.accession} · {dataset.source_db}{dataset.omic_type ? ` · ${dataset.omic_type}` : ''}
+          </SheetDescription>
         </SheetHeader>
 
         <div className="mt-4 space-y-4 text-sm">
@@ -166,7 +169,7 @@ export function DatasetDetailPanel({ dataset, projectId, onClose }: DatasetDetai
             <div className="flex items-start justify-between gap-3">
               <div className="space-y-1">
                 <p className="text-muted-foreground text-xs">Curation status</p>
-                <Badge className={statusColors[dataset.curation_status] ?? ''} variant="outline">
+                <Badge className={statusColors[dataset.curation_status ?? ''] ?? ''} variant="outline">
                   {dataset.curation_status}
                 </Badge>
                 {dataset.notes && (

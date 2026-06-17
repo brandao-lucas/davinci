@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
@@ -45,7 +45,7 @@ export function SampleDetailPanel({ sample, projectId, onClose }: SampleDetailPa
   if (!sample) return null;
 
   const openEdit = () => {
-    setEditStatus(sample.curation_status);
+    setEditStatus(sample.curation_status ?? 'pending');
     setNotes(sample.notes ?? '');
     setExclusionReason(sample.exclusion_reason ?? '');
     setEditing(true);
@@ -75,6 +75,9 @@ export function SampleDetailPanel({ sample, projectId, onClose }: SampleDetailPa
         <SheetContent className="w-full sm:max-w-xl overflow-y-auto">
           <SheetHeader>
             <SheetTitle className="text-base leading-tight pr-6">{sample.title}</SheetTitle>
+            <SheetDescription>
+              Sample detail — {sample.accession}{sample.organism ? ` · ${sample.organism}` : ''}
+            </SheetDescription>
           </SheetHeader>
 
           <div className="mt-4 space-y-4 text-sm">
@@ -151,7 +154,7 @@ export function SampleDetailPanel({ sample, projectId, onClose }: SampleDetailPa
               <div className="flex items-start justify-between gap-3">
                 <div className="space-y-1">
                   <p className="text-muted-foreground text-xs">Curation status</p>
-                  <Badge className={statusColors[sample.curation_status] ?? ''} variant="outline">
+                  <Badge className={statusColors[sample.curation_status ?? ''] ?? ''} variant="outline">
                     {sample.curation_status}
                   </Badge>
                   {/* curation-audit-trail: show curated_at */}

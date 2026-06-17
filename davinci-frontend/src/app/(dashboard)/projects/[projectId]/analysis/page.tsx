@@ -13,7 +13,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useProjectStats } from '@/lib/hooks/use-projects';
-import { usePapers } from '@/lib/hooks/use-papers';
+import { usePapers, usePaper } from '@/lib/hooks/use-papers';
 import { useDatasets } from '@/lib/hooks/use-datasets';
 import { useSamplesByProject } from '@/lib/hooks/use-samples';
 import type { Paper } from '@/lib/types/paper';
@@ -42,10 +42,18 @@ export default function AnalysisPage({ params }: { params: Promise<{ projectId: 
   const { data: samplesData, isLoading: samplesLoading } = useSamplesByProject(projectId, INCLUDED_SAMPLES_FILTER);
   const includedSamples = samplesData?.results ?? [];
 
-  // Detail panels (read-only view reuses existing panels)
-  const [selectedPaper, setSelectedPaper] = useState<Paper | null>(null);
+  // Detail panels
+  const [selectedPaperId, setSelectedPaperId] = useState<number | null>(null);
   const [selectedDataset, setSelectedDataset] = useState<OmicDataset | null>(null);
   const [selectedSample, setSelectedSample] = useState<ProjectSample | null>(null);
+
+  const { data: paperDetail, isLoading: detailLoading } = usePaper(
+    projectId,
+    selectedPaperId ?? 0,
+  );
+
+  const handleSelectPaper = (paper: Paper) => setSelectedPaperId(paper.id);
+  const handleCloseDetail = () => setSelectedPaperId(null);
 
   return (
     <div className="space-y-6">
@@ -130,7 +138,7 @@ export default function AnalysisPage({ params }: { params: Promise<{ projectId: 
           ) : (
             <PapersTable
               papers={includedPapers}
-              onSelect={setSelectedPaper}
+              onSelect={handleSelectPaper}
             />
           )}
         </TabsContent>
@@ -169,10 +177,12 @@ export default function AnalysisPage({ params }: { params: Promise<{ projectId: 
         </TabsContent>
       </Tabs>
 
-      {/* Detail panels (shared with curation pages) */}
+      {/* Detail panels */}
       <PaperDetailPanel
-        paper={selectedPaper}
-        onClose={() => setSelectedPaper(null)}
+        paperId={selectedPaperId}
+        detail={paperDetail}
+        isLoading={detailLoading}
+        onClose={handleCloseDetail}
       />
       <DatasetDetailPanel
         dataset={selectedDataset}

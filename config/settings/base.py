@@ -39,6 +39,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'django.contrib.postgres',
     'rest_framework',
+    'drf_spectacular',
     'django_filters',
     'corsheaders',
     'apps.core',
@@ -162,6 +163,24 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 50,
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'DaVinci API',
+    'DESCRIPTION': 'API da plataforma DaVinci — ingestão, curadoria e exportação de literatura e metadados ômicos.',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    # ProjectPaper e ProjectSample têm CurationStatus com choices idênticas
+    # (pending/included/excluded/maybe) → mesmo hash → um único nome para os dois.
+    # ProjectDataset.CurationStatus tem choices diferentes (queued/downloaded) →
+    # hash distinto → nome separado.
+    'ENUM_NAME_OVERRIDES': {
+        # Cobre ProjectPaper.CurationStatus e ProjectSample.CurationStatus (valores idênticos)
+        'CurationStatusEnum': 'apps.core.models.ProjectPaper.CurationStatus',
+        # Cobre ProjectDataset.CurationStatus (tem queued/downloaded extras)
+        'DatasetCurationStatusEnum': 'apps.core.models.ProjectDataset.CurationStatus',
+    },
 }
 
 # Celery

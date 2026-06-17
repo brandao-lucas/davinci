@@ -27,6 +27,8 @@ class UserCategoryViewSet(
     """
     serializer_class = UserCategorySerializer
     http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+    # stub para drf-spectacular; get_queryset() prevalece em runtime
+    queryset = UserCategory.objects.none()
 
     def _get_project(self):
         return get_object_or_404(
