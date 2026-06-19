@@ -8,6 +8,7 @@ from .views.sample_views import ProjectSampleViewSet
 from .views.category_views import ClinicalCategoryViewSet, UserCategoryViewSet
 from .views.link_views import ProjectPaperDatasetViewSet
 from .views.job_views import IngestionJobViewSet
+from .views.gene_views import ProjectGeneViewSet
 
 router = DefaultRouter()
 router.register(r'projects', DaVinciProjectViewSet, basename='project')
@@ -46,6 +47,9 @@ link_reject = ProjectPaperDatasetViewSet.as_view({'post': 'reject'})
 job_list = IngestionJobViewSet.as_view({'get': 'list'})
 job_detail = IngestionJobViewSet.as_view({'get': 'retrieve'})
 job_cancel = IngestionJobViewSet.as_view({'post': 'cancel'})
+
+gene_list = ProjectGeneViewSet.as_view({'get': 'list'})
+gene_detail = ProjectGeneViewSet.as_view({'get': 'gene_detail'})
 
 PROJECT_PREFIX = r'projects/<uuid:project_pk>/'
 
@@ -90,4 +94,8 @@ urlpatterns = [
     path(f'{PROJECT_PREFIX}jobs/', job_list, name='project-job-list'),
     path(f'{PROJECT_PREFIX}jobs/<uuid:pk>/', job_detail, name='project-job-detail'),
     path(f'{PROJECT_PREFIX}jobs/<uuid:pk>/cancel/', job_cancel, name='project-job-cancel'),
+
+    # Genes — lista agregada e detalhe por símbolo
+    path(f'{PROJECT_PREFIX}genes/', gene_list, name='project-gene-list'),
+    path(f'{PROJECT_PREFIX}genes/<str:gene_symbol>/', gene_detail, name='project-gene-detail'),
 ]

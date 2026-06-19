@@ -1,6 +1,7 @@
 'use client';
 
 import { use, useState } from 'react';
+import Link from 'next/link';
 import { PageHeader } from '@/components/layout/page-header';
 import { ProjectStatsOverview } from '@/components/projects/project-stats-overview';
 import { PapersTable } from '@/components/papers/papers-table';
@@ -95,7 +96,14 @@ export default function AnalysisPage({ params }: { params: Promise<{ projectId: 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <Card>
                   <CardHeader>
-                    <CardTitle className="text-sm">Top Genes</CardTitle>
+                    <CardTitle className="text-sm">
+                      <Link
+                        href={`/projects/${projectId}/genes`}
+                        className="hover:underline text-foreground"
+                      >
+                        Top Genes
+                      </Link>
+                    </CardTitle>
                   </CardHeader>
                   <CardContent>
                     <div className="flex flex-wrap gap-2">

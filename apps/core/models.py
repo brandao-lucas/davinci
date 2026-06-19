@@ -781,16 +781,27 @@ class EntityContext(models.Model):
         'Sentença Contexto',
         help_text='Sentença do abstract contendo a entidade'
     )
-    sentence_position = models.PositiveSmallIntegerField(
+    sentence_position = models.SmallIntegerField(
         'Posição no Abstract',
         default=0,
-        help_text='Índice da sentença no abstract (0-based)'
+        help_text='Índice da sentença no abstract (0-based; -1 = sentinela "processado sem snippet")'
+    )
+    computed_at = models.DateTimeField(
+        'Derivado em',
+        null=True,
+        blank=True,
+        help_text=(
+            'Momento em que o snippet foi derivado/materializado. '
+            'Comparar com paper.updated_at para invalidar cache stale.'
+        )
     )
 
     class Meta:
+        unique_together = ['paper', 'entity_type', 'entity_name', 'sentence_position']
         indexes = [
             models.Index(fields=['entity_type', 'entity_name']),
             models.Index(fields=['paper', 'entity_type']),
+            models.Index(fields=['paper', 'entity_type', 'entity_name']),
         ]
 
     def __str__(self):

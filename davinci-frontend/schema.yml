@@ -796,6 +796,106 @@ paths:
               schema:
                 $ref: '#/components/schemas/PaginatedProjectDatasetListList'
           description: ''
+  /api/v1/projects/{project_pk}/genes/:
+    get:
+      operationId: projects_genes_list
+      description: 'Retorna lista paginada de genes mencionados nos papers do projeto,
+        agrupados por gene_symbol. Inclui contagens de citações únicas (included e
+        total) e soma de menções. Filtros: ?q= (icontains no símbolo), ?ordering=
+        (unique_citations_included | unique_citations_total | mention_count_total
+        | gene_symbol; prefixe com ''-'' para DESC), ?included_only=true (omite genes
+        sem nenhum paper incluído). Default: -unique_citations_included. Paginação:
+        ?page=, ?page_size= (máx 100).'
+      summary: Lista genes do projeto (agregada)
+      parameters:
+      - in: query
+        name: included_only
+        schema:
+          type: boolean
+        description: 'Quando true, retorna apenas genes com ao menos um paper com
+          curation_status=included (unique_citations_included > 0). Aceita true/false/1/0.
+          Default: false.'
+      - in: query
+        name: ordering
+        schema:
+          type: string
+        description: 'Campo de ordenação. Valores válidos: unique_citations_included,
+          unique_citations_total, mention_count_total, gene_symbol (prefixe com -
+          para DESC).'
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: page_size
+        required: false
+        in: query
+        description: Number of results to return per page.
+        schema:
+          type: integer
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: query
+        name: q
+        schema:
+          type: string
+        description: Filtro por símbolo (icontains).
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedProjectGeneListList'
+          description: ''
+  /api/v1/projects/{project_pk}/genes/{gene_symbol}/:
+    get:
+      operationId: projects_genes_retrieve
+      description: Retorna métricas do gene e, para cada paper do projeto que o cita,
+        as sentenças do abstract onde o gene aparece (snippets). Se o cache de snippets
+        estiver frio ou stale para algum paper, uma task Celery é disparada e context_status='computing'
+        é retornado; chamadas subsequentes retornam 'ready' quando o cache estiver
+        pronto. gene_symbol inválido (> 64 chars) ou inexistente no projeto → 404.
+      summary: Detalhe de gene do projeto (com snippets de contexto)
+      parameters:
+      - in: path
+        name: gene_symbol
+        schema:
+          type: string
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectGeneDetail'
+          description: ''
   /api/v1/projects/{project_pk}/jobs/:
     get:
       operationId: projects_jobs_list
@@ -1531,6 +1631,14 @@ components:
         * `auto` - Automático (elink/co-ocorrência)
         * `confirmed` - Confirmado pelo Pesquisador
         * `rejected` - Rejeitado pelo Pesquisador
+    ContextStatusEnum:
+      enum:
+      - ready
+      - computing
+      type: string
+      description: |-
+        * `ready` - ready
+        * `computing` - computing
     CurationStatusEnum:
       enum:
       - pending
@@ -1697,9 +1805,10 @@ components:
         sentence_position:
           type: integer
           maximum: 32767
-          minimum: 0
+          minimum: -32768
           title: Posição no Abstract
-          description: Índice da sentença no abstract (0-based)
+          description: Índice da sentença no abstract (0-based; -1 = sentinela "processado
+            sem snippet")
       required:
       - entity_name
       - entity_type
@@ -1718,6 +1827,56 @@ components:
         * `variant` - Variante
         * `disease` - Doença
         * `pathway` - Pathway
+    GeneReference:
+      type: object
+      description: Paper do projeto que cita o gene, com suas sentenças de contexto.
+      properties:
+        project_paper_id:
+          type: integer
+          description: PK de ProjectPaper — usada no PATCH /projects/{id}/papers/<pk>/
+            para toggle de curadoria. Distinta da PK de Paper (pmid para exibição).
+        pmid:
+          type: integer
+          description: PubMed ID do paper.
+        title:
+          type: string
+          description: Título do paper.
+        pub_year:
+          type: integer
+          nullable: true
+          description: Ano de publicação.
+        journal:
+          type: string
+          description: Periódico (ISO abbrev).
+        curation_status:
+          type: string
+          description: Status de curadoria do paper neste projeto (included, excluded,
+            pending, maybe).
+        snippets:
+          type: array
+          items:
+            $ref: '#/components/schemas/GeneSnippet'
+      required:
+      - curation_status
+      - journal
+      - pmid
+      - project_paper_id
+      - pub_year
+      - snippets
+      - title
+    GeneSnippet:
+      type: object
+      description: Uma sentença do abstract que contém o gene.
+      properties:
+        sentence:
+          type: string
+          description: Sentença do abstract contendo o gene.
+        sentence_position:
+          type: integer
+          description: Índice 0-based da sentença no abstract.
+      required:
+      - sentence
+      - sentence_position
     IngestionJob:
       type: object
       properties:
@@ -2087,6 +2246,29 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ProjectDatasetList'
+    PaginatedProjectGeneListList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProjectGeneList'
     PaginatedProjectPaperDatasetList:
       type: object
       required:
@@ -2719,6 +2901,81 @@ components:
       - source_db
       - summary
       - title
+    ProjectGeneDetail:
+      type: object
+      description: |-
+        Detalhe de um gene no projeto: métricas agregadas + referências com snippets.
+
+        context_status:
+            'ready'     — cache de snippets completo e fresco para todos os papers.
+            'computing' — task de derivação foi disparada; alguns snippets podem faltar.
+      properties:
+        gene_symbol:
+          type: string
+        entrez_id:
+          type: integer
+          nullable: true
+          description: Entrez Gene ID representativo (primeiro não-nulo). Nulo se
+            ausente.
+        unique_citations_included:
+          type: integer
+          description: Papers distintos com status 'included' que citam o gene.
+        unique_citations_total:
+          type: integer
+          description: Papers distintos (qualquer status) que citam o gene neste projeto.
+        references:
+          type: array
+          items:
+            $ref: '#/components/schemas/GeneReference'
+        context_status:
+          allOf:
+          - $ref: '#/components/schemas/ContextStatusEnum'
+          description: |-
+            'ready' | 'computing' — estado do cache de snippets.
+
+            * `ready` - ready
+            * `computing` - computing
+      required:
+      - context_status
+      - entrez_id
+      - gene_symbol
+      - references
+      - unique_citations_included
+      - unique_citations_total
+    ProjectGeneList:
+      type: object
+      description: |-
+        Item da lista agregada de genes do projeto.
+
+        Cada registro representa um gene_symbol único com contagens
+        agregadas calculadas numa única query no GeneService.
+      properties:
+        gene_symbol:
+          type: string
+          description: 'Símbolo do gene (ex.: TNF, BRCA1).'
+        entrez_id:
+          type: integer
+          nullable: true
+          description: Entrez Gene ID representativo do grupo (primeiro não-nulo).
+            Nulo se ausente.
+        unique_citations_included:
+          type: integer
+          description: Número de papers distintos com curation_status='included' que
+            citam o gene.
+        unique_citations_total:
+          type: integer
+          description: Número de papers distintos (qualquer status) do projeto que
+            citam o gene.
+        mention_count_total:
+          type: integer
+          description: Soma de mention_count de todos os PaperGene do projeto para
+            este gene.
+      required:
+      - entrez_id
+      - gene_symbol
+      - mention_count_total
+      - unique_citations_included
+      - unique_citations_total
     ProjectPaperCurate:
       type: object
       description: 'Write-only: update curation fields.'
