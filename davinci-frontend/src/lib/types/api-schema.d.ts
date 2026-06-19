@@ -120,6 +120,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/projects/{id}/mesh/suggest/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Sugerir descritores MeSH para o projeto
+         * @description Chama rust_engine.mesh_suggest para sugerir descritores MeSH a partir de um termo livre. Se 'term' estiver ausente ou vazio, usa a query_term + query_synonyms do projeto como termo de busca. A NCBI API key do perfil do usuário é usada internamente — nunca retornada. Isolamento: só o dono do projeto pode chamar este endpoint.
+         */
+        post: operations["projects_mesh_suggest_create"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/projects/{id}/omics_search/": {
         parameters: {
             query?: never;
@@ -154,6 +174,26 @@ export interface paths {
          * @description Cria e enfileira um job de busca de literatura no PubMed para o projeto.
          */
         post: operations["projects_search_create"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{id}/search/preview/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview de magnitude da query PubMed
+         * @description Monta a query PubMed a partir da configuração MeSH enviada no body (selected_mesh, mesh_default_mode, panel_flags) e retorna contagens comparativas via rust_engine.pubmed_magnitude_preview. Operação READ-ONLY: não cria IngestionJob, não altera o projeto. Cache curto (120s) por hash da query + flags para evitar re-chamadas ao Rust enquanto o usuário faz ajustes. A NCBI API key do perfil do usuário é usada internamente — nunca retornada. Isolamento: só o dono do projeto pode chamar este endpoint.
+         */
+        post: operations["projects_search_preview_create"];
         delete?: never;
         options?: never;
         head?: never;
@@ -358,6 +398,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/projects/{project_pk}/drugs/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Lista medicamentos do projeto (agregada)
+         * @description Retorna lista paginada de medicamentos mencionados nos papers do projeto, agrupados por drug_name_lower (chave canônica normalizada). Inclui contagens de citações únicas (included e total), soma de menções e URLs externas (DrugBank quando drugbank_id presente; PubChem sempre). Filtros: ?q= (icontains no drug_name_lower), ?ordering= (unique_citations_included | unique_citations_total | mention_count_total | drug_name; prefixe com '-' para DESC), ?included_only=true (omite medicamentos sem nenhum paper incluído). Default: -unique_citations_included. Paginação: ?page=, ?page_size= (máx 100).
+         */
+        get: operations["projects_drugs_list"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_pk}/drugs/{drug_name_lower}/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Detalhe de medicamento do projeto (com snippets de contexto)
+         * @description Retorna métricas do medicamento e, para cada paper do projeto que o cita, as sentenças do abstract onde o medicamento aparece (snippets). Se o cache de snippets estiver frio ou stale para algum paper, uma task Celery é disparada e context_status='computing' é retornado; chamadas subsequentes retornam 'ready' quando o cache estiver pronto. drug_name_lower inválido (> 255 chars) ou inexistente no projeto → 404. O front-end deve encodeURIComponent() o drug_name_lower na URL.
+         */
+        get: operations["projects_drugs_retrieve"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/projects/{project_pk}/genes/": {
         parameters: {
             query?: never;
@@ -521,6 +601,46 @@ export interface paths {
          * @description Define confidence=rejected no link entre paper e dataset.
          */
         post: operations["projects_links_reject_create"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_pk}/mesh/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Lista termos MeSH do projeto (agregada)
+         * @description Retorna lista paginada de termos MeSH indexados nos papers do projeto, agrupados por descriptor. Inclui major_topic_count (métrica primária: papers distintos included onde is_major_topic=True), contagens de citações únicas (included e total) e URL NCBI MeSH. Filtros: ?q= (icontains no descriptor), ?ordering= (major_topic_count | unique_citations_included | unique_citations_total | descriptor; prefixe com '-' para DESC), ?included_only=true (omite descriptors sem nenhum paper incluído). Default: -major_topic_count. Paginação: ?page=, ?page_size= (máx 100).
+         */
+        get: operations["projects_mesh_list"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_pk}/mesh/{descriptor}/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Detalhe de descriptor MeSH do projeto (com snippets de contexto)
+         * @description Retorna métricas do descriptor MeSH e, para cada paper do projeto que o cita, as sentenças do abstract onde o descriptor aparece (snippets). Inclui qualifiers MeSH distintos entre os papers do projeto. Se o cache de snippets estiver frio ou stale para algum paper, uma task Celery é disparada e context_status='computing' é retornado; chamadas subsequentes retornam 'ready' quando o cache estiver pronto. NOTA: MeSH não garante presença literal do descriptor no abstract — zero snippets é comum e esperado (coberto pelo sentinela). descriptor inválido (> 255 chars) ou inexistente no projeto → 404.
+         */
+        get: operations["projects_mesh_retrieve"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -822,6 +942,16 @@ export interface components {
             readonly total_papers: number;
             /** @default 0 */
             readonly total_datasets: number;
+            selected_mesh?: unknown;
+            /**
+             * @description Modo padrão para blocos MeSH sem 'mode' explícito: 'and' (precisão) ou 'or' (recall)
+             *
+             *     * `and` - and
+             *     * `or` - or
+             * @default and
+             */
+            mesh_default_mode: components["schemas"]["MeshDefaultModeEnum"];
+            magnitude_snapshot?: unknown;
             /**
              * Identificador
              * @description Gerado automaticamente: {titulo}_{user}_davinci
@@ -840,6 +970,8 @@ export interface components {
             date_from?: number | null;
             /** Ano Final */
             date_to?: number | null;
+            /** Pesquisa Avançada Habilitada */
+            advanced_search_enabled?: boolean;
             readonly status: components["schemas"]["DaVinciProjectStatusEnum"];
             /** Format: date-time */
             readonly created_at: string;
@@ -885,6 +1017,29 @@ export interface components {
          * @enum {string}
          */
         DatasetCurationStatusEnum: "pending" | "included" | "excluded" | "queued" | "downloaded";
+        /** @description Paper do projeto que cita o medicamento, com suas sentenças de contexto. */
+        DrugReference: {
+            /** @description PK de ProjectPaper — usada no PATCH /projects/{id}/papers/<pk>/ para toggle de curadoria. Distinta da PK de Paper (pmid para exibição). */
+            project_paper_id: number;
+            /** @description PubMed ID do paper. */
+            pmid: number;
+            /** @description Título do paper. */
+            title: string;
+            /** @description Ano de publicação. */
+            pub_year: number | null;
+            /** @description Periódico (ISO abbrev). */
+            journal: string;
+            /** @description Status de curadoria do paper neste projeto (included, excluded, pending, maybe). */
+            curation_status: string;
+            snippets: components["schemas"]["DrugSnippet"][];
+        };
+        /** @description Uma sentença do abstract que contém o medicamento. */
+        DrugSnippet: {
+            /** @description Sentença do abstract contendo o medicamento. */
+            sentence: string;
+            /** @description Índice 0-based da sentença no abstract. */
+            sentence_position: number;
+        };
         EntityContext: {
             entity_type: components["schemas"]["EntityTypeEnum"];
             /** Nome da Entidade */
@@ -906,9 +1061,10 @@ export interface components {
          *     * `variant` - Variante
          *     * `disease` - Doença
          *     * `pathway` - Pathway
+         *     * `mesh` - MeSH Term
          * @enum {string}
          */
-        EntityTypeEnum: "gene" | "drug" | "variant" | "disease" | "pathway";
+        EntityTypeEnum: "gene" | "drug" | "variant" | "disease" | "pathway" | "mesh";
         /** @description Paper do projeto que cita o gene, com suas sentenças de contexto. */
         GeneReference: {
             /** @description PK de ProjectPaper — usada no PATCH /projects/{id}/papers/<pk>/ para toggle de curadoria. Distinta da PK de Paper (pmid para exibição). */
@@ -983,6 +1139,83 @@ export interface components {
          * @enum {string}
          */
         JobTypeEnum: "pubmed_search" | "pubmed_fetch" | "geo_search" | "sra_search" | "gwas_search" | "sample_fetch" | "variant_annotation" | "gene_ner" | "drug_ner" | "context_extraction";
+        /** @description Resposta do endpoint POST /projects/{id}/search/preview/ */
+        MagnitudePreview: {
+            /** @description Artigos encontrados só pela query de texto livre */
+            free_text_count: number;
+            /** @description Artigos encontrados pelos termos MeSH combinados */
+            mesh_count: number;
+            /** @description Artigos encontrados pela query final combinada (preview idêntico à ingestão) */
+            combined_count: number;
+            /** @description Artigos presentes tanto em free_text quanto em MeSH */
+            overlap: number;
+            /** @description Artigos presentes só em free_text (não indexados em MeSH ainda ou não cobertos) */
+            only_free_text: number;
+            /** @description Artigos presentes só em MeSH (não cobertos pela query de texto livre) */
+            only_mesh: number;
+            /** @description Artigos fornecidos pelo publisher, ainda sem indexação MeSH completa */
+            not_yet_indexed: number;
+            /** @description Revisões (Review[pt]) na query combinada */
+            reviews: number;
+            /** @description Revisões sistemáticas e meta-análises na query combinada */
+            systematic_reviews: number;
+            by_year?: number[][];
+            by_pub_type?: unknown[][];
+            open_access?: number[] | null;
+            /** @description Query PubMed exata usada no preview (idêntica à que será usada na ingestão) */
+            readonly query_used: string;
+        };
+        /** @description Paper do projeto que cita o descriptor MeSH, com sentenças de contexto. */
+        MeSHReference: {
+            /** @description PK de ProjectPaper — usada no PATCH /projects/{id}/papers/<pk>/ para toggle de curadoria. Distinta da PK de Paper (pmid para exibição). */
+            project_paper_id: number;
+            /** @description PubMed ID do paper. */
+            pmid: number;
+            /** @description Título do paper. */
+            title: string;
+            /** @description Ano de publicação. */
+            pub_year: number | null;
+            /** @description Periódico (ISO abbrev). */
+            journal: string;
+            /** @description Status de curadoria do paper neste projeto (included, excluded, pending, maybe). */
+            curation_status: string;
+            /** @description True se este descriptor é tópico principal (MajorTopicYN='Y') no paper. */
+            is_major_topic: boolean;
+            snippets: components["schemas"]["MeSHSnippet"][];
+        };
+        /** @description Uma sentença do abstract que contém o descriptor MeSH. */
+        MeSHSnippet: {
+            /** @description Sentença do abstract contendo o descriptor. */
+            sentence: string;
+            /** @description Índice 0-based da sentença no abstract. */
+            sentence_position: number;
+        };
+        /**
+         * @description * `and` - and
+         *     * `or` - or
+         * @enum {string}
+         */
+        MeshDefaultModeEnum: "and" | "or";
+        /** @description Body de POST /projects/{id}/mesh/suggest/ */
+        MeshSuggestRequest: {
+            /** @description Termo livre para sugestão MeSH. Se ausente ou vazio, usa a query_term + query_synonyms do projeto. */
+            term?: string;
+        };
+        /** @description Uma sugestão de descritor MeSH retornada pelo rust_engine.mesh_suggest. */
+        MeshSuggestion: {
+            /** @description Nome canônico do descritor MeSH */
+            descriptor: string;
+            /** @description ID MeSH único (ex: D003920) */
+            ui: string;
+            /** @description Números de posição na árvore MeSH (ex: ['C18.452.394.750']) */
+            tree_numbers: string[];
+            /** @description Nota de escopo do descritor MeSH */
+            scope_note: string;
+            /** @description Subheadings válidos para este descritor */
+            allowable_qualifiers: string[];
+            /** @description Número de artigos no PubMed indexados com este descritor */
+            pubmed_count: number;
+        };
         OmicDataset: {
             readonly id: number;
             /** @description GSE, SRP, PRJNA, E-MTAB, etc. */
@@ -1112,6 +1345,21 @@ export interface components {
             previous?: string | null;
             results: components["schemas"]["IngestionJob"][];
         };
+        PaginatedMeshSuggestionList: {
+            /** @example 123 */
+            count: number;
+            /**
+             * Format: uri
+             * @example http://api.example.org/accounts/?page=4
+             */
+            next?: string | null;
+            /**
+             * Format: uri
+             * @example http://api.example.org/accounts/?page=2
+             */
+            previous?: string | null;
+            results: components["schemas"]["MeshSuggestion"][];
+        };
         PaginatedProjectDatasetListList: {
             /** @example 123 */
             count: number;
@@ -1127,6 +1375,21 @@ export interface components {
             previous?: string | null;
             results: components["schemas"]["ProjectDatasetList"][];
         };
+        PaginatedProjectDrugListList: {
+            /** @example 123 */
+            count: number;
+            /**
+             * Format: uri
+             * @example http://api.example.org/accounts/?page=4
+             */
+            next?: string | null;
+            /**
+             * Format: uri
+             * @example http://api.example.org/accounts/?page=2
+             */
+            previous?: string | null;
+            results: components["schemas"]["ProjectDrugList"][];
+        };
         PaginatedProjectGeneListList: {
             /** @example 123 */
             count: number;
@@ -1141,6 +1404,21 @@ export interface components {
              */
             previous?: string | null;
             results: components["schemas"]["ProjectGeneList"][];
+        };
+        PaginatedProjectMeSHListList: {
+            /** @example 123 */
+            count: number;
+            /**
+             * Format: uri
+             * @example http://api.example.org/accounts/?page=4
+             */
+            next?: string | null;
+            /**
+             * Format: uri
+             * @example http://api.example.org/accounts/?page=2
+             */
+            previous?: string | null;
+            results: components["schemas"]["ProjectMeSHList"][];
         };
         PaginatedProjectPaperDatasetList: {
             /** @example 123 */
@@ -1201,6 +1479,26 @@ export interface components {
              */
             previous?: string | null;
             results: components["schemas"]["UserCategory"][];
+        };
+        /** @description Flags que habilitam métricas adicionais no preview de magnitude. */
+        PanelFlags: {
+            /**
+             * @description Incluir contagens por ano (buckets temporais)
+             * @default false
+             */
+            by_year: boolean;
+            /**
+             * @description Incluir contagens por tipo de publicação
+             * @default false
+             */
+            by_pub_type: boolean;
+            /**
+             * @description Incluir contagens de acesso aberto (PMC)
+             * @default false
+             */
+            open_access: boolean;
+            /** @description Anos específicos para bucketing temporal (null = padrão do Rust). Máximo 20 entradas. Cada ano deve estar entre 1900 e ano_atual+1. */
+            year_buckets?: number[] | null;
         };
         PaperAuthor: {
             /**
@@ -1326,6 +1624,16 @@ export interface components {
             readonly total_papers: number;
             /** @default 0 */
             readonly total_datasets: number;
+            selected_mesh?: unknown;
+            /**
+             * @description Modo padrão para blocos MeSH sem 'mode' explícito: 'and' (precisão) ou 'or' (recall)
+             *
+             *     * `and` - and
+             *     * `or` - or
+             * @default and
+             */
+            mesh_default_mode: components["schemas"]["MeshDefaultModeEnum"];
+            magnitude_snapshot?: unknown;
             /**
              * Identificador
              * @description Gerado automaticamente: {titulo}_{user}_davinci
@@ -1344,6 +1652,8 @@ export interface components {
             date_from?: number | null;
             /** Ano Final */
             date_to?: number | null;
+            /** Pesquisa Avançada Habilitada */
+            advanced_search_enabled?: boolean;
             readonly status?: components["schemas"]["DaVinciProjectStatusEnum"];
             /** Format: date-time */
             readonly created_at?: string;
@@ -1456,6 +1766,60 @@ export interface components {
             curated_at?: string | null;
         };
         /**
+         * @description Detalhe de um medicamento no projeto: métricas agregadas + referências com snippets.
+         *
+         *     context_status:
+         *         'ready'     — cache de snippets completo e fresco para todos os papers.
+         *         'computing' — task de derivação foi disparada; alguns snippets podem faltar.
+         */
+        ProjectDrugDetail: {
+            /** @description Nome representativo do medicamento. */
+            drug_name: string;
+            /** @description DrugBank ID representativo (primeiro não-vazio). String vazia quando ausente. */
+            drugbank_id: string;
+            /** @description Papers distintos com status 'included' que citam o medicamento. */
+            unique_citations_included: number;
+            /** @description Papers distintos (qualquer status) que citam o medicamento neste projeto. */
+            unique_citations_total: number;
+            /** @description URL direta no DrugBank. Null quando drugbank_id ausente. */
+            drugbank_url: string | null;
+            /** @description URL de busca PubChem por nome. Sempre presente. */
+            pubchem_search_url: string;
+            references: components["schemas"]["DrugReference"][];
+            /**
+             * @description 'ready' | 'computing' — estado do cache de snippets.
+             *
+             *     * `ready` - ready
+             *     * `computing` - computing
+             */
+            context_status: components["schemas"]["ContextStatusEnum"];
+        };
+        /**
+         * @description Item da lista agregada de medicamentos do projeto.
+         *
+         *     Cada registro representa um drug_name_lower único com contagens
+         *     agregadas calculadas numa única query no DrugService.
+         *
+         *     Chave de agrupamento: drug_name_lower (canônica).
+         *     Exibição: drug_name representativo (Max do grupo).
+         */
+        ProjectDrugList: {
+            /** @description Nome representativo do medicamento (Max do grupo por drug_name_lower). */
+            drug_name: string;
+            /** @description DrugBank ID representativo do grupo (primeiro não-vazio). String vazia ou null quando ausente. */
+            drugbank_id: string;
+            /** @description Número de papers distintos com curation_status='included' que citam o medicamento. */
+            unique_citations_included: number;
+            /** @description Número de papers distintos (qualquer status) do projeto que citam o medicamento. */
+            unique_citations_total: number;
+            /** @description Soma de mention_count de todos os PaperDrug do projeto para este medicamento. Pode contar o mesmo paper mais de uma vez se houver múltiplas menções. */
+            mention_count_total: number;
+            /** @description URL direta no DrugBank (https://go.drugbank.com/drugs/<drugbank_id>). Null quando drugbank_id ausente. */
+            drugbank_url: string | null;
+            /** @description URL de busca PubChem por nome do medicamento (https://pubchem.ncbi.nlm.nih.gov/#query=<drug_name> URL-encoded). Sempre presente. */
+            pubchem_search_url: string;
+        };
+        /**
          * @description Detalhe de um gene no projeto: métricas agregadas + referências com snippets.
          *
          *     context_status:
@@ -1496,6 +1860,59 @@ export interface components {
             unique_citations_total: number;
             /** @description Soma de mention_count de todos os PaperGene do projeto para este gene. */
             mention_count_total: number;
+        };
+        /**
+         * @description Detalhe de um descriptor MeSH no projeto:
+         *     métricas agregadas + qualifiers + referências com snippets.
+         *
+         *     context_status:
+         *         'ready'     — cache de snippets completo e fresco para todos os papers.
+         *         'computing' — task de derivação foi disparada; alguns snippets podem faltar.
+         *
+         *     Nota sobre snippets: MeSH não garante presença literal do descriptor no
+         *     abstract; zero snippets é comum e esperado (coberto pelo sentinela -1).
+         */
+        ProjectMeSHDetail: {
+            /** @description Descriptor MeSH. */
+            descriptor: string;
+            /** @description Papers distintos com status 'included' onde o descriptor é tópico principal. */
+            major_topic_count: number;
+            /** @description Papers distintos com status 'included' que citam o descriptor. */
+            unique_citations_included: number;
+            /** @description Papers distintos (qualquer status) que citam o descriptor neste projeto. */
+            unique_citations_total: number;
+            /** @description Qualifiers MeSH distintos não-vazios entre os papers do projeto. */
+            qualifiers: string[];
+            /** @description URL de busca NCBI MeSH para o descriptor. */
+            ncbi_mesh_url: string;
+            references: components["schemas"]["MeSHReference"][];
+            /**
+             * @description 'ready' | 'computing' — estado do cache de snippets.
+             *
+             *     * `ready` - ready
+             *     * `computing` - computing
+             */
+            context_status: components["schemas"]["ContextStatusEnum"];
+        };
+        /**
+         * @description Item da lista agregada de termos MeSH do projeto.
+         *
+         *     Cada registro representa um descriptor único com contagens
+         *     agregadas calculadas numa única query no MeshService.
+         *
+         *     Métrica primária: major_topic_count (papers included onde is_major_topic=True).
+         */
+        ProjectMeSHList: {
+            /** @description Descriptor MeSH (ex.: 'Diabetes Mellitus', 'Neoplasms'). */
+            descriptor: string;
+            /** @description Número de papers distintos com curation_status='included' onde este descriptor é tópico principal (is_major_topic=True). Métrica primária. */
+            major_topic_count: number;
+            /** @description Número de papers distintos com curation_status='included' que citam o descriptor. */
+            unique_citations_included: number;
+            /** @description Número de papers distintos (qualquer status) do projeto que citam o descriptor. */
+            unique_citations_total: number;
+            /** @description URL de busca NCBI MeSH para o descriptor (https://www.ncbi.nlm.nih.gov/mesh/?term=<descriptor> URL-encoded). */
+            ncbi_mesh_url: string;
         };
         /** @description Write-only: update curation fields. */
         ProjectPaperCurate: {
@@ -1693,6 +2110,21 @@ export interface components {
              * @default
              */
             exclusion_reason: string;
+        };
+        /** @description Body de POST /projects/{id}/search/preview/ */
+        SearchPreviewRequest: {
+            /** @description Lista de descritores MeSH para calcular o preview. Se ausente, usa selected_mesh do projeto. */
+            selected_mesh?: unknown;
+            /**
+             * @description Modo padrão para blocos sem mode explícito
+             *
+             *     * `and` - and
+             *     * `or` - or
+             * @default and
+             */
+            mesh_default_mode: components["schemas"]["MeshDefaultModeEnum"];
+            /** @description Flags de painéis adicionais do preview de magnitude */
+            panel_flags?: components["schemas"]["PanelFlags"];
         };
         /**
          * @description * `geo` - GEO (Gene Expression Omnibus)
@@ -2021,6 +2453,41 @@ export interface operations {
             };
         };
     };
+    projects_mesh_suggest_create: {
+        parameters: {
+            query?: {
+                /** @description Which field to use when ordering the results. */
+                ordering?: string;
+                /** @description A page number within the paginated result set. */
+                page?: number;
+                /** @description A search term. */
+                search?: string;
+            };
+            header?: never;
+            path: {
+                /** @description A UUID string identifying this da vinci project. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["MeshSuggestRequest"];
+                "application/x-www-form-urlencoded": components["schemas"]["MeshSuggestRequest"];
+                "multipart/form-data": components["schemas"]["MeshSuggestRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PaginatedMeshSuggestionList"];
+                };
+            };
+        };
+    };
     projects_omics_search_create: {
         parameters: {
             query?: never;
@@ -2067,6 +2534,34 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["JobDispatchResponse"];
+                };
+            };
+        };
+    };
+    projects_search_preview_create: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description A UUID string identifying this da vinci project. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["SearchPreviewRequest"];
+                "application/x-www-form-urlencoded": components["schemas"]["SearchPreviewRequest"];
+                "multipart/form-data": components["schemas"]["SearchPreviewRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MagnitudePreview"];
                 };
             };
         };
@@ -2359,6 +2854,62 @@ export interface operations {
             };
         };
     };
+    projects_drugs_list: {
+        parameters: {
+            query?: {
+                /** @description Quando true, retorna apenas medicamentos com ao menos um paper com curation_status=included (unique_citations_included > 0). Aceita true/false/1/0. Default: false. */
+                included_only?: boolean;
+                /** @description Campo de ordenação. Valores válidos: unique_citations_included, unique_citations_total, mention_count_total, drug_name (prefixe com - para DESC). Default: -unique_citations_included. */
+                ordering?: string;
+                /** @description A page number within the paginated result set. */
+                page?: number;
+                /** @description Number of results to return per page. */
+                page_size?: number;
+                /** @description Filtro por nome do medicamento (icontains). */
+                q?: string;
+                /** @description A search term. */
+                search?: string;
+            };
+            header?: never;
+            path: {
+                project_pk: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PaginatedProjectDrugListList"];
+                };
+            };
+        };
+    };
+    projects_drugs_retrieve: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                drug_name_lower: string;
+                project_pk: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectDrugDetail"];
+                };
+            };
+        };
+    };
     projects_genes_list: {
         parameters: {
             query?: {
@@ -2563,6 +3114,62 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ProjectPaperDataset"];
+                };
+            };
+        };
+    };
+    projects_mesh_list: {
+        parameters: {
+            query?: {
+                /** @description Quando true, retorna apenas descriptors com ao menos um paper com curation_status=included (unique_citations_included > 0). Aceita true/false/1/0. Default: false. */
+                included_only?: boolean;
+                /** @description Campo de ordenação. Valores válidos: major_topic_count, unique_citations_included, unique_citations_total, descriptor (prefixe com - para DESC). Default: -major_topic_count. */
+                ordering?: string;
+                /** @description A page number within the paginated result set. */
+                page?: number;
+                /** @description Number of results to return per page. */
+                page_size?: number;
+                /** @description Filtro por descriptor (icontains). */
+                q?: string;
+                /** @description A search term. */
+                search?: string;
+            };
+            header?: never;
+            path: {
+                project_pk: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PaginatedProjectMeSHListList"];
+                };
+            };
+        };
+    };
+    projects_mesh_retrieve: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                descriptor: string;
+                project_pk: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMeSHDetail"];
                 };
             };
         };

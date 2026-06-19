@@ -28,6 +28,44 @@ struct EsearchResult {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// Return only the total hit count for a PubMed query, without downloading PMIDs.
+///
+/// Calls esearch with `retmax=0` and reads `esearchresult.count`.
+/// Used by the magnitude-preview pipeline where only counts are needed.
+pub async fn esearch_count(
+    client: &NcbiClient,
+    term: &str,
+    date_from: Option<u16>,
+    date_to: Option<u16>,
+) -> Result<usize, String> {
+    let date_from_str = date_from.map(|y| y.to_string()).unwrap_or_default();
+    let date_to_str = date_to.map(|y| y.to_string()).unwrap_or_default();
+
+    let mut params: Vec<(&str, &str)> = vec![
+        ("db", "pubmed"),
+        ("term", term),
+        ("retmax", "0"),
+        ("retmode", "json"),
+    ];
+
+    if !date_from_str.is_empty() || !date_to_str.is_empty() {
+        params.push(("datetype", "pdat"));
+        if !date_from_str.is_empty() {
+            params.push(("mindate", &date_from_str));
+        }
+        if !date_to_str.is_empty() {
+            params.push(("maxdate", &date_to_str));
+        }
+    }
+
+    let body = client.fetch_with_retry(ESEARCH_URL, &params).await?;
+    let resp: EsearchResponse = serde_json::from_str(&body)
+        .map_err(|e| format!("PubMed esearch count JSON parse error: {e}"))?;
+
+    let count: usize = resp.esearchresult.count.trim().parse().unwrap_or(0);
+    Ok(count)
+}
+
 /// Search PubMed for PMIDs matching the query with optional date range.
 ///
 /// `max_results` caps how many PMIDs to retrieve. NCBI supports up to 100 000

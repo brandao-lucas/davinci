@@ -109,6 +109,30 @@ class DaVinciProject(models.Model):
         help_text='Ex: ["blood", "skin", "liver"]'
     )
 
+    # Pesquisa avançada premium (MeSH + painel de magnitude)
+    advanced_search_enabled = models.BooleanField(
+        'Pesquisa Avançada Habilitada',
+        default=False
+    )
+    selected_mesh = models.JSONField(
+        'Descritores MeSH Selecionados',
+        default=list,
+        blank=True,
+        help_text='[{"descriptor": str, "ui": str, "qualifiers": [str], "mode": "and"|"or", "major_only": bool}]'
+    )
+    mesh_default_mode = models.CharField(
+        'Modo Padrão MeSH',
+        max_length=3,
+        default='and',
+        help_text="'and' (precisão) ou 'or' (recall)"
+    )
+    magnitude_snapshot = models.JSONField(
+        'Snapshot de Magnitude',
+        default=dict,
+        blank=True,
+        help_text='Último preview de magnitude calculado'
+    )
+
     # Status do pipeline
     class PipelineStatus(models.TextChoices):
         DRAFT = 'draft', 'Rascunho'
@@ -773,6 +797,7 @@ class EntityContext(models.Model):
         VARIANT = 'variant', 'Variante'
         DISEASE = 'disease', 'Doença'
         PATHWAY = 'pathway', 'Pathway'
+        MESH = 'mesh', 'MeSH Term'
 
     paper = models.ForeignKey(Paper, on_delete=models.CASCADE, related_name='contexts')
     entity_type = models.CharField(max_length=20, choices=EntityType.choices)

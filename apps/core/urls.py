@@ -9,6 +9,8 @@ from .views.category_views import ClinicalCategoryViewSet, UserCategoryViewSet
 from .views.link_views import ProjectPaperDatasetViewSet
 from .views.job_views import IngestionJobViewSet
 from .views.gene_views import ProjectGeneViewSet
+from .views.mesh_views import ProjectMeSHViewSet
+from .views.drug_views import ProjectDrugViewSet
 
 router = DefaultRouter()
 router.register(r'projects', DaVinciProjectViewSet, basename='project')
@@ -50,6 +52,12 @@ job_cancel = IngestionJobViewSet.as_view({'post': 'cancel'})
 
 gene_list = ProjectGeneViewSet.as_view({'get': 'list'})
 gene_detail = ProjectGeneViewSet.as_view({'get': 'gene_detail'})
+
+mesh_list = ProjectMeSHViewSet.as_view({'get': 'list'})
+mesh_detail = ProjectMeSHViewSet.as_view({'get': 'mesh_detail'})
+
+drug_list = ProjectDrugViewSet.as_view({'get': 'list'})
+drug_detail = ProjectDrugViewSet.as_view({'get': 'drug_detail'})
 
 PROJECT_PREFIX = r'projects/<uuid:project_pk>/'
 
@@ -98,4 +106,12 @@ urlpatterns = [
     # Genes — lista agregada e detalhe por símbolo
     path(f'{PROJECT_PREFIX}genes/', gene_list, name='project-gene-list'),
     path(f'{PROJECT_PREFIX}genes/<str:gene_symbol>/', gene_detail, name='project-gene-detail'),
+
+    # MeSH — lista agregada e detalhe por descriptor
+    path(f'{PROJECT_PREFIX}mesh/', mesh_list, name='project-mesh-list'),
+    path(f'{PROJECT_PREFIX}mesh/<str:descriptor>/', mesh_detail, name='project-mesh-detail'),
+
+    # Drugs — lista agregada e detalhe por drug_name_lower
+    path(f'{PROJECT_PREFIX}drugs/', drug_list, name='project-drug-list'),
+    path(f'{PROJECT_PREFIX}drugs/<str:drug_name_lower>/', drug_detail, name='project-drug-detail'),
 ]

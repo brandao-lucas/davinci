@@ -1,6 +1,10 @@
 use pyo3::prelude::*;
 use tokio::runtime::Runtime;
 
+// Re-export PyO3 types from sub-modules so they are visible at crate root for the pymodule.
+pub use crate::ncbi::mesh::{mesh_suggest, MeshSuggestion};
+pub use crate::ncbi::preview::{pubmed_magnitude_preview, MagnitudePreview};
+
 pub mod categorization;
 pub mod db;
 pub mod ncbi;
@@ -626,9 +630,14 @@ fn rust_engine(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IngestionResult>()?;
     m.add_class::<OmicsResult>()?;
     m.add_class::<SampleIngestionResult>()?;
+    // MeSH / preview types and functions
+    m.add_class::<MagnitudePreview>()?;
+    m.add_class::<MeshSuggestion>()?;
     m.add_function(wrap_pyfunction!(search_and_ingest_pubmed, m)?)?;
     m.add_function(wrap_pyfunction!(search_and_ingest_omics, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_pending_links, m)?)?;
     m.add_function(wrap_pyfunction!(ingest_samples_for_dataset, m)?)?;
+    m.add_function(wrap_pyfunction!(pubmed_magnitude_preview, m)?)?;
+    m.add_function(wrap_pyfunction!(mesh_suggest, m)?)?;
     Ok(())
 }

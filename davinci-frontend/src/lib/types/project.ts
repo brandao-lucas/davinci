@@ -18,3 +18,12 @@ export interface CreateProjectInput {
   target_organisms?: string[];
   target_tissues?: string[];
 }
+
+// UpdateProjectInput: superconjunto de CreateProjectInput que inclui campos da pesquisa avançada.
+// Todos opcionais porque PATCH só envia o que mudou.
+export type UpdateProjectInput = Partial<CreateProjectInput> & {
+  selected_mesh?: unknown;
+  mesh_default_mode?: string;
+  magnitude_snapshot?: unknown;
+  advanced_search_enabled?: boolean;
+};

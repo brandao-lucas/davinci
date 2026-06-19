@@ -3,8 +3,10 @@
 import { use } from 'react';
 import { PageHeader } from '@/components/layout/page-header';
 import { ProjectStatsOverview } from '@/components/projects/project-stats-overview';
+import { AdvancedSearchBlock } from '@/components/projects/advanced-search/AdvancedSearchBlock';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { Separator } from '@/components/ui/separator';
 import { useProject, useProjectStats, useDispatchSearch } from '@/lib/hooks/use-projects';
 import { useJobs, useJobPolling } from '@/lib/hooks/use-jobs';
 import { JobStatusCard } from '@/components/jobs/job-status-card';
@@ -85,6 +87,15 @@ export default function ProjectOverviewPage({ params }: { params: Promise<{ proj
       />
 
       {stats && <ProjectStatsOverview stats={stats} projectId={projectId} />}
+
+      {/* Bloco de Pesquisa Avançada — visível apenas em projetos draft */}
+      {project.status === 'draft' && (
+        <>
+          <Separator />
+          <AdvancedSearchBlock project={project} />
+          <Separator />
+        </>
+      )}
 
       {latestJob && (
         <div>

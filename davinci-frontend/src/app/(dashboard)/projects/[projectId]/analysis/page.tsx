@@ -118,13 +118,42 @@ export default function AnalysisPage({ params }: { params: Promise<{ projectId: 
 
                 <Card>
                   <CardHeader>
-                    <CardTitle className="text-sm">Top MeSH Terms</CardTitle>
+                    <CardTitle className="text-sm">
+                      <Link
+                        href={`/projects/${projectId}/mesh`}
+                        className="hover:underline text-foreground"
+                      >
+                        Top MeSH Terms
+                      </Link>
+                    </CardTitle>
                   </CardHeader>
                   <CardContent>
                     <div className="flex flex-wrap gap-2">
                       {stats.top_mesh_terms.map((m, i) => (
                         <Badge key={i} variant="secondary">
                           {m.term} <span className="ml-1">×{m.count}</span>
+                        </Badge>
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">
+                      <Link
+                        href={`/projects/${projectId}/drugs`}
+                        className="hover:underline text-foreground"
+                      >
+                        Top Drugs
+                      </Link>
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="flex flex-wrap gap-2">
+                      {stats.top_drugs.map((d, i) => (
+                        <Badge key={i} variant="outline">
+                          {d.drug} <span className="ml-1 text-muted-foreground">×{d.count}</span>
                         </Badge>
                       ))}
                     </div>

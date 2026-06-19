@@ -1,5 +1,5 @@
 import apiClient from './client';
-import type { DaVinciProject, CreateProjectInput, ProjectStats } from '@/lib/types/project';
+import type { DaVinciProject, CreateProjectInput, UpdateProjectInput, ProjectStats } from '@/lib/types/project';
 import type { PaginatedResponse } from '@/lib/types/api';
 
 export const projectsApi = {
@@ -12,7 +12,7 @@ export const projectsApi = {
   create: (data: CreateProjectInput) =>
     apiClient.post<DaVinciProject>('/projects/', data),
 
-  update: (id: string, data: Partial<CreateProjectInput>) =>
+  update: (id: string, data: UpdateProjectInput) =>
     apiClient.patch<DaVinciProject>(`/projects/${id}/`, data),
 
   delete: (id: string) =>

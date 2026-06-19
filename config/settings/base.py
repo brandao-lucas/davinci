@@ -164,6 +164,15 @@ REST_FRAMEWORK = {
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 50,
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+    # Throttle rates para endpoints de I/O externo caro (fix DoS — item 3 do laudo 007).
+    # ScopedRateThrottle é aplicado por escopo declarado na action (@action throttle_scope).
+    # Chave 'preview' cobre mesh/suggest e search/preview (ambos disparam chamadas NCBI).
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.ScopedRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'preview': '30/min',
+    },
 }
 
 SPECTACULAR_SETTINGS = {

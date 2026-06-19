@@ -2,6 +2,7 @@ from django.db import transaction
 
 from apps.core.models import DaVinciProject, IngestionJob
 from apps.core.tasks.ingestion_tasks import run_omics_ingestion, run_pubmed_ingestion
+from apps.core.services.query_builder import build_pubmed_query
 
 class SearchService:
     """
@@ -18,10 +19,9 @@ class SearchService:
             except Exception:
                 pass
 
-        # Build NCBI-compatible query by combining the main query term with synonyms using OR
-        combined_query = project.query_term
-        if project.query_synonyms:
-            combined_query = f"{project.query_term} OR {' OR '.join(project.query_synonyms)}"
+        # Query centralizada: build_pubmed_query usa MeSH quando advanced_search_enabled,
+        # caso contrário cai no OR simples legado. Mesma função alimenta preview e ingestão.
+        combined_query = build_pubmed_query(project)
 
         with transaction.atomic():
             job = IngestionJob.objects.create(
@@ -70,10 +70,9 @@ class SearchService:
             except Exception:
                 pass
 
-        # Build NCBI-compatible query by combining the main query term with synonyms using OR
-        combined_query = project.query_term
-        if project.query_synonyms:
-            combined_query = f"{project.query_term} OR {' OR '.join(project.query_synonyms)}"
+        # Query centralizada: build_pubmed_query usa MeSH quando advanced_search_enabled,
+        # caso contrário cai no OR simples legado. Mesma função alimenta preview e ingestão.
+        combined_query = build_pubmed_query(project)
 
         with transaction.atomic():
             job = IngestionJob.objects.create(
