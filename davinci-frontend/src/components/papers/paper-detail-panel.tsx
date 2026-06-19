@@ -1,6 +1,12 @@
 'use client';
 
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet';
 import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -25,13 +31,22 @@ export function PaperDetailPanel({ paperId, detail, isLoading, onClose }: PaperD
       <SheetContent className="w-full sm:max-w-xl overflow-y-auto">
         {isLoading || !p ? (
           // Skeleton enquanto o detalhe carrega
-          <div className="space-y-4 pt-2">
-            <Skeleton className="h-5 w-3/4" />
-            <Skeleton className="h-4 w-1/2" />
-            <Skeleton className="h-32 w-full" />
-            <Skeleton className="h-4 w-full" />
-            <Skeleton className="h-4 w-5/6" />
-          </div>
+          <>
+            {/* Radix exige Title/Description em todo estado do Dialog/Sheet */}
+            <SheetHeader>
+              <SheetTitle className="sr-only">Carregando detalhe do artigo</SheetTitle>
+              <SheetDescription className="sr-only">
+                Aguarde enquanto os dados do artigo são carregados.
+              </SheetDescription>
+            </SheetHeader>
+            <div className="space-y-4 pt-2">
+              <Skeleton className="h-5 w-3/4" />
+              <Skeleton className="h-4 w-1/2" />
+              <Skeleton className="h-32 w-full" />
+              <Skeleton className="h-4 w-full" />
+              <Skeleton className="h-4 w-5/6" />
+            </div>
+          </>
         ) : (
           <>
             <SheetHeader>

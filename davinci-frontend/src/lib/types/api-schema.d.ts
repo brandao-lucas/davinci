@@ -1360,6 +1360,7 @@ export interface components {
             readonly organism: string;
             readonly n_samples: number | null;
             readonly platform: string;
+            readonly extra_metadata: Record<string, never>;
             curation_status?: components["schemas"]["DatasetCurationStatusEnum"];
             exclusion_reason?: string;
             notes?: string;

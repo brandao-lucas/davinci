@@ -2683,6 +2683,9 @@ components:
         platform:
           type: string
           readOnly: true
+        extra_metadata:
+          type: object
+          readOnly: true
         curation_status:
           $ref: '#/components/schemas/DatasetCurationStatusEnum'
         exclusion_reason:
@@ -2706,6 +2709,7 @@ components:
       - accession
       - added_at
       - bioproject_id
+      - extra_metadata
       - id
       - n_samples
       - omic_subcategory

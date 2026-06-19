@@ -33,9 +33,10 @@ const statusColors: Record<string, string> = {
 function externalUrl(dataset: OmicDataset): string | null {
   const acc = dataset.accession;
   switch (dataset.source_db.toLowerCase()) {
-    case 'geo': return `https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=${acc}`;
+    // GEO e BioProject têm seus links providos pelas tags BioProject/GSE abaixo
+    case 'geo': return null;
+    case 'bioproject': return null;
     case 'sra': return `https://www.ncbi.nlm.nih.gov/sra/${acc}`;
-    case 'bioproject': return `https://www.ncbi.nlm.nih.gov/bioproject/${acc}`;
     case 'gwas_catalog':
     case 'gwas': return `https://www.ebi.ac.uk/gwas/studies/${acc}`;
     default: return null;
@@ -51,6 +52,12 @@ export function DatasetDetailPanel({ dataset, projectId, onClose }: DatasetDetai
   if (!dataset) return null;
 
   const url = externalUrl(dataset);
+  const extra = dataset.extra_metadata as Record<string, string | null> | undefined;
+  // PRJNA mora em bioproject_id (GEO) ou no próprio accession (origem BioProject)
+  const bioprojectAcc =
+    dataset.bioproject_id ||
+    (dataset.source_db.toLowerCase() === 'bioproject' ? dataset.accession : '');
+  const gse = extra?.gse;
 
   const openEdit = () => {
     setEditStatus(dataset.curation_status ?? 'pending');
@@ -76,13 +83,41 @@ export function DatasetDetailPanel({ dataset, projectId, onClose }: DatasetDetai
         <div className="mt-4 space-y-4 text-sm">
           {/* Meta row */}
           <div className="flex flex-wrap items-center gap-2 text-muted-foreground">
-            <Badge variant="outline" className="font-mono text-xs">{dataset.accession}</Badge>
-            <span>·</span>
             <span>{dataset.source_db}</span>
             {dataset.omic_type && (
               <>
                 <span>·</span>
                 <Badge variant="secondary" className="text-xs">{dataset.omic_type}</Badge>
+              </>
+            )}
+            {bioprojectAcc && (
+              <>
+                <span>·</span>
+                <a
+                  href={`https://www.ncbi.nlm.nih.gov/bioproject/${bioprojectAcc}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline hover:text-foreground"
+                >
+                  <Badge variant="outline" className="font-mono text-xs">
+                    {bioprojectAcc}
+                  </Badge>
+                </a>
+              </>
+            )}
+            {gse && (
+              <>
+                <span>·</span>
+                <a
+                  href={`https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE${gse}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline hover:text-foreground"
+                >
+                  <Badge variant="outline" className="font-mono text-xs">
+                    GSE{gse}
+                  </Badge>
+                </a>
               </>
             )}
             {url && (

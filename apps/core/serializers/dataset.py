@@ -34,11 +34,18 @@ class ProjectDatasetListSerializer(serializers.ModelSerializer):
     n_samples = serializers.IntegerField(source='dataset.n_samples', read_only=True, allow_null=True)
     platform = serializers.CharField(source='dataset.platform', read_only=True)
 
+    @extend_schema_field({'type': 'object'})
+    def get_extra_metadata(self, obj):
+        return obj.dataset.extra_metadata
+
+    extra_metadata = serializers.SerializerMethodField()
+
     class Meta:
         model = ProjectDataset
         fields = [
             'id', 'accession', 'source_db', 'bioproject_id', 'title', 'summary',
             'omic_type', 'omic_subcategory', 'organism', 'n_samples', 'platform',
+            'extra_metadata',
             'curation_status', 'exclusion_reason', 'notes',
             'relevance_score', 'added_at', 'curated_at',
         ]
