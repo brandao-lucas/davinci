@@ -20,12 +20,23 @@ export default function ProjectOverviewPage({ params }: { params: Promise<{ proj
 
   const latestJob = jobs?.results?.[0];
 
-  // Poll the latest job while it's active so the button reflects real-time state
+  // Poll the latest job while it's active so the button reflects real-time state.
+  // After pubmed_search completes, the backend auto-chains a geo_search job.
+  // The polling invalidation (in useJobPolling) refreshes the list so that
+  // latestJob transitions from pubmed_search → geo_search automatically.
   const latestJobId = latestJob?.id ?? '';
   useJobPolling(projectId, latestJobId);
 
   const jobIsActive = latestJob?.status === 'pending' || latestJob?.status === 'running';
   const isProcessing = dispatchSearch.isPending || jobIsActive;
+
+  // Human-readable phase label based on the current active job type
+  const phaseLabel: string = (() => {
+    if (!isProcessing) return '';
+    if (dispatchSearch.isPending) return 'Starting…';
+    if (latestJob?.job_type === 'geo_search') return 'Fetching datasets…';
+    return 'Fetching papers…';
+  })();
 
   // Desabilita o botão quando os descritores não mudaram desde a última busca concluída
   const descriptorsChanged = project
@@ -63,7 +74,7 @@ export default function ProjectOverviewPage({ params }: { params: Promise<{ proj
               title={searchButtonTitle}
             >
               {isProcessing
-                ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" />Processing request…</>
+                ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" />{phaseLabel}</>
                 : dispatchSearch.isError
                   ? 'Failed — Retry'
                   : <><Play className="h-4 w-4 mr-2" />Start Search</>

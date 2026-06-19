@@ -1,6 +1,7 @@
 'use client';
 
-import { use, useState } from 'react';
+import { use, useState, useEffect, useRef, Suspense } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { PageHeader } from '@/components/layout/page-header';
 import { DatasetsTable } from '@/components/datasets/datasets-table';
 import { DatasetDetailPanel } from '@/components/datasets/dataset-detail-panel';
@@ -29,15 +30,30 @@ const SOURCE_DBS = [
 ];
 const STATUSES = ['pending', 'included', 'excluded', 'queued', 'downloaded'];
 
-export default function DatasetsPage({ params }: { params: Promise<{ projectId: string }> }) {
-  const { projectId } = use(params);
+// Inner component isolado para uso do useSearchParams (exige Suspense boundary).
+function DatasetsPageContent({ projectId }: { projectId: string }) {
+  const searchParams = useSearchParams();
   const [selectedDataset, setSelectedDataset] = useState<OmicDataset | null>(null);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const debouncedQuery = useDebounce(searchQuery, 300);
 
-  const { datasetFilters, setDatasetFilters } = useFilterStore();
-  const filters = datasetFilters[projectId] ?? {};
+  const { setDatasetFilters } = useFilterStore();
+  // Re-lê do store para reflectir seed e mudanças manuais no dropdown.
+  const filters = useFilterStore((s) => s.datasetFilters[projectId] ?? {});
+
+  // Seed do filtro a partir da URL — roda uma única vez ao montar.
+  const seededRef = useRef(false);
+  useEffect(() => {
+    if (seededRef.current) return;
+    seededRef.current = true;
+    const urlStatus = searchParams.get('curation_status');
+    if (urlStatus) {
+      setDatasetFilters(projectId, { curation_status: urlStatus });
+    }
+    // Intencionalmente sem deps de `filters`: lemos o store apenas no mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Dados do projeto (para comparar descritores com o último job)
   const { data: project } = useProject(projectId);
@@ -195,5 +211,15 @@ export default function DatasetsPage({ params }: { params: Promise<{ projectId: 
         onClear={() => setSelectedIds([])}
       />
     </div>
+  );
+}
+
+export default function DatasetsPage({ params }: { params: Promise<{ projectId: string }> }) {
+  const { projectId } = use(params);
+
+  return (
+    <Suspense fallback={<div className="h-64 bg-muted rounded-lg animate-pulse" />}>
+      <DatasetsPageContent projectId={projectId} />
+    </Suspense>
   );
 }

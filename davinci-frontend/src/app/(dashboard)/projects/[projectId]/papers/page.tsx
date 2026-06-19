@@ -1,6 +1,7 @@
 'use client';
 
-import { use, useState } from 'react';
+import { use, useState, useEffect, useRef, Suspense } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { PageHeader } from '@/components/layout/page-header';
 import { PapersTable } from '@/components/papers/papers-table';
 import { PaperDetailPanel } from '@/components/papers/paper-detail-panel';
@@ -14,8 +15,10 @@ import { useFilterStore } from '@/lib/stores/filter-store';
 import type { Paper } from '@/lib/types/paper';
 import { Search } from 'lucide-react';
 
-export default function PapersPage({ params }: { params: Promise<{ projectId: string }> }) {
-  const { projectId } = use(params);
+// Inner component isolado para uso do useSearchParams (exige Suspense boundary).
+// Semeia o store com curation_status da URL uma única vez ao montar.
+function PapersPageContent({ projectId }: { projectId: string }) {
+  const searchParams = useSearchParams();
   const [selectedPaperId, setSelectedPaperId] = useState<number | null>(null);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
@@ -24,8 +27,27 @@ export default function PapersPage({ params }: { params: Promise<{ projectId: st
   const { paperFilters, setPaperFilters } = useFilterStore();
   const filters = paperFilters[projectId] ?? {};
 
+  // Seed do filtro a partir da URL — roda uma única vez por montagem.
+  // Guarda o projectId que já foi semeado para não reaplicar em navegações
+  // dentro da mesma página nem brigar com mudanças manuais no dropdown.
+  const seededRef = useRef(false);
+  useEffect(() => {
+    if (seededRef.current) return;
+    seededRef.current = true;
+    const urlStatus = searchParams.get('curation_status');
+    if (urlStatus) {
+      setPaperFilters(projectId, { ...filters, curation_status: urlStatus });
+    }
+    // Intencionalmente sem `filters` nas deps: queremos ler o store apenas
+    // no momento do mount, sem reaplicar a cada render subsequente.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Re-lê o store após possível seed para garantir valor atualizado.
+  const currentFilters = useFilterStore((s) => s.paperFilters[projectId] ?? {});
+
   const activeFilters = {
-    ...filters,
+    ...currentFilters,
     search: debouncedQuery || undefined,
   };
 
@@ -33,7 +55,6 @@ export default function PapersPage({ params }: { params: Promise<{ projectId: st
   const papers = data?.results ?? [];
 
   // Busca o detalhe completo apenas quando um paper está selecionado.
-  // enabled=false quando selectedPaperId é null — nenhum fetch em idle.
   const { data: paperDetail, isLoading: detailLoading } = usePaper(
     projectId,
     selectedPaperId ?? 0,
@@ -49,7 +70,7 @@ export default function PapersPage({ params }: { params: Promise<{ projectId: st
       <div className="flex gap-4">
         <div className="w-56 shrink-0 space-y-4">
           <PaperFiltersPanel
-            filters={filters}
+            filters={currentFilters}
             onChange={(f) => setPaperFilters(projectId, f)}
           />
         </div>
@@ -92,5 +113,15 @@ export default function PapersPage({ params }: { params: Promise<{ projectId: st
         onClear={() => setSelectedIds([])}
       />
     </div>
+  );
+}
+
+export default function PapersPage({ params }: { params: Promise<{ projectId: string }> }) {
+  const { projectId } = use(params);
+
+  return (
+    <Suspense fallback={<div className="h-64 bg-muted rounded-lg animate-pulse" />}>
+      <PapersPageContent projectId={projectId} />
+    </Suspense>
   );
 }

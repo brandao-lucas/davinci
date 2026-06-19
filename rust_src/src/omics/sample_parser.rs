@@ -3,7 +3,12 @@
 /// # Fetch strategy
 ///
 /// ## GEO
-/// `efetch db=gse accession=GSE* rettype=soft retmode=text`
+/// Uses the GEO Accession Display endpoint (NOT efetch, which has no `db=gse`):
+/// `https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSExxxxx&targ=gsm&form=text&view=brief`
+///
+/// - `targ=gsm` returns all GSM sample records for the series.
+/// - `form=text` returns SOFT (line-oriented text format).
+/// - `view=brief` limits each record to core metadata fields.
 ///
 /// GEO SOFT is a line-oriented text format. Each sample block starts with
 /// `^SAMPLE = GSMxxxxxxx` and ends at the next `^` directive. Fields are
@@ -14,15 +19,25 @@
 /// SOFT was chosen over MINiML (which is XML) because:
 /// 1. It is much smaller (no namespace cruft, no binary blobs).
 /// 2. It is line-delimited, so parsing is a single streaming pass.
-/// 3. The efetch endpoint returns it reliably for any size GSE.
+/// 3. The acc.cgi endpoint returns it reliably for any size GSE.
 ///
 /// ## SRA
-/// `efetch db=sra accession=SRP* rettype=xml retmode=xml`
+/// Three-step via E-utilities:
+/// 1. `esearch.fcgi?db=sra&term=SRP...&retmax=500&retmode=json` → all UIDs for the study
+/// 2. UIDs are batched into groups of up to 200, joined by comma.
+/// 3. `efetch.fcgi?db=sra&id=<uid1,uid2,...>&retmode=xml` → EXPERIMENT_PACKAGE_SET XML
+///    (one efetch call per batch, respecting the NcbiClient rate limit between calls)
+///
+/// The `efetch` endpoint requires numeric UIDs via the `id=` parameter;
+/// the `acc=` parameter is not valid for efetch and returns 400.
 ///
 /// The SRA efetch XML for a study returns a `<EXPERIMENT_PACKAGE_SET>` where
 /// each `<EXPERIMENT_PACKAGE>` has a `<SAMPLE>` element with accession,
 /// title, scientific name, taxon id, and `<SAMPLE_ATTRIBUTE>` key/value pairs.
 /// One pass through the XML extracts all sample records.
+///
+/// `parse_sra_samples_xml` deduplicates by SRS accession, so samples referenced
+/// across multiple experiment packages are never inserted twice.
 ///
 /// SRA fetch-by-study-accession is preferred over fetch-by-run because it
 /// gives sample-level (SRS) records, which map directly to `OmicSample`.
@@ -32,12 +47,37 @@
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use serde::Deserialize;
 use serde_json::{json, Map, Value as JsonValue};
 
 use crate::ncbi::client::NcbiClient;
 use crate::omics::models::OmicSampleData;
 
+const GEO_ACC_CGI_URL: &str = "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi";
+const ESEARCH_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi";
 const EFETCH_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi";
+
+/// Maximum UIDs to retrieve from esearch in a single SRA query.
+/// NCBI supports up to 10 000 for esearch; 500 covers all practical studies
+/// without risking oversized efetch payloads.
+const SRA_ESEARCH_RETMAX: &str = "500";
+
+/// Maximum UIDs per efetch call when fetching SRA experiment packages.
+/// NCBI recommends keeping comma-delimited id lists short; 200 is safe and
+/// keeps individual payloads manageable while minimising round-trips.
+const SRA_EFETCH_BATCH_SIZE: usize = 200;
+
+// ─── SRA esearch response structs ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SraEsearchResponse {
+    esearchresult: SraEsearchResult,
+}
+
+#[derive(Deserialize)]
+struct SraEsearchResult {
+    idlist: Vec<String>,
+}
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
@@ -71,16 +111,27 @@ async fn fetch_geo_samples(
     dataset_id: i64,
     gse_accession: &str,
 ) -> Result<Vec<OmicSampleData>, String> {
-    // GEO SOFT via efetch: db=gse, acc=GSExxxxx, rettype=soft, retmode=text
-    // The `acc` parameter accepts the GSE accession directly.
+    // GEO SOFT via the GEO Accession Display endpoint.
+    //
+    // efetch has no `db=gse` — using it with that db returns 400.
+    // The canonical way to get SOFT for all samples of a series is:
+    //   https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi
+    //     ?acc=GSExxxxx&targ=gsm&form=text&view=brief
+    //
+    // `targ=gsm`  → include GSM sample records
+    // `form=text` → SOFT text format (compatible with parse_geo_soft)
+    // `view=brief`→ omits bulky data tables, keeps metadata fields
+    //
+    // The NcbiClient may append `api_key` as an extra query param;
+    // acc.cgi silently ignores unrecognised parameters.
     let params = [
-        ("db", "gse"),
         ("acc", gse_accession),
-        ("rettype", "soft"),
-        ("retmode", "text"),
+        ("targ", "gsm"),
+        ("form", "text"),
+        ("view", "brief"),
     ];
 
-    let body = client.fetch_with_retry(EFETCH_URL, &params).await?;
+    let body = client.fetch_with_retry(GEO_ACC_CGI_URL, &params).await?;
     parse_geo_soft(&body, dataset_id)
 }
 
@@ -275,17 +326,77 @@ async fn fetch_sra_samples(
     dataset_id: i64,
     srp_accession: &str,
 ) -> Result<Vec<OmicSampleData>, String> {
-    // efetch db=sra accession=SRP* rettype=xml retmode=xml
-    // Returns EXPERIMENT_PACKAGE_SET; each EXPERIMENT_PACKAGE has a SAMPLE element.
-    let params = [
-        ("db", "sra"),
-        ("acc", srp_accession),
-        ("rettype", "xml"),
-        ("retmode", "xml"),
-    ];
+    // efetch requires numeric UIDs via `id=`; the `acc=` parameter is not
+    // valid for efetch and produces a 400 response.
+    //
+    // Step 1: esearch to resolve the SRP accession to ALL numeric UIDs.
+    //   esearch.fcgi?db=sra&term=SRP...&retmax=500&retmode=json
+    //
+    //   retmax=500 captures all experiments for any realistic study.
+    //   The SRP study accession returns one UID per SRX (experiment), and each
+    //   experiment maps to one or more SRS (sample) records. Using retmax=1
+    //   would cap the fetch at 1 experiment → 1 sample regardless of study size.
+    //
+    // Step 2: batch the UID list into groups of SRA_EFETCH_BATCH_SIZE and issue
+    //   one efetch call per batch:
+    //   efetch.fcgi?db=sra&id=<uid1,uid2,...>&retmode=xml
+    //   Each call returns an EXPERIMENT_PACKAGE_SET; the XML parser deduplicates
+    //   SRS accessions across batches so no sample appears twice.
 
-    let body = client.fetch_with_retry(EFETCH_URL, &params).await?;
-    parse_sra_samples_xml(&body, dataset_id)
+    let esearch_params = [
+        ("db", "sra"),
+        ("term", srp_accession),
+        ("retmax", SRA_ESEARCH_RETMAX),
+        ("retmode", "json"),
+    ];
+    let esearch_body = client.fetch_with_retry(ESEARCH_URL, &esearch_params).await?;
+
+    let esearch_resp: SraEsearchResponse = serde_json::from_str(&esearch_body)
+        .map_err(|e| format!("SRA esearch JSON parse error: {e}"))?;
+
+    let uids = esearch_resp.esearchresult.idlist;
+    if uids.is_empty() {
+        return Err(format!(
+            "SRA esearch returned no UIDs for accession: {srp_accession}"
+        ));
+    }
+
+    eprintln!(
+        "[sra] {srp_accession}: esearch returned {} UIDs, fetching in batches of {}",
+        uids.len(),
+        SRA_EFETCH_BATCH_SIZE,
+    );
+
+    // Shared dedup set across all batches so the same SRS accession from
+    // different experiment packages is never inserted twice.
+    let mut seen_accessions: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut all_samples: Vec<OmicSampleData> = Vec::new();
+
+    for (batch_idx, batch) in uids.chunks(SRA_EFETCH_BATCH_SIZE).enumerate() {
+        let id_list = batch.join(",");
+        let efetch_params = [
+            ("db", "sra"),
+            ("id", id_list.as_str()),
+            ("retmode", "xml"),
+        ];
+        let body = client.fetch_with_retry(EFETCH_URL, &efetch_params).await?;
+
+        let batch_samples = parse_sra_samples_xml_with_dedup(&body, dataset_id, &mut seen_accessions)?;
+        eprintln!(
+            "[sra] {srp_accession}: batch {} → {} new samples (total so far: {})",
+            batch_idx,
+            batch_samples.len(),
+            all_samples.len() + batch_samples.len(),
+        );
+        all_samples.extend(batch_samples);
+    }
+
+    eprintln!(
+        "[sra] {srp_accession}: finished — {} distinct samples total",
+        all_samples.len(),
+    );
+    Ok(all_samples)
 }
 
 /// Parse SRA efetch XML.  Expected structure (simplified):
@@ -310,13 +421,27 @@ async fn fetch_sra_samples(
 /// ```
 ///
 /// One pass extracts all `<SAMPLE>` blocks. Deduplicates by `accession`.
+///
+/// This is a thin wrapper around `parse_sra_samples_xml_with_dedup` that
+/// creates a fresh dedup set, used by unit tests.
+#[cfg(test)]
 fn parse_sra_samples_xml(xml: &str, dataset_id: i64) -> Result<Vec<OmicSampleData>, String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    parse_sra_samples_xml_with_dedup(xml, dataset_id, &mut seen)
+}
+
+/// Inner parser that accepts an external dedup set so that samples are
+/// deduplicated across multiple efetch batches (cross-batch dedup).
+fn parse_sra_samples_xml_with_dedup(
+    xml: &str,
+    dataset_id: i64,
+    mut seen_accessions: &mut std::collections::HashSet<String>,
+) -> Result<Vec<OmicSampleData>, String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
     let mut samples: Vec<OmicSampleData> = Vec::new();
-    // Dedup: a study can have the same sample referenced in multiple experiment packages
-    let mut seen_accessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // seen_accessions is provided by the caller for cross-batch dedup.
 
     // Per-sample state
     let mut in_sample = false;
@@ -702,6 +827,98 @@ mod tests {
         assert!(samples.is_empty());
     }
 
-    // Note: tests that make real NCBI network calls are omitted here.
-    // Integration tests should use `#[ignore]` and run separately with network access.
+    // ── Integration tests (require network, run with --ignored) ──────────────
+    //
+    // How to run:
+    //   cd rust_src && cargo test -- --ignored --nocapture
+    //
+    // These tests hit real NCBI endpoints. They validate that the corrected
+    // fetch URLs (acc.cgi for GEO, esearch+efetch for SRA) work end-to-end.
+    // They are marked #[ignore] so CI does not depend on network availability.
+
+    #[tokio::test]
+    #[ignore = "requires network access to real NCBI endpoints"]
+    async fn integration_geo_fetch_gse10072() {
+        // GSE10072: lung cancer study with ~107 samples — small enough for a quick test.
+        let client = NcbiClient::new(None);
+        let result = fetch_geo_samples(&client, 1, "GSE10072").await;
+        assert!(result.is_ok(), "fetch_geo_samples failed: {:?}", result.err());
+        let samples = result.unwrap();
+        assert!(
+            samples.len() > 0,
+            "Expected samples > 0 for GSE10072, got 0. \
+             Check that acc.cgi URL and params are correct."
+        );
+        // Spot-check: all samples should have a GSM accession and a dataset_id
+        for s in &samples {
+            assert!(
+                s.accession.starts_with("GSM"),
+                "Expected GSM accession, got: {}",
+                s.accession
+            );
+            assert_eq!(s.dataset_id, 1);
+        }
+        eprintln!("GSE10072: {} samples fetched", samples.len());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access to real NCBI endpoints"]
+    async fn integration_sra_fetch_srp009539() {
+        // SRP009539: small RNA-seq study — modest size for a quick validation.
+        let client = NcbiClient::new(None);
+        let result = fetch_sra_samples(&client, 2, "SRP009539").await;
+        assert!(result.is_ok(), "fetch_sra_samples failed: {:?}", result.err());
+        let samples = result.unwrap();
+        assert!(
+            samples.len() > 0,
+            "Expected samples > 0 for SRP009539, got 0. \
+             Check that esearch+efetch pipeline is correct."
+        );
+        for s in &samples {
+            assert!(
+                s.accession.starts_with("SRS"),
+                "Expected SRS accession, got: {}",
+                s.accession
+            );
+            assert_eq!(s.dataset_id, 2);
+        }
+        eprintln!("SRP009539: {} samples fetched", samples.len());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access to real NCBI endpoints"]
+    async fn integration_sra_fetch_srp612352_multi_sample() {
+        // SRP612352: the study that exposed the retmax=1 bug.
+        // Ground truth from the database: n_samples=13, only 1 OmicSample was
+        // created before the fix.  After the fix, esearch must return >1 UID
+        // and the full efetch+parse pipeline must return >1 distinct SRS sample.
+        let client = NcbiClient::new(None);
+        let result = fetch_sra_samples(&client, 3, "SRP612352").await;
+        assert!(result.is_ok(), "fetch_sra_samples failed: {:?}", result.err());
+        let samples = result.unwrap();
+        assert!(
+            samples.len() > 1,
+            "Expected >1 sample for SRP612352 (ground truth: 13), got {}. \
+             Verify that esearch retmax is not 1.",
+            samples.len()
+        );
+        // Spot-check: all accessions must be SRS*, dataset_id must be correct
+        for s in &samples {
+            assert!(
+                s.accession.starts_with("SRS"),
+                "Expected SRS accession, got: {}",
+                s.accession
+            );
+            assert_eq!(s.dataset_id, 3);
+        }
+        // No duplicate accessions
+        let unique: std::collections::HashSet<&str> =
+            samples.iter().map(|s| s.accession.as_str()).collect();
+        assert_eq!(
+            unique.len(),
+            samples.len(),
+            "Duplicate SRS accessions detected in result"
+        );
+        eprintln!("SRP612352: {} distinct samples fetched", samples.len());
+    }
 }

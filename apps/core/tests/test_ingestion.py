@@ -9,9 +9,9 @@ from django.contrib.auth.models import User
 from django.test import TestCase, TransactionTestCase
 
 from apps.accounts.models import UserProfile
-from apps.core.models import DaVinciProject, IngestionJob, Paper
+from apps.core.models import DaVinciProject, IngestionJob, OmicDataset, Paper
 from apps.core.services.search_service import SearchService
-from apps.core.tasks.ingestion_tasks import run_omics_ingestion, run_pubmed_ingestion
+from apps.core.tasks.ingestion_tasks import run_omics_ingestion, run_pubmed_ingestion, run_sample_ingestion
 
 
 # ─── Phase 2 — PubMed ingestion (existing) ───────────────────────────────────
@@ -590,3 +590,156 @@ class PubmedToOmicsChainTestCase(TransactionTestCase):
         self.assertEqual(geo_job.job_type, IngestionJob.JobType.GEO_SEARCH)
         self.assertEqual(geo_job.project, self.project)
         omics_delay.assert_called_once_with(str(geo_job.id))
+
+
+# ─── Tarefa 1 — Derivação de accession em run_sample_ingestion ───────────────
+
+def _fake_rust_sample_module(ingest_fn=None):
+    """
+    Injeta módulo rust_engine falso com ingest_samples_for_dataset simulado.
+    """
+    mod = types.ModuleType('rust_engine')
+    mod.ingest_samples_for_dataset = ingest_fn or (lambda **kw: MagicMock(
+        samples_fetched=0, samples_written=0, errors=[],
+    ))
+    return mod
+
+
+class SampleIngestionAccessionTestCase(TransactionTestCase):
+    """
+    Testa a derivação do accession correto em run_sample_ingestion.
+
+    Cobre:
+    - GEO com gse numérico → usa GSE{gse} ao chamar o Rust
+    - GEO com gse já prefixado (GSE…) → não duplica prefixo
+    - GEO sem gse em extra_metadata → aborta com job FAILED, não chama Rust
+    - SRA → usa dataset.accession diretamente
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='sample_acc_user', password='pw')
+        self.project = DaVinciProject.objects.create(
+            user=self.user,
+            title='Sample Acc Test',
+            slug='sample-acc-test-davinci',
+            query_term='test',
+        )
+        self.addCleanup(lambda: sys.modules.pop('rust_engine', None))
+
+    def _make_geo_dataset(self, accession, gse=None):
+        extra = {'gse': gse} if gse is not None else {}
+        return OmicDataset.objects.create(
+            accession=accession,
+            source_db='geo',
+            title='GEO dataset test',
+            extra_metadata=extra,
+        )
+
+    def _make_sra_dataset(self, accession):
+        return OmicDataset.objects.create(
+            accession=accession,
+            source_db='sra',
+            title='SRA dataset test',
+        )
+
+    def test_geo_gse_numerico_usa_prefixo_gse(self):
+        """
+        GEO com extra_metadata['gse'] = '249027' → Rust recebe dataset_accession='GSE249027'.
+        """
+        dataset = self._make_geo_dataset('PRJNA1047051', gse='249027')
+
+        captured = {}
+
+        def fake_ingest(**kwargs):
+            captured.update(kwargs)
+            return MagicMock(samples_fetched=30, samples_written=30, errors=[])
+
+        sys.modules['rust_engine'] = _fake_rust_sample_module(ingest_fn=fake_ingest)
+
+        result = run_sample_ingestion(str(self.project.id), dataset.id)
+
+        self.assertEqual(captured.get('dataset_accession'), 'GSE249027')
+        self.assertEqual(result['samples_fetched'], 30)
+
+        job = IngestionJob.objects.filter(
+            project=self.project,
+            job_type=IngestionJob.JobType.SAMPLE_FETCH,
+        ).latest('created_at')
+        self.assertEqual(job.parameters['dataset_accession'], 'GSE249027')
+
+    def test_geo_gse_ja_prefixado_nao_duplica(self):
+        """
+        GEO com extra_metadata['gse'] = 'GSE249027' → Rust recebe 'GSE249027', sem 'GSEGSE'.
+        """
+        dataset = self._make_geo_dataset('PRJNA1047051', gse='GSE249027')
+
+        captured = {}
+
+        def fake_ingest(**kwargs):
+            captured.update(kwargs)
+            return MagicMock(samples_fetched=30, samples_written=30, errors=[])
+
+        sys.modules['rust_engine'] = _fake_rust_sample_module(ingest_fn=fake_ingest)
+
+        run_sample_ingestion(str(self.project.id), dataset.id)
+
+        self.assertEqual(captured.get('dataset_accession'), 'GSE249027')
+
+    def test_geo_sem_gse_nao_chama_rust_e_marca_failed(self):
+        """
+        GEO sem 'gse' em extra_metadata → job criado com status=FAILED,
+        Rust NÃO é chamado, retorno indica erro.
+        """
+        dataset = self._make_geo_dataset('PRJNA9999999', gse=None)
+
+        rust_called = {'flag': False}
+
+        def fake_ingest(**kwargs):
+            rust_called['flag'] = True
+            return MagicMock(samples_fetched=0, samples_written=0, errors=[])
+
+        sys.modules['rust_engine'] = _fake_rust_sample_module(ingest_fn=fake_ingest)
+
+        result = run_sample_ingestion(str(self.project.id), dataset.id)
+
+        # Rust não deve ter sido chamado
+        self.assertFalse(rust_called['flag'], 'Rust não deve ser chamado quando gse está ausente')
+
+        # Retorno indica erro
+        self.assertEqual(result['samples_fetched'], 0)
+        self.assertEqual(result['samples_written'], 0)
+        self.assertTrue(len(result['errors']) > 0)
+        self.assertIn('GSE', result['errors'][0])
+
+        # Job deve ter sido criado com status FAILED
+        job = IngestionJob.objects.filter(
+            project=self.project,
+            job_type=IngestionJob.JobType.SAMPLE_FETCH,
+        ).latest('created_at')
+        self.assertEqual(job.status, IngestionJob.JobStatus.FAILED)
+        self.assertIn('extra_metadata', job.error_message)
+
+    def test_sra_usa_accession_diretamente(self):
+        """
+        SRA → Rust recebe dataset_accession igual a dataset.accession (SRP…).
+        """
+        dataset = self._make_sra_dataset('SRP123456')
+
+        captured = {}
+
+        def fake_ingest(**kwargs):
+            captured.update(kwargs)
+            return MagicMock(samples_fetched=48, samples_written=48, errors=[])
+
+        sys.modules['rust_engine'] = _fake_rust_sample_module(ingest_fn=fake_ingest)
+
+        result = run_sample_ingestion(str(self.project.id), dataset.id)
+
+        self.assertEqual(captured.get('dataset_accession'), 'SRP123456')
+        self.assertEqual(result['samples_fetched'], 48)
+
+        job = IngestionJob.objects.filter(
+            project=self.project,
+            job_type=IngestionJob.JobType.SAMPLE_FETCH,
+        ).latest('created_at')
+        self.assertEqual(job.parameters['dataset_accession'], 'SRP123456')

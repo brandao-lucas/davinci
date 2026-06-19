@@ -54,16 +54,21 @@ export function ProjectStatsOverview({ stats, projectId }: ProjectStatsOverviewP
     .map(([name, value]) => ({ name, value }));
 
   const papersHref = projectId ? `/projects/${projectId}/papers` : undefined;
+  const includedPapersHref = projectId ? `/projects/${projectId}/papers?curation_status=included` : undefined;
   const datasetsHref = projectId ? `/projects/${projectId}/datasets` : undefined;
+  const includedDatasetsHref = projectId ? `/projects/${projectId}/datasets?curation_status=included` : undefined;
+  const samplesHref = projectId ? `/projects/${projectId}/samples` : undefined;
+  const includedSamplesHref = projectId ? `/projects/${projectId}/samples?curation_status=included` : undefined;
 
   return (
     <div className="space-y-6">
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
         <StatsCard label="Total Papers" value={stats.total_papers} href={papersHref} />
-        <StatsCard label="Included Papers" value={stats.included_papers} sub="papers" href={papersHref} />
+        <StatsCard label="Included Papers" value={stats.included_papers} sub="included" href={includedPapersHref} />
         <StatsCard label="Total Datasets" value={stats.total_datasets} href={datasetsHref} />
-        <StatsCard label="Included Datasets" value={stats.included_datasets} sub="datasets" href={datasetsHref} />
-        <StatsCard label="Total Samples" value={stats.total_samples} />
+        <StatsCard label="Included Datasets" value={stats.included_datasets} sub="included" href={includedDatasetsHref} />
+        <StatsCard label="Total Samples" value={stats.total_samples} href={samplesHref} />
+        <StatsCard label="Included Samples" value={stats.included_samples} sub="included" href={includedSamplesHref} />
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">

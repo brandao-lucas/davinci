@@ -282,20 +282,62 @@ def run_sample_ingestion(self, project_id: str, dataset_id: int):
         except Exception:
             pass
 
+        # Deriva o accession correto para cada fonte.
+        # GEO: o campo `accession` guarda o BioProject (PRJNA…). O accession real
+        # para buscar samples no acc.cgi é a Série GEO (GSE…), armazenada em
+        # extra_metadata['gse'] apenas como número (ex: '249027' → 'GSE249027').
+        # Se extra_metadata não tiver 'gse', o job é abortado com erro claro.
+        if dataset.source_db == 'geo':
+            gse_raw = (dataset.extra_metadata or {}).get('gse')
+            if not gse_raw:
+                error_msg = (
+                    f"GEO dataset {dataset.accession} sem GSE em extra_metadata — "
+                    "não é possível buscar samples sem o accession GSE*"
+                )
+                logger.error(
+                    'run_sample_ingestion abortado para dataset %s: %s',
+                    dataset_id,
+                    error_msg,
+                )
+                IngestionJob.objects.create(
+                    project=project,
+                    job_type=IngestionJob.JobType.SAMPLE_FETCH,
+                    status=IngestionJob.JobStatus.FAILED,
+                    parameters={
+                        'dataset_id': dataset_id,
+                        'dataset_accession': dataset.accession,
+                        'source_db': dataset.source_db,
+                    },
+                    error_message=error_msg,
+                )
+                return {'samples_fetched': 0, 'samples_written': 0, 'errors': [error_msg]}
+
+            gse_str = str(gse_raw).strip()
+            # Normaliza: se o valor já vier prefixado (ex: 'GSE249027'), usa como está;
+            # se for apenas o número ('249027'), adiciona o prefixo.
+            if gse_str.upper().startswith('GSE'):
+                dataset_accession = gse_str
+            else:
+                dataset_accession = f"GSE{gse_str}"
+        else:
+            # SRA: accession (SRP…) está correto.
+            # BioProject/GWAS: mantém o accession original.
+            dataset_accession = dataset.accession
+
         job = IngestionJob.objects.create(
             project=project,
             job_type=IngestionJob.JobType.SAMPLE_FETCH,
             status=IngestionJob.JobStatus.RUNNING,
             parameters={
                 'dataset_id': dataset_id,
-                'dataset_accession': dataset.accession,
+                'dataset_accession': dataset_accession,
                 'source_db': dataset.source_db,
             },
         )
 
         result = rust_engine.ingest_samples_for_dataset(
             dataset_id=dataset.id,
-            dataset_accession=dataset.accession,
+            dataset_accession=dataset_accession,
             source_db=dataset.source_db,
             db_url=db_url,
             ncbi_api_key=ncbi_api_key,

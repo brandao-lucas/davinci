@@ -214,6 +214,31 @@ class DatasetApiTests(APITestCase):
         response = self.client.get(f'{self.base}search/', {'q': 'rna'})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+    def test_list_datasets_filter_by_curation_status(self):
+        """
+        Bug 2 — regressão: ?curation_status= funciona para datasets (mesmo param de papers).
+        O filtro por 'included' deve retornar só o dataset com esse status.
+        """
+        ds2 = make_dataset(accession='GSE002b', omic_type='genomic')
+        make_project_dataset(self.project, ds2, curation_status='included')
+        response = self.client.get(self.base, {'curation_status': 'included'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['results']), 1)
+        self.assertEqual(response.data['results'][0]['curation_status'], 'included')
+
+    def test_list_datasets_filter_curation_status_pending_returns_pending_only(self):
+        """
+        Garante que ?curation_status=pending filtra corretamente, ignorando
+        outros status — cobre o cenário oposto ao de 'included'.
+        """
+        ds2 = make_dataset(accession='GSE003b', omic_type='genomic')
+        make_project_dataset(self.project, ds2, curation_status='excluded')
+        response = self.client.get(self.base, {'curation_status': 'pending'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # setUp cria pd com status 'pending'; ds2 tem 'excluded' → só 1 resultado
+        self.assertEqual(len(response.data['results']), 1)
+        self.assertEqual(response.data['results'][0]['curation_status'], 'pending')
+
 
 # ─── Phase 4 — Categories ────────────────────────────────────────────────────
 
@@ -616,11 +641,14 @@ class SampleApiTests(APITestCase):
         self.project = make_project(self.user)
         self.dataset = make_dataset(accession='GSE100')
         # ProjectDataset necessário para a validação de isolamento do achado #1
-        make_project_dataset(self.project, self.dataset)
+        # Guardamos o retorno para usar ProjectDataset.id na URL (identificador canônico).
+        self.pd = make_project_dataset(self.project, self.dataset)
         self.sample = make_sample(self.dataset, accession='GSM100')
         self.ps = make_project_sample(self.project, self.sample)
         self.base = f'/api/v1/projects/{self.project.id}/samples/'
-        self.dataset_base = f'/api/v1/projects/{self.project.id}/datasets/{self.dataset.id}/samples/'
+        # dataset_base usa ProjectDataset.id (pd.id), que é o mesmo 'id' exposto
+        # pelo serializer da lista de datasets — identificador canônico único.
+        self.dataset_base = f'/api/v1/projects/{self.project.id}/datasets/{self.pd.id}/samples/'
 
     def test_list_samples_of_project(self):
         response = self.client.get(self.base)
@@ -650,13 +678,18 @@ class SampleApiTests(APITestCase):
         self.assertEqual(response.data['results'][0]['curation_status'], 'included')
 
     def test_list_samples_filter_by_dataset_query_param(self):
-        """Filtro ?dataset=<id> na rota plana /samples/ restringe ao dataset."""
+        """
+        Filtro ?dataset=<id> na rota plana /samples/ restringe ao dataset.
+        O valor passado é ProjectDataset.id (mesmo 'id' da lista de datasets),
+        não OmicDataset.id.
+        """
         other_ds = make_dataset(accession='GSE300')
-        make_project_dataset(self.project, other_ds)
+        other_pd = make_project_dataset(self.project, other_ds)
         other_sample = make_sample(other_ds, accession='GSM300')
         make_project_sample(self.project, other_sample)
 
-        response = self.client.get(self.base, {'dataset': self.dataset.id})
+        # Usa self.pd.id (ProjectDataset.id), não self.dataset.id (OmicDataset.id)
+        response = self.client.get(self.base, {'dataset': self.pd.id})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         accessions = [r['accession'] for r in response.data['results']]
         self.assertIn('GSM100', accessions)
@@ -752,6 +785,77 @@ class SampleBulkCurateTests(APITestCase):
         self.assertIn('detail', response.json())
 
 
+class SampleDatasetRouteTests(APITestCase):
+    """
+    Bug 1 — regressão: /datasets/{dataset_pk}/samples/ usa ProjectDataset.id
+    (o mesmo 'id' que a lista de datasets expõe), não OmicDataset.id.
+
+    Garante que:
+    - dataset que pertence ao projeto + sem samples → 200 lista vazia (nunca 404)
+    - dataset que pertence ao projeto + com samples → 200 lista com samples
+    - dataset de outro projeto → 404 (segurança: não vaza existência)
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='dsroute_user', password='pw')
+        self.client.force_authenticate(user=self.user)
+        self.project = make_project(self.user, title='DS Route Project', query_term='x')
+        self.dataset = make_dataset(accession='GSE700')
+        self.pd = make_project_dataset(self.project, self.dataset, curation_status='pending')
+        # URL usa ProjectDataset.id (campo 'id' exposto pelo serializer da lista)
+        self.samples_url = (
+            f'/api/v1/projects/{self.project.id}/datasets/{self.pd.id}/samples/'
+        )
+
+    def test_dataset_in_project_no_samples_returns_200_empty(self):
+        """
+        Bug 1 — caso principal: dataset está no projeto mas ainda não tem samples
+        ingeridos. Deve retornar 200 com lista vazia, não 404.
+        A causa raiz era get_object_or_404(..., dataset_id=dataset_pk) resolvendo
+        o ProjectDataset.id como OmicDataset.id → miss → 404.
+        """
+        response = self.client.get(self.samples_url)
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+            f'Esperado 200 (lista vazia), obtido {response.status_code}. '
+            'Bug 1: a rota de samples deve aceitar ProjectDataset.id.',
+        )
+        self.assertEqual(
+            len(response.data['results']),
+            0,
+            'Lista deve ser vazia quando nenhum sample foi ingerido para o dataset.',
+        )
+
+    def test_dataset_in_project_with_samples_returns_200_with_results(self):
+        """Dataset no projeto + samples ingeridos → 200 com samples listados."""
+        sample = make_sample(self.dataset, accession='GSM700')
+        make_project_sample(self.project, sample)
+        response = self.client.get(self.samples_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['results']), 1)
+        self.assertEqual(response.data['results'][0]['accession'], 'GSM700')
+
+    def test_dataset_not_in_project_returns_404(self):
+        """
+        dataset_pk que não pertence ao projeto do usuário → 404.
+        Garante que a validação de segurança continua funcionando após a correção.
+        """
+        other_user = User.objects.create_user(username='dsroute_other', password='pw')
+        other_project = make_project(other_user, title='Other', query_term='y')
+        other_dataset = make_dataset(accession='GSE701')
+        other_pd = make_project_dataset(other_project, other_dataset)
+        # Usa o ProjectDataset.id de outro projeto — deve ser 404
+        response = self.client.get(
+            f'/api/v1/projects/{self.project.id}/datasets/{other_pd.id}/samples/'
+        )
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_404_NOT_FOUND,
+            'dataset_pk de outro projeto deve retornar 404 (não vazar existência).',
+        )
+
+
 class SampleIsolationTests(APITestCase):
     """
     Testes de isolamento entre usuários (firebase-auth-guard).
@@ -800,23 +904,28 @@ class SampleIsolationTests(APITestCase):
         """
         Achado #1 (007): dataset_pk da rota aninhada validado contra o projeto.
 
-        Usuário A possui projeto_a com dataset_a. Usuário B possui projeto_b
-        com dataset_b (dataset_b NÃO está no projeto_a). Acessar
-        /projects/{projeto_a}/datasets/{dataset_b}/samples/ deve retornar 404
+        Usuário A possui projeto_a. Usuário B possui projeto_b com pd_b
+        (ProjectDataset de projeto_b). Acessar
+        /projects/{projeto_a}/datasets/{pd_b.id}/samples/ deve retornar 404
         — não lista vazia — para não vazar existência do dataset.
+
+        Nota: dataset_pk é o ProjectDataset.id (mesmo 'id' exposto na lista de
+        datasets). O teste usa pd_b.id (ProjectDataset do projeto B), não
+        dataset_b.id (OmicDataset), pois o identificador canônico é o ProjectDataset.id.
         """
         project_b = make_project(self.user_b, title='Project B', query_term='y')
         dataset_b = make_dataset(accession='GSE501')
-        # dataset_b está no projeto_b (do user_b), mas NÃO no projeto_a (do user_a)
-        make_project_dataset(project_b, dataset_b)
+        # pd_b é o ProjectDataset de dataset_b no projeto_b
+        pd_b = make_project_dataset(project_b, dataset_b)
 
+        # Usa pd_b.id (ProjectDataset do projeto B) na URL do projeto A
         response = self.client_a.get(
-            f'/api/v1/projects/{self.project_a.id}/datasets/{dataset_b.id}/samples/'
+            f'/api/v1/projects/{self.project_a.id}/datasets/{pd_b.id}/samples/'
         )
         self.assertEqual(
             response.status_code,
             status.HTTP_404_NOT_FOUND,
-            'Achado #1: dataset_pk fora do projeto deve retornar 404, não lista vazia.',
+            'Achado #1: ProjectDataset.id de outro projeto deve retornar 404, não lista vazia.',
         )
 
     def test_dataset_query_param_outside_project_returns_404(self):
@@ -824,19 +933,20 @@ class SampleIsolationTests(APITestCase):
         Achado #1 (007): query param ?dataset=<id> validado contra o projeto.
 
         Mesmo cenário do teste anterior, mas usando a rota plana com ?dataset=<id>.
+        dataset_pk via query param também é ProjectDataset.id.
         """
         project_b = make_project(self.user_b, title='Project B2', query_term='z')
         dataset_b = make_dataset(accession='GSE502')
-        make_project_dataset(project_b, dataset_b)
+        pd_b = make_project_dataset(project_b, dataset_b)
 
         response = self.client_a.get(
             f'/api/v1/projects/{self.project_a.id}/samples/',
-            {'dataset': dataset_b.id},
+            {'dataset': pd_b.id},
         )
         self.assertEqual(
             response.status_code,
             status.HTTP_404_NOT_FOUND,
-            'Achado #1: ?dataset=<id> fora do projeto deve retornar 404, não lista vazia.',
+            'Achado #1: ?dataset=<ProjectDataset.id de outro projeto> deve retornar 404.',
         )
 
 
