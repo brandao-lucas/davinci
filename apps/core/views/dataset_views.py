@@ -8,7 +8,7 @@ from rest_framework import mixins, viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from apps.core.models import DaVinciProject, IngestionJob, OmicSample, ProjectDataset
+from apps.core.models import DaVinciProject, IngestionJob, OmicDataset, OmicSample, ProjectDataset
 from apps.core.serializers.dataset import (
     ProjectDatasetListSerializer,
     ProjectDatasetDetailSerializer,
@@ -16,6 +16,7 @@ from apps.core.serializers.dataset import (
     DatasetBulkCurateRequestSerializer,
     BulkCurateResponseSerializer,
 )
+from apps.core.serializers.link import AddDatasetToProjectRequestSerializer
 from apps.core.tasks.ingestion_tasks import run_sample_ingestion
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,13 @@ class ProjectDatasetViewSet(
     def get_queryset(self):
         project = self._get_project()
         qs = ProjectDataset.objects.filter(project=project).select_related('dataset')
+
+        # Para detalhe: pré-carrega vínculos project-scoped para evitar N+1 no linked_papers.
+        # O filtro por project_id é feito no serializer (Regra #3 — sem cross-project).
+        if self.action == 'retrieve':
+            qs = qs.prefetch_related(
+                'projectpaperdataset_set__project_paper__paper',
+            )
 
         curation_status = self.request.query_params.get('curation_status')
         if curation_status:
@@ -200,3 +208,64 @@ class ProjectDatasetViewSet(
         )
         serializer = ProjectDatasetListSerializer(qs, many=True)
         return Response(serializer.data)
+
+    @extend_schema(
+        request=AddDatasetToProjectRequestSerializer,
+        responses={200: ProjectDatasetListSerializer, 201: ProjectDatasetListSerializer},
+        summary="Adicionar dataset ao projeto a partir de sugestão de órfão",
+        description=(
+            "Vincula um OmicDataset global existente ao projeto como ProjectDataset "
+            "(curation_status='pending'). Idempotente: se o vínculo já existir, "
+            "retorna o existente com HTTP 200. Criação nova retorna HTTP 201.\n\n"
+            "Após criar o vínculo, dispara materialize_project_links para que a "
+            "ponta recém-adicionada promova automaticamente o par órfão a "
+            "ProjectPaperDataset(confidence='auto') (Nível 1).\n\n"
+            "Request body: { \"dataset_id\": <int> }  — dataset_id vindo de "
+            "GET /links/suggestions/ (campo OrphanLinkSuggestionSerializer.dataset_id)."
+        ),
+    )
+    @action(detail=False, methods=['post'], url_path='add_from_suggestion')
+    def add_from_suggestion(self, request, project_pk=None):
+        """
+        Adiciona dataset global (identificado por dataset_id / PK de OmicDataset) ao projeto.
+
+        Fluxo:
+          1. Valida request body { "dataset_id": <int> }.
+          2. Resolve projeto via _get_project() — 404 se alheio (Regra #3).
+          3. Busca OmicDataset global — 404 se inexistente.
+          4. get_or_create ProjectDataset com curation_status='pending'.
+          5. Dispara materialize_project_links para promover vínculos.
+          6. Retorna ProjectDataset serializado (201 se criado, 200 se existente).
+        """
+        serializer = AddDatasetToProjectRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        dataset_id = serializer.validated_data['dataset_id']
+
+        project = self._get_project()
+
+        dataset = get_object_or_404(OmicDataset, pk=dataset_id)
+
+        project_dataset, created = ProjectDataset.objects.get_or_create(
+            project=project,
+            dataset=dataset,
+            defaults={'curation_status': ProjectDataset.CurationStatus.PENDING},
+        )
+
+        # Re-dispara materialização para promover o par órfão recém-completado.
+        # Chamada síncrona — mesma convenção de run_pubmed_ingestion/run_omics_ingestion.
+        # Falha não derruba a resposta — o vínculo ProjectDataset já foi criado.
+        try:
+            from apps.core.services.link_service import materialize_project_links
+            materialize_project_links(project.id)
+        except Exception as exc:
+            logger.error(
+                'materialize_project_links falhou após add_from_suggestion (projeto %s, dataset_id %s): %s',
+                project.id, dataset_id, exc,
+            )
+
+        response_serializer = ProjectDatasetListSerializer(
+            project_dataset,
+            context={'request': request},
+        )
+        http_status = status.HTTP_201_CREATED if created else status.HTTP_200_OK
+        return Response(response_serializer.data, status=http_status)

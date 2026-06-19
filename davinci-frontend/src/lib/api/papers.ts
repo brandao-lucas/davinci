@@ -30,4 +30,10 @@ export const papersApi = {
     apiClient.get<PaginatedResponse<Paper>>(`/projects/${projectId}/papers/search/`, {
       params: { q: query },
     }),
+
+  addFromSuggestion: (projectId: string, pmid: number) =>
+    apiClient.post<import('@/lib/types/paper').Paper>(
+      `/projects/${projectId}/papers/add_from_suggestion/`,
+      { pmid },
+    ),
 };

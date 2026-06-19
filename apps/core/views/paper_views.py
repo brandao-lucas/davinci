@@ -8,7 +8,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from apps.core.models import (
-    DaVinciProject, ProjectPaper, ClinicalCategory, UserCategory,
+    DaVinciProject, Paper, ProjectPaper, ClinicalCategory, UserCategory,
 )
 from apps.core.serializers.paper import (
     ProjectPaperListSerializer,
@@ -18,6 +18,7 @@ from apps.core.serializers.paper import (
     PaperBulkCurateResponseSerializer,
     PaperCategorizeRequestSerializer,
 )
+from apps.core.serializers.link import AddPaperToProjectRequestSerializer
 
 
 class ProjectPaperViewSet(
@@ -54,6 +55,13 @@ class ProjectPaperViewSet(
             .select_related('paper')
             .prefetch_related('clinical_categories', 'user_categories')
         )
+
+        # Para detalhe: pré-carrega vínculos project-scoped para evitar N+1 no linked_datasets.
+        # O filtro por project_id é feito no serializer (Regra #3 — sem cross-project).
+        if self.action == 'retrieve':
+            qs = qs.prefetch_related(
+                'projectpaperdataset_set__project_dataset__dataset',
+            )
 
         # Filters
         curation_status = self.request.query_params.get('curation_status')
@@ -202,3 +210,67 @@ class ProjectPaperViewSet(
         ).update(curation_status=new_status, curated_at=timezone.now())
 
         return Response({'updated': updated})
+
+    @extend_schema(
+        request=AddPaperToProjectRequestSerializer,
+        responses={200: ProjectPaperListSerializer, 201: ProjectPaperListSerializer},
+        summary="Adicionar paper ao projeto a partir de sugestão de órfão",
+        description=(
+            "Vincula um Paper global existente ao projeto como ProjectPaper "
+            "(curation_status='pending'). Idempotente: se o vínculo já existir, "
+            "retorna o existente com HTTP 200. Criação nova retorna HTTP 201.\n\n"
+            "Após criar o vínculo, dispara materialize_project_links para que a "
+            "ponta recém-adicionada promova automaticamente o par órfão a "
+            "ProjectPaperDataset(confidence='auto') (Nível 1).\n\n"
+            "Request body: { \"pmid\": <int> }  — paper_pmid vindo de "
+            "GET /links/suggestions/ (campo OrphanLinkSuggestionSerializer.paper_pmid)."
+        ),
+    )
+    @action(detail=False, methods=['post'], url_path='add_from_suggestion')
+    def add_from_suggestion(self, request, project_pk=None):
+        """
+        Adiciona paper global (identificado por PMID) ao projeto como ProjectPaper.
+
+        Fluxo:
+          1. Valida request body { "pmid": <int> }.
+          2. Resolve projeto via _get_project() — 404 se alheio (Regra #3).
+          3. Busca Paper global — 404 se inexistente.
+          4. get_or_create ProjectPaper com curation_status='pending'.
+          5. Dispara materialize_project_links para promover vínculos.
+          6. Retorna ProjectPaper serializado (201 se criado, 200 se existente).
+        """
+        serializer = AddPaperToProjectRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        pmid = serializer.validated_data['pmid']
+
+        project = self._get_project()
+
+        paper = get_object_or_404(Paper, pmid=pmid)
+
+        project_paper, created = ProjectPaper.objects.get_or_create(
+            project=project,
+            paper=paper,
+            defaults={'curation_status': ProjectPaper.CurationStatus.PENDING},
+        )
+
+        # Re-dispara materialização para promover o par órfão recém-completado.
+        # Chamada síncrona — mesma convenção de run_pubmed_ingestion/run_omics_ingestion,
+        # que chamam materialize_project_links diretamente (não via Celery) pois a
+        # operação é puramente set-based no banco e retorna em < 1 ms para projetos normais.
+        # Falha não derruba a resposta — o vínculo ProjectPaper já foi criado.
+        try:
+            from apps.core.services.link_service import materialize_project_links
+            materialize_project_links(project.id)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).error(
+                'materialize_project_links falhou após add_from_suggestion (projeto %s, pmid %s): %s',
+                project.id, pmid, exc,
+            )
+
+        response_serializer = ProjectPaperListSerializer(
+            project_paper,
+            context={'request': request},
+        )
+        http_status = status.HTTP_201_CREATED if created else status.HTTP_200_OK
+        return Response(response_serializer.data, status=http_status)

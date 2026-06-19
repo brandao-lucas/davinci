@@ -11,7 +11,7 @@ import { Textarea } from '@/components/ui/textarea';
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
-import { useCurateDataset } from '@/lib/hooks/use-datasets';
+import { useCurateDataset, useDataset } from '@/lib/hooks/use-datasets';
 import type { OmicDataset } from '@/lib/types/dataset';
 
 interface DatasetDetailPanelProps {
@@ -48,6 +48,10 @@ export function DatasetDetailPanel({ dataset, projectId, onClose }: DatasetDetai
   const [editStatus, setEditStatus] = useState('');
   const [notes, setNotes] = useState('');
   const [editing, setEditing] = useState(false);
+
+  // Busca o detalhe completo (inclui linked_papers serializado pelo backend).
+  const { data: detail } = useDataset(projectId, dataset?.id ?? 0);
+  const linkedPapers = detail?.linked_papers;
 
   if (!dataset) return null;
 
@@ -213,6 +217,42 @@ export function DatasetDetailPanel({ dataset, projectId, onClose }: DatasetDetai
               </div>
               <Button size="sm" variant="outline" onClick={openEdit}>Edit</Button>
             </div>
+          )}
+
+          {/* Papers vinculados */}
+          {linkedPapers && linkedPapers.length > 0 && (
+            <>
+              <Separator />
+              <div>
+                <p className="font-medium mb-2 text-sm">Papers vinculados</p>
+                <div className="space-y-2">
+                  {linkedPapers.map((lp) => (
+                    <div key={lp.id} className="flex items-start justify-between gap-2 text-xs">
+                      <div className="min-w-0">
+                        <p className="font-mono">PMID {lp.paper_pmid}</p>
+                        {lp.paper_title && (
+                          <p className="text-muted-foreground truncate" title={lp.paper_title}>
+                            {lp.paper_title}
+                          </p>
+                        )}
+                      </div>
+                      <Badge
+                        variant="outline"
+                        className={
+                          lp.confidence === 'confirmed'
+                            ? 'bg-green-100 text-green-800 shrink-0'
+                            : lp.confidence === 'rejected'
+                            ? 'bg-red-100 text-red-800 shrink-0'
+                            : 'bg-amber-100 text-amber-800 shrink-0'
+                        }
+                      >
+                        {lp.confidence}
+                      </Badge>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>
           )}
         </div>
       </SheetContent>

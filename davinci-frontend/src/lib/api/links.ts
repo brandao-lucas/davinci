@@ -1,14 +1,15 @@
 import apiClient from './client';
 import type { PaginatedResponse } from '@/lib/types/api';
+import type { OrphanLinkSuggestion, LinkSuggestionFilters } from '@/lib/types/links';
 
 export interface PaperDatasetLink {
   id: number;
-  paper: number;
+  /** PMID do paper (número inteiro). */
+  paper_pmid: number;
   paper_title: string;
-  paper_pmid: string;
-  dataset: number;
   dataset_accession: string;
   dataset_title: string;
+  omic_type: string;
   confidence: 'auto' | 'confirmed' | 'rejected';
   created_at: string;
 }
@@ -22,4 +23,10 @@ export const linksApi = {
 
   reject: (projectId: string, linkId: number) =>
     apiClient.post(`/projects/${projectId}/links/${linkId}/reject/`),
+
+  suggestions: (projectId: string, filters?: LinkSuggestionFilters) =>
+    apiClient.get<PaginatedResponse<OrphanLinkSuggestion>>(
+      `/projects/${projectId}/links/suggestions/`,
+      { params: filters },
+    ),
 };

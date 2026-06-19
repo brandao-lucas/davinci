@@ -1,8 +1,9 @@
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 from apps.core.models import (
     Paper, PaperAuthor, PaperKeyword, PaperMeSHTerm,
     PaperGene, PaperDrug, PaperVariant, EntityContext,
-    ProjectPaper, ClinicalCategory, UserCategory,
+    ProjectPaper, ProjectPaperDataset, ClinicalCategory, UserCategory,
 )
 
 
@@ -68,6 +69,34 @@ class PaperDetailSerializer(serializers.ModelSerializer):
         ]
 
 
+class LinkedDatasetBriefSerializer(serializers.ModelSerializer):
+    """
+    Resumo de um vínculo ProjectPaperDataset para exibir no detalhe de um paper.
+
+    Expõe os campos do dataset vinculado + metadados do link.
+    Filtrado pelo project_pk da rota — sem vazamento cross-project (Regra #3).
+    """
+    dataset_accession = serializers.CharField(
+        source='project_dataset.dataset.accession', read_only=True
+    )
+    dataset_title = serializers.CharField(
+        source='project_dataset.dataset.title', read_only=True
+    )
+    omic_type = serializers.CharField(
+        source='project_dataset.dataset.omic_type', read_only=True
+    )
+    project_dataset_id = serializers.IntegerField(
+        source='project_dataset.id', read_only=True
+    )
+
+    class Meta:
+        model = ProjectPaperDataset
+        fields = [
+            'id', 'project_dataset_id', 'dataset_accession', 'dataset_title',
+            'omic_type', 'confidence', 'created_at',
+        ]
+
+
 class ClinicalCategoryBriefSerializer(serializers.ModelSerializer):
     class Meta:
         model = ClinicalCategory
@@ -106,10 +135,33 @@ class ProjectPaperListSerializer(serializers.ModelSerializer):
 
 
 class ProjectPaperDetailSerializer(serializers.ModelSerializer):
-    """Full detail: paper content + curation fields."""
+    """Full detail: paper content + curation fields + linked datasets."""
     paper = PaperDetailSerializer(read_only=True)
     clinical_categories = ClinicalCategoryBriefSerializer(many=True, read_only=True)
     user_categories = UserCategoryBriefSerializer(many=True, read_only=True)
+
+    @extend_schema_field(LinkedDatasetBriefSerializer(many=True))
+    def get_linked_datasets(self, obj):
+        """
+        Retorna os datasets vinculados a este paper dentro do projeto da rota.
+
+        Filtrado por project_pk do contexto da view (Regra #3 — sem vazamento cross-project).
+        Usa prefetch_related('projectpaperdataset__project_dataset__dataset') do viewset
+        para evitar N+1. O obj aqui é ProjectPaper (não Paper).
+        """
+        view = self.context.get('view')
+        project_pk = view.kwargs.get('project_pk') if view else None
+        if not project_pk:
+            return []
+
+        # Aproveita o prefetch quando disponível (see viewset).
+        # accessor reverso de ProjectPaperDataset.project_paper é 'projectpaperdataset_set'.
+        links = obj.projectpaperdataset_set.all()
+        # Filtra pelo project_pk da rota (segurança: impede cross-project)
+        links = [lnk for lnk in links if str(lnk.project_id) == str(project_pk)]
+        return LinkedDatasetBriefSerializer(links, many=True).data
+
+    linked_datasets = serializers.SerializerMethodField()
 
     class Meta:
         model = ProjectPaper
@@ -118,6 +170,7 @@ class ProjectPaperDetailSerializer(serializers.ModelSerializer):
             'curation_status', 'exclusion_reason', 'notes',
             'relevance_score', 'clinical_categories', 'user_categories',
             'added_at', 'curated_at',
+            'linked_datasets',
         ]
         read_only_fields = ['id', 'paper', 'added_at', 'curated_at']
 

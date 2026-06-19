@@ -24,11 +24,13 @@ paper_detail = ProjectPaperViewSet.as_view({'get': 'retrieve', 'patch': 'partial
 paper_categorize = ProjectPaperViewSet.as_view({'post': 'categorize'})
 paper_bulk_curate = ProjectPaperViewSet.as_view({'post': 'bulk_curate'})
 paper_search = ProjectPaperViewSet.as_view({'get': 'search'})
+paper_add_from_suggestion = ProjectPaperViewSet.as_view({'post': 'add_from_suggestion'})
 
 dataset_list = ProjectDatasetViewSet.as_view({'get': 'list'})
 dataset_detail = ProjectDatasetViewSet.as_view({'get': 'retrieve', 'patch': 'partial_update'})
 dataset_bulk_curate = ProjectDatasetViewSet.as_view({'post': 'bulk_curate'})
 dataset_search = ProjectDatasetViewSet.as_view({'get': 'search'})
+dataset_add_from_suggestion = ProjectDatasetViewSet.as_view({'post': 'add_from_suggestion'})
 
 # Samples — rota plana (todos os samples do projeto) e rota por dataset
 sample_list = ProjectSampleViewSet.as_view({'get': 'list'})
@@ -44,6 +46,7 @@ category_detail = UserCategoryViewSet.as_view({
 })
 
 link_list = ProjectPaperDatasetViewSet.as_view({'get': 'list'})
+link_suggestions = ProjectPaperDatasetViewSet.as_view({'get': 'suggestions'})
 link_confirm = ProjectPaperDatasetViewSet.as_view({'post': 'confirm'})
 link_reject = ProjectPaperDatasetViewSet.as_view({'post': 'reject'})
 
@@ -72,6 +75,8 @@ urlpatterns = [
     path(f'{PROJECT_PREFIX}papers/', paper_list, name='project-paper-list'),
     path(f'{PROJECT_PREFIX}papers/search/', paper_search, name='project-paper-search'),
     path(f'{PROJECT_PREFIX}papers/bulk_curate/', paper_bulk_curate, name='project-paper-bulk-curate'),
+    # add_from_suggestion deve vir antes de <int:pk>/ para não ser capturada como pk
+    path(f'{PROJECT_PREFIX}papers/add_from_suggestion/', paper_add_from_suggestion, name='project-paper-add-from-suggestion'),
     path(f'{PROJECT_PREFIX}papers/<int:pk>/', paper_detail, name='project-paper-detail'),
     path(f'{PROJECT_PREFIX}papers/<int:pk>/categorize/', paper_categorize, name='project-paper-categorize'),
 
@@ -79,6 +84,8 @@ urlpatterns = [
     path(f'{PROJECT_PREFIX}datasets/', dataset_list, name='project-dataset-list'),
     path(f'{PROJECT_PREFIX}datasets/search/', dataset_search, name='project-dataset-search'),
     path(f'{PROJECT_PREFIX}datasets/bulk_curate/', dataset_bulk_curate, name='project-dataset-bulk-curate'),
+    # add_from_suggestion deve vir antes de <int:pk>/ para não ser capturada como pk
+    path(f'{PROJECT_PREFIX}datasets/add_from_suggestion/', dataset_add_from_suggestion, name='project-dataset-add-from-suggestion'),
     path(f'{PROJECT_PREFIX}datasets/<int:pk>/', dataset_detail, name='project-dataset-detail'),
 
     # Samples por dataset — para a página de samples de um dataset específico (Op 4.4)
@@ -99,6 +106,8 @@ urlpatterns = [
 
     # Literature ↔ Omics links
     path(f'{PROJECT_PREFIX}links/', link_list, name='project-link-list'),
+    # suggestions deve vir ANTES de <int:pk>/ para não ser capturada como pk
+    path(f'{PROJECT_PREFIX}links/suggestions/', link_suggestions, name='project-link-suggestions'),
     path(f'{PROJECT_PREFIX}links/<int:pk>/confirm/', link_confirm, name='project-link-confirm'),
     path(f'{PROJECT_PREFIX}links/<int:pk>/reject/', link_reject, name='project-link-reject'),
 

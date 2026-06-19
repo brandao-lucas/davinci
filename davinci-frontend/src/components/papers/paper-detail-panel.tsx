@@ -12,6 +12,9 @@ import { Separator } from '@/components/ui/separator';
 import { Skeleton } from '@/components/ui/skeleton';
 import type { PaperDetail } from '@/lib/types/paper';
 
+// linked_datasets agora está em ProjectPaperDetail (api-schema.d.ts gerado).
+// PaperDetail já carrega o campo — intersecção manual removida.
+
 interface PaperDetailPanelProps {
   /** ID do paper selecionado na lista (null = painel fechado). */
   paperId: number | null;
@@ -147,6 +150,46 @@ export function PaperDetailPanel({ paperId, detail, isLoading, onClose }: PaperD
                   <div>
                     <p className="font-medium mb-1">Notes</p>
                     <p className="text-muted-foreground">{detail.notes}</p>
+                  </div>
+                </>
+              )}
+
+              {detail.linked_datasets && detail.linked_datasets.length > 0 && (
+                <>
+                  <Separator />
+                  <div>
+                    <p className="font-medium mb-2">Datasets vinculados</p>
+                    <div className="space-y-2">
+                      {detail.linked_datasets.map((ds) => (
+                        <div key={ds.id} className="flex items-start justify-between gap-2 text-xs">
+                          <div className="min-w-0">
+                            <p className="font-mono truncate">{ds.dataset_accession}</p>
+                            {ds.dataset_title && (
+                              <p className="text-muted-foreground truncate" title={ds.dataset_title}>
+                                {ds.dataset_title}
+                              </p>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-1 shrink-0">
+                            {ds.omic_type && (
+                              <Badge variant="secondary" className="text-xs">{ds.omic_type}</Badge>
+                            )}
+                            <Badge
+                              variant="outline"
+                              className={
+                                ds.confidence === 'confirmed'
+                                  ? 'bg-green-100 text-green-800'
+                                  : ds.confidence === 'rejected'
+                                  ? 'bg-red-100 text-red-800'
+                                  : 'bg-amber-100 text-amber-800'
+                              }
+                            >
+                              {ds.confidence ?? 'auto'}
+                            </Badge>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 </>
               )}

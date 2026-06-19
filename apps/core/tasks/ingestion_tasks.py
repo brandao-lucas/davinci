@@ -93,6 +93,22 @@ def run_pubmed_ingestion(self, job_id: str):
         except Exception as e:
             logger.warning('resolve_pending_links warning: %s', e)
 
+        # Materializa vínculos project-scoped (ProjectPaperDataset, Nível 1).
+        # Idempotente via ON CONFLICT DO NOTHING. Falha não derruba o job de papers.
+        try:
+            from apps.core.services.link_service import materialize_project_links
+            inserted = materialize_project_links(job.project_id)
+            if inserted > 0:
+                logger.info(
+                    'PubMed job %s: %d vínculos ProjectPaperDataset materializados para projeto %s',
+                    job_id, inserted, job.project_id,
+                )
+        except Exception as e:
+            logger.error(
+                'materialize_project_links falhou após PubMed job %s (projeto %s): %s',
+                job_id, job.project_id, e,
+            )
+
         # Encadeamento automático: dispara GEO_SEARCH após PubMed concluído (Op 1.1).
         # Protegido por guarda de idempotência em _dispatch_omics_after_pubmed.
         try:
@@ -193,6 +209,25 @@ def run_omics_ingestion(self, job_id: str):
                 job.save(update_fields=['records_processed', 'error_message'])
             except IngestionJob.DoesNotExist:
                 pass
+
+        # Materializa vínculos project-scoped (ProjectPaperDataset, Nível 1).
+        # Executado após resolve_pending_links do Rust (já ocorreu dentro de search_and_ingest_omics).
+        # Idempotente via ON CONFLICT DO NOTHING. Falha não derruba o job de ômicas.
+        try:
+            from apps.core.services.link_service import materialize_project_links
+            # Recarrega o job para obter project_id caso não esteja hydratado.
+            _project_id = job.project_id
+            inserted = materialize_project_links(_project_id)
+            if inserted > 0:
+                logger.info(
+                    'Omics job %s: %d vínculos ProjectPaperDataset materializados para projeto %s',
+                    job_id, inserted, _project_id,
+                )
+        except Exception as e:
+            logger.error(
+                'materialize_project_links falhou após omics job %s (projeto %s): %s',
+                job_id, job.project_id if 'job' in dir() else '?', e,
+            )
 
         return {
             'datasets_processed': result.datasets_processed,

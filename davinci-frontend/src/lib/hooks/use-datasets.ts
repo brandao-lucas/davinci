@@ -2,7 +2,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { datasetsApi } from '@/lib/api/datasets';
 import { extractApiErrorMessage } from '@/lib/utils/api-error';
-import type { DatasetFilters } from '@/lib/types/dataset';
+import type { DatasetFilters, ProjectDatasetDetail } from '@/lib/types/dataset';
 
 export function useDatasets(projectId: string, filters?: DatasetFilters) {
   return useQuery({
@@ -13,7 +13,7 @@ export function useDatasets(projectId: string, filters?: DatasetFilters) {
 }
 
 export function useDataset(projectId: string, datasetId: number) {
-  return useQuery({
+  return useQuery<ProjectDatasetDetail>({
     queryKey: ['datasets', projectId, datasetId],
     queryFn: () => datasetsApi.get(projectId, datasetId).then(r => r.data),
     enabled: !!projectId && !!datasetId,

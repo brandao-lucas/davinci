@@ -1,13 +1,14 @@
 import apiClient from './client';
-import type { OmicDataset, DatasetFilters } from '@/lib/types/dataset';
+import type { OmicDataset, ProjectDatasetDetail, DatasetFilters } from '@/lib/types/dataset';
 import type { PaginatedResponse } from '@/lib/types/api';
 
 export const datasetsApi = {
   list: (projectId: string, filters?: DatasetFilters) =>
     apiClient.get<PaginatedResponse<OmicDataset>>(`/projects/${projectId}/datasets/`, { params: filters }),
 
+  // Endpoint de detalhe retorna ProjectDatasetDetail (dataset aninhado + curadoria).
   get: (projectId: string, datasetId: number) =>
-    apiClient.get<OmicDataset>(`/projects/${projectId}/datasets/${datasetId}/`),
+    apiClient.get<ProjectDatasetDetail>(`/projects/${projectId}/datasets/${datasetId}/`),
 
   curate: (projectId: string, datasetId: number, data: {
     curation_status: string;
@@ -27,4 +28,10 @@ export const datasetsApi = {
     apiClient.get<PaginatedResponse<OmicDataset>>(`/projects/${projectId}/datasets/search/`, {
       params: { q: query },
     }),
+
+  addFromSuggestion: (projectId: string, datasetId: number) =>
+    apiClient.post<OmicDataset>(
+      `/projects/${projectId}/datasets/add_from_suggestion/`,
+      { dataset_id: datasetId },
+    ),
 };
