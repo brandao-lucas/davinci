@@ -5,11 +5,11 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
-import { Loader2, Sparkles, BarChart2, Save, AlertCircle } from 'lucide-react';
+import { Loader2, Sparkles, BarChart2, Save, AlertCircle, Play } from 'lucide-react';
 import { MeshSelector } from './MeshSelector';
 import { MagnitudePanel } from './MagnitudePanel';
 import { useSearchPreview, useSearchPreviewMutation } from '@/lib/hooks/use-advanced-search';
-import { useUpdateProject } from '@/lib/hooks/use-projects';
+import { useUpdateProject, useDispatchSearch } from '@/lib/hooks/use-projects';
 import type { DaVinciProject } from '@/lib/types/project';
 import type {
   SelectedMeshItem,
@@ -58,6 +58,7 @@ export function AdvancedSearchBlock({ project }: AdvancedSearchBlockProps) {
 
   const updateProject = useUpdateProject(project.id);
   const fullPreviewMutation = useSearchPreviewMutation(project.id);
+  const dispatchSearch = useDispatchSearch(project.id);
 
   // Core counts — recalculam ao vivo (debounce 400ms interno ao hook)
   const {
@@ -95,6 +96,11 @@ export function AdvancedSearchBlock({ project }: AdvancedSearchBlockProps) {
     });
   }
 
+  async function handleStartSearch() {
+    await handleSave();
+    await dispatchSearch.mutateAsync();
+  }
+
   async function handleAnalyzeFull() {
     const result = await fullPreviewMutation.mutateAsync({
       selected_mesh: selectedMesh,
@@ -108,6 +114,7 @@ export function AdvancedSearchBlock({ project }: AdvancedSearchBlockProps) {
 
   const isSaving = updateProject.isPending;
   const isAnalyzing = fullPreviewMutation.isPending;
+  const isStarting = isSaving || dispatchSearch.isPending;
 
   // Exibe o painel pesado se vieram do fullPreviewMutation OU se o livePreview já tem esses dados
   const previewForPanel: MagnitudePreview | null =
@@ -148,6 +155,19 @@ export function AdvancedSearchBlock({ project }: AdvancedSearchBlockProps) {
             {isSaving
               ? <><Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />Salvando…</>
               : <><Save className="h-3.5 w-3.5 mr-1.5" />Salvar configuração</>
+            }
+          </Button>
+
+          <Button
+            variant="default"
+            size="sm"
+            onClick={handleStartSearch}
+            disabled={isStarting || selectedMesh.length === 0}
+            title={selectedMesh.length === 0 ? 'Selecione ao menos um descritor MeSH para iniciar a pesquisa premium.' : undefined}
+          >
+            {isStarting
+              ? <><Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />Iniciando…</>
+              : <><Play className="h-3.5 w-3.5 mr-1.5" />Iniciar pesquisa</>
             }
           </Button>
         </div>
@@ -233,7 +253,7 @@ export function AdvancedSearchBlock({ project }: AdvancedSearchBlockProps) {
             </>
           )}
 
-          {updateProject.isSuccess && (
+          {updateProject.isSuccess && !dispatchSearch.isPending && !dispatchSearch.isError && (
             <p className="text-xs text-green-600 dark:text-green-400 text-center">
               Configuração salva com sucesso.
             </p>
@@ -242,6 +262,12 @@ export function AdvancedSearchBlock({ project }: AdvancedSearchBlockProps) {
           {updateProject.isError && (
             <p className="text-xs text-destructive text-center">
               Erro ao salvar. Tente novamente.
+            </p>
+          )}
+
+          {dispatchSearch.isError && (
+            <p className="text-xs text-destructive text-center">
+              Erro ao iniciar pesquisa. Verifique se o worker Celery está ativo.
             </p>
           )}
         </div>

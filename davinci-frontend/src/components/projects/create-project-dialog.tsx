@@ -14,20 +14,24 @@ import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { useCreateProject } from '@/lib/hooks/use-projects';
 import { projectsApi } from '@/lib/api/projects';
-import { Plus } from 'lucide-react';
+import { Plus, Search, Sparkles } from 'lucide-react';
 
 const schema = z.object({
-  title: z.string().min(1, 'Title is required'),
+  title: z.string().min(1, 'Título obrigatório'),
   description: z.string().optional(),
-  query_term: z.string().min(1, 'Query term is required'),
+  query_term: z.string().min(1, 'Termo de busca obrigatório'),
   date_from: z.string().optional(),
   date_to: z.string().optional(),
 });
 
 type FormData = z.infer<typeof schema>;
 
+// Ação escolhida pelo usuário ao submeter o formulário
+type SubmitAction = 'skip' | 'refine';
+
 export function CreateProjectDialog() {
   const [open, setOpen] = useState(false);
+  const [submitAction, setSubmitAction] = useState<SubmitAction | null>(null);
   const router = useRouter();
   const createProject = useCreateProject();
 
@@ -35,74 +39,133 @@ export function CreateProjectDialog() {
     resolver: zodResolver(schema),
   });
 
-  const onSubmit = async (data: FormData) => {
-    const payload = {
-      title: data.title,
-      description: data.description,
-      query_term: data.query_term,
-      date_from: data.date_from ? parseInt(data.date_from, 10) : undefined,
-      date_to: data.date_to ? parseInt(data.date_to, 10) : undefined,
-    };
-    const project = await createProject.mutateAsync(payload);
+  const isPending = createProject.isPending || submitAction !== null;
+
+  const onSubmit = async (data: FormData, action: SubmitAction) => {
+    setSubmitAction(action);
     try {
-      await projectsApi.search(project.id);
-    } catch {
-      // Project created; search can be started manually from the project page
+      const payload = {
+        title: data.title,
+        description: data.description,
+        query_term: data.query_term,
+        date_from: data.date_from ? parseInt(data.date_from, 10) : undefined,
+        date_to: data.date_to ? parseInt(data.date_to, 10) : undefined,
+      };
+
+      const project = await createProject.mutateAsync(payload);
+
+      if (action === 'skip') {
+        // Pular MeSH: desabilita explicitamente a busca avançada e dispara
+        // a busca simples por termo — equivalente ao comportamento anterior
+        // de auto-busca. A ordem de await garante que o PATCH persista antes
+        // de o job de busca ser iniciado.
+        await projectsApi.update(project.id, { advanced_search_enabled: false });
+        try {
+          await projectsApi.search(project.id);
+        } catch {
+          // Busca pode ser iniciada manualmente na página do projeto
+        }
+      }
+      // action === 'refine': não dispara busca — o usuário refinará via
+      // AdvancedSearchBlock na página do draft e clicará em "Iniciar pesquisa".
+
+      reset();
+      setOpen(false);
+      router.push(`/projects/${project.id}`);
+    } finally {
+      setSubmitAction(null);
     }
-    reset();
-    setOpen(false);
-    router.push(`/projects/${project.id}`);
   };
+
+  const handleSkip = handleSubmit((data) => onSubmit(data, 'skip'));
+  const handleRefine = handleSubmit((data) => onSubmit(data, 'refine'));
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
         <Button>
           <Plus className="h-4 w-4 mr-2" />
-          New Project
+          Novo Projeto
         </Button>
       </DialogTrigger>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>Create New Project</DialogTitle>
-          <DialogDescription>Fill in the details to start a new systematic review project.</DialogDescription>
+          <DialogTitle>Criar novo projeto</DialogTitle>
+          <DialogDescription>
+            Preencha os dados básicos. Você poderá refinar os descritores MeSH antes de iniciar a busca ou ir direto à busca simples.
+          </DialogDescription>
         </DialogHeader>
-        <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+
+        <form className="space-y-4">
           <div className="space-y-1.5">
-            <Label htmlFor="title">Title</Label>
-            <Input id="title" {...register('title')} placeholder="Transcriptomics in Heart Failure" />
+            <Label htmlFor="title">Título</Label>
+            <Input id="title" {...register('title')} placeholder="Transcriptômica em Insuficiência Cardíaca" />
             {errors.title && <p className="text-xs text-destructive">{errors.title.message}</p>}
           </div>
 
           <div className="space-y-1.5">
-            <Label htmlFor="query_term">Query Term</Label>
+            <Label htmlFor="query_term">Termo de busca</Label>
             <Input id="query_term" {...register('query_term')} placeholder="heart failure transcriptomics" />
             {errors.query_term && <p className="text-xs text-destructive">{errors.query_term.message}</p>}
           </div>
 
           <div className="space-y-1.5">
-            <Label htmlFor="description">Description (optional)</Label>
+            <Label htmlFor="description">Descrição (opcional)</Label>
             <Textarea id="description" {...register('description')} rows={2} />
           </div>
 
           <div className="flex gap-4">
             <div className="flex-1 space-y-1.5">
-              <Label htmlFor="date_from">From year</Label>
+              <Label htmlFor="date_from">Ano inicial</Label>
               <Input id="date_from" type="number" {...register('date_from')} placeholder="2010" />
             </div>
             <div className="flex-1 space-y-1.5">
-              <Label htmlFor="date_to">To year</Label>
+              <Label htmlFor="date_to">Ano final</Label>
               <Input id="date_to" type="number" {...register('date_to')} placeholder="2024" />
             </div>
           </div>
 
-          <div className="flex justify-end gap-2 pt-2">
-            <Button type="button" variant="outline" onClick={() => setOpen(false)}>
-              Cancel
-            </Button>
-            <Button type="submit" disabled={createProject.isPending}>
-              {createProject.isPending ? 'Creating…' : 'Create Project'}
-            </Button>
+          {createProject.isError && (
+            <p className="text-xs text-destructive">
+              Erro ao criar projeto. Tente novamente.
+            </p>
+          )}
+
+          <div className="border-t pt-4 space-y-2">
+            <p className="text-xs text-muted-foreground">
+              Como deseja prosseguir?
+            </p>
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setOpen(false)}
+                disabled={isPending}
+              >
+                Cancelar
+              </Button>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={handleSkip}
+                  disabled={isPending}
+                  title="Cria o projeto e inicia a busca simples por termo agora"
+                >
+                  <Search className="h-4 w-4 mr-2" />
+                  {submitAction === 'skip' ? 'Iniciando busca…' : 'Pular — busca simples'}
+                </Button>
+                <Button
+                  type="button"
+                  onClick={handleRefine}
+                  disabled={isPending}
+                  title="Cria o projeto e abre o refinamento com descritores MeSH antes de buscar (recurso avançado)"
+                >
+                  <Sparkles className="h-4 w-4 mr-2" />
+                  {submitAction === 'refine' ? 'Criando…' : 'Refinar com MeSH'}
+                </Button>
+              </div>
+            </div>
           </div>
         </form>
       </DialogContent>

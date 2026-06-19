@@ -92,6 +92,15 @@ export default function ProjectOverviewPage({ params }: { params: Promise<{ proj
       {project.status === 'draft' && (
         <>
           <Separator />
+          <div className="space-y-1">
+            <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+              Passo 2 de 3 — Refine sua busca
+            </p>
+            <p className="text-sm text-muted-foreground">
+              Adicione descritores MeSH para ampliar a cobertura da busca ou use o botão{' '}
+              <strong>Iniciar pesquisa</strong> no topo para buscar com o termo atual.
+            </p>
+          </div>
           <AdvancedSearchBlock project={project} />
           <Separator />
         </>
