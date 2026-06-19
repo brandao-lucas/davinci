@@ -639,6 +639,294 @@ fn ingest_samples_for_dataset(
     }
 }
 
+// ─── Dataset file download (F1 — GEO supplementary) ─────────────────────────
+
+/// Result returned by `download_dataset_files`.
+#[pyclass]
+#[derive(Clone)]
+pub struct DownloadResult {
+    /// Number of files successfully downloaded and written to `dest_dir`.
+    #[pyo3(get, set)]
+    pub files_downloaded: u64,
+    /// Total bytes written across all downloaded files.
+    #[pyo3(get, set)]
+    pub bytes_total: u64,
+    /// Non-fatal per-file error strings.
+    #[pyo3(get, set)]
+    pub errors: Vec<String>,
+}
+
+#[pymethods]
+impl DownloadResult {
+    #[new]
+    fn new() -> Self {
+        DownloadResult {
+            files_downloaded: 0,
+            bytes_total: 0,
+            errors: Vec::new(),
+        }
+    }
+}
+
+/// Download dataset files to disk and register metadata in `core_datasetfile`.
+///
+/// # Arguments
+///
+/// | Parameter           | Type          | Description |
+/// |---------------------|---------------|-------------|
+/// | `job_id`            | `str`         | UUID of the `IngestionJob` row to update throughout the run. |
+/// | `dataset_id`        | `i64`         | PK of `core_omicdataset` — written as FK in every `core_datasetfile` row. |
+/// | `dataset_accession` | `str`         | GEO accession, e.g. `"GSE12345"`. Used to resolve the suppl/ URL. |
+/// | `source_db`         | `str`         | Currently `"geo"`. Reserved for F2 (`"sra"`, `"ena"`). |
+/// | `file_kind`         | `str`         | `"geo_supplementary"` for F1. F2 will pass `"fastq"`. |
+/// | `dest_dir`          | `str`         | Absolute path to the local temp directory where files are written. Django reads this to find the files for object-storage upload. |
+/// | `db_url`            | `str`         | PostgreSQL connection string. |
+/// | `ncbi_api_key`      | `Option[str]` | NCBI API key (not used for GEO FTP downloads; reserved for rate-limited E-utilities calls in F2). |
+///
+/// # Storage-key contract with Django (D3)
+///
+/// Rust writes each file to `<dest_dir>/<filename>` and records
+/// `storage_key = "<dest_dir>/<filename>"` (the full local path) in
+/// `core_datasetfile`. Django's post-job step reads `storage_key` to locate
+/// the file on disk, uploads it via `default_storage`, and overwrites
+/// `storage_key` with the final object-storage path.
+///
+/// This means:
+/// - `storage_key` is **never NULL** (NOT NULL constraint); Rust always fills it.
+/// - After Django's upload step, `storage_key` is the canonical object-storage key.
+/// - Before upload, `storage_key` holds the temporary local path (safe to use for upload).
+///
+/// # Returns
+///
+/// `DownloadResult { files_downloaded, bytes_total, errors }`.
+/// Raises `PyRuntimeError` only on fatal errors (DB connection, COPY failure).
+/// Per-file errors (network, parse) are non-fatal and appear in `errors`.
+#[pyfunction]
+#[pyo3(signature = (job_id, dataset_id, dataset_accession, source_db, file_kind, dest_dir, db_url, ncbi_api_key=None))]
+fn download_dataset_files(
+    job_id: String,
+    dataset_id: i64,
+    dataset_accession: String,
+    source_db: String,
+    file_kind: String,
+    dest_dir: String,
+    db_url: String,
+    ncbi_api_key: Option<String>,
+) -> PyResult<DownloadResult> {
+    let rt = Runtime::new().unwrap();
+
+    let result: Result<DownloadResult, String> = rt.block_on(async {
+        // 1. Connect to DB and mark job running
+        let db_client = match crate::db::connection::connect_db(&db_url).await {
+            Ok(c) => c,
+            Err(e) => return Err(format!("DB connection failed: {e}")),
+        };
+
+        crate::db::job_tracker::update_job_status(&db_client, &job_id, "running", 0, 0, 0, None)
+            .await?;
+
+        let ncbi = crate::ncbi::client::NcbiClient::new(ncbi_api_key);
+        let dest_path = std::path::Path::new(&dest_dir);
+
+        let mut errors: Vec<String> = Vec::new();
+        let mut db_rows: Vec<crate::db::copy_writer::DatasetFileRow> = Vec::new();
+
+        match source_db.as_str() {
+            "geo" => {
+                match file_kind.as_str() {
+                    "geo_supplementary" | "supplementary" => {
+                        // Resolve and download GEO supplementary files
+                        let (files, download_errors) =
+                            crate::omics::downloader::download_geo_supplementary(
+                                &ncbi,
+                                &dataset_accession,
+                                dest_path,
+                            )
+                            .await;
+
+                        errors.extend(download_errors);
+
+                        for f in &files {
+                            // Natural key: <GSE_accession>__<filename>
+                            let accession_key =
+                                format!("{}_{}", dataset_accession.to_uppercase(), f.file_name);
+
+                            db_rows.push(crate::db::copy_writer::DatasetFileRow {
+                                accession: accession_key,
+                                file_type: "supplementary".to_string(),
+                                source: "geo_ftp".to_string(),
+                                remote_url: f.remote_url.clone(),
+                                // Full local path — Django reads this to upload to object storage
+                                storage_key: f.result.path.clone(),
+                                size_bytes: Some(f.result.size_bytes as i64),
+                                checksum_md5: Some(f.result.checksum_md5.clone()),
+                                download_status: "downloaded".to_string(),
+                                bytes_downloaded: f.result.size_bytes as i64,
+                                error_message: String::new(),
+                                dataset_id: Some(dataset_id),
+                                sample_id: None,
+                            });
+                        }
+
+                        // Also record failed files so Django knows they exist
+                        // (errors list already carries the messages above)
+                    }
+                    unknown => {
+                        errors.push(format!(
+                            "Unknown file_kind '{}' for source 'geo'. Expected: geo_supplementary",
+                            unknown
+                        ));
+                    }
+                }
+            }
+            // F2 branch — ENA FASTQ download
+            "sra" | "ena" => {
+                match file_kind.as_str() {
+                    "fastq" => {
+                        // 1. Resolve SRR samples for this dataset from the DB
+                        let srr_samples = match crate::omics::downloader::fetch_srr_samples_for_dataset(
+                            &db_client,
+                            dataset_id,
+                        )
+                        .await
+                        {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let msg = format!("fetch_srr_samples_for_dataset failed: {}", e);
+                                crate::db::job_tracker::update_job_status(
+                                    &db_client, &job_id, "failed", 0, 0, 0, Some(&msg),
+                                )
+                                .await?;
+                                return Err(msg);
+                            }
+                        };
+
+                        eprintln!(
+                            "[download] dataset_id={} has {} SRR sample(s)",
+                            dataset_id,
+                            srr_samples.len()
+                        );
+
+                        if srr_samples.is_empty() {
+                            errors.push(format!(
+                                "No SRR/ERR/DRR samples found for dataset_id={} (accession={}). \
+                                 Ensure sample ingestion ran before FASTQ download.",
+                                dataset_id, dataset_accession
+                            ));
+                        } else {
+                            // 2. Download FASTQ files via ENA FTP (resumable)
+                            let (fastq_results, download_errors) =
+                                crate::omics::downloader::download_fastq_for_samples(
+                                    &ncbi,
+                                    &srr_samples,
+                                    dest_path,
+                                )
+                                .await;
+
+                            errors.extend(download_errors);
+
+                            // 3. Build DB rows — sample_id filled, dataset_id NULL (XOR constraint)
+                            for fr in &fastq_results {
+                                // Determine download_status: check if this accession_key appears
+                                // in errors (MD5 mismatch) — mark as failed; otherwise downloaded.
+                                let md5_ok = fr.entry.expected_md5.as_ref().map_or(true, |expected| {
+                                    expected.is_empty() || *expected == fr.checksum_md5
+                                });
+                                let dl_status = if md5_ok { "downloaded" } else { "failed" };
+                                let err_msg = if md5_ok {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        "MD5 mismatch: expected {:?}, got {}",
+                                        fr.entry.expected_md5, fr.checksum_md5
+                                    )
+                                };
+
+                                db_rows.push(crate::db::copy_writer::DatasetFileRow {
+                                    accession: fr.entry.accession_key.clone(),
+                                    file_type: "fastq".to_string(),
+                                    source: "ena_ftp".to_string(),
+                                    remote_url: fr.entry.url.clone(),
+                                    storage_key: fr.local_path.clone(),
+                                    size_bytes: Some(fr.size_bytes as i64),
+                                    checksum_md5: Some(fr.checksum_md5.clone()),
+                                    download_status: dl_status.to_string(),
+                                    bytes_downloaded: fr.size_bytes as i64,
+                                    error_message: err_msg,
+                                    dataset_id: None, // XOR: FASTQ belongs to sample
+                                    sample_id: Some(fr.sample_id),
+                                });
+                            }
+                        }
+                    }
+                    unknown => {
+                        errors.push(format!(
+                            "Unknown file_kind '{}' for source '{}'. Expected: fastq",
+                            unknown, source_db
+                        ));
+                    }
+                }
+            }
+            unknown => {
+                errors.push(format!(
+                    "Unknown source_db '{}'. Valid: geo, sra, ena",
+                    unknown
+                ));
+            }
+        }
+
+        // 2. COPY metadata to DB (even if some downloads failed — record what we have)
+        let files_downloaded = db_rows.len() as u64;
+        let bytes_total: u64 = db_rows
+            .iter()
+            .filter_map(|r| r.size_bytes.map(|b| b as u64))
+            .sum();
+
+        if !db_rows.is_empty() {
+            match crate::db::copy_writer::copy_dataset_files(&db_client, &db_rows).await {
+                Ok(n) => eprintln!("[download] COPY core_datasetfile: {} rows upserted", n),
+                Err(e) => {
+                    let msg = format!("copy_dataset_files failed: {:?}", e);
+                    crate::db::job_tracker::update_job_status(
+                        &db_client, &job_id, "failed", 0, 0, 0, Some(&msg),
+                    )
+                    .await?;
+                    return Err(msg);
+                }
+            }
+        }
+
+        // 3. Update IngestionJob
+        let err_summary = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        };
+        let status = if errors.is_empty() { "completed" } else { "completed_with_errors" };
+        crate::db::job_tracker::update_job_status(
+            &db_client,
+            &job_id,
+            status,
+            files_downloaded as i32,
+            files_downloaded as i32,
+            0,
+            err_summary.as_deref(),
+        )
+        .await?;
+
+        Ok(DownloadResult {
+            files_downloaded,
+            bytes_total,
+            errors,
+        })
+    });
+
+    match result {
+        Ok(res) => Ok(res),
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
 // ─── Python module registration ───────────────────────────────────────────────
 
 #[pymodule]
@@ -646,6 +934,7 @@ fn rust_engine(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IngestionResult>()?;
     m.add_class::<OmicsResult>()?;
     m.add_class::<SampleIngestionResult>()?;
+    m.add_class::<DownloadResult>()?;
     // MeSH / preview types and functions
     m.add_class::<MagnitudePreview>()?;
     m.add_class::<MeshSuggestion>()?;
@@ -653,6 +942,7 @@ fn rust_engine(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(search_and_ingest_omics, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_pending_links, m)?)?;
     m.add_function(wrap_pyfunction!(ingest_samples_for_dataset, m)?)?;
+    m.add_function(wrap_pyfunction!(download_dataset_files, m)?)?;
     m.add_function(wrap_pyfunction!(pubmed_magnitude_preview, m)?)?;
     m.add_function(wrap_pyfunction!(mesh_suggest, m)?)?;
     Ok(())

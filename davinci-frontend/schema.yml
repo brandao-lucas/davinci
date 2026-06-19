@@ -816,6 +816,161 @@ paths:
               schema:
                 $ref: '#/components/schemas/ProjectDatasetCurate'
           description: ''
+  /api/v1/projects/{project_pk}/datasets/{id}/download/:
+    post:
+      operationId: projects_datasets_download_create
+      description: |-
+        Enfileira o download dos arquivos ômicos do dataset.
+
+        **Derivação de file_kind por source_db:**
+        - `source_db='geo'` → `file_kind='geo_supplementary'` (padrão F1, MB).
+          Body pode ser vazio ou omitir `file_kind`.
+        - `source_db='sra'` → `file_kind='fastq'` (F2, GB–TB). Exige   `confirm=true` no body; sem confirm retorna HTTP 400 com prévia de quota.
+
+        **Quota (apenas FASTQ):**
+        - Soma `DatasetFile.size_bytes` já baixados (`status='downloaded'`) do   projeto e compara com `DOWNLOAD_QUOTA_BYTES` (padrão: 200 GB).
+        - Se excedida: HTTP 409 com `used_bytes` / `quota_bytes`.
+        - Se `confirm=false`/ausente: HTTP 400 com prévia de quota (mesmo payload).
+
+        **GEO supplementary (F1):** sem gate de confirm ou quota — fluxo simples.
+
+        Idempotente: job ativo para o mesmo dataset retorna o existente (202).
+        Progresso monitorável via GET /projects/{project_pk}/jobs/ com filtro ?job_type=geo_supplementary_download ou ?job_type=fastq_download.
+      summary: Iniciar download de arquivos do dataset
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DownloadDispatchRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/DownloadDispatchRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/DownloadDispatchRequest'
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownloadDispatchResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownloadQuotaPreview'
+          description: ''
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownloadQuotaPreview'
+          description: ''
+        '404':
+          description: No response body
+  /api/v1/projects/{project_pk}/datasets/{id}/files/:
+    get:
+      operationId: projects_datasets_files_list
+      description: |-
+        Lista os DatasetFile associados ao dataset, filtrados pelo projeto do usuário autenticado (Regra #3 — sem vazamento cross-project). Cada arquivo expõe uma `download_url` de proxy autenticado (nunca o storage_key cru nem URL pública do MinIO).
+
+        Arquivos com download_status != 'downloaded' têm download_url=null.
+      summary: Listar arquivos do dataset
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedDatasetFileList'
+          description: ''
+  /api/v1/projects/{project_pk}/datasets/{id}/files/{file_id}/content/:
+    get:
+      operationId: projects_datasets_files_content_retrieve
+      description: |-
+        Proxy autenticado: valida isolamento por usuário/projeto e serve o conteúdo do arquivo via streaming a partir do object storage (default_storage). Nunca expõe storage_key nem URL pública do MinIO.
+
+        Apenas arquivos com download_status='downloaded' são servidos (HTTP 200). Outros estados retornam HTTP 404 ou HTTP 409.
+
+        Content-Disposition inclui o filename original. O path é derivado exclusivamente do storage_key do registro validado — nunca de input do cliente (sem path traversal).
+      summary: Download autenticado do conteúdo de um arquivo
+      parameters:
+      - in: path
+        name: file_id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          description: No response body
   /api/v1/projects/{project_pk}/datasets/add_from_suggestion/:
     post:
       operationId: projects_datasets_add_from_suggestion_create
@@ -2389,6 +2544,198 @@ components:
         * `excluded` - Excluído
         * `queued` - Na Fila de Download
         * `downloaded` - Baixado
+    DatasetFile:
+      type: object
+      description: |-
+        Serializer read-only de DatasetFile.
+
+        Campos expostos:
+            id, file_type, source, size_bytes, checksum_md5, checksum_algo,
+            download_status, bytes_downloaded, downloaded_at, accession,
+            download_url (URL de proxy autenticado — nunca storage_key cru).
+
+        Campos NUNCA expostos: storage_key, remote_url, dataset_id, sample_id.
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        accession:
+          type: string
+          readOnly: true
+          description: 'Chave natural estável (ex.: GSExxx_supp_<nome>, SRRxxx_1)'
+        file_type:
+          allOf:
+          - $ref: '#/components/schemas/FileTypeEnum'
+          readOnly: true
+          title: Tipo de Arquivo
+        source:
+          allOf:
+          - $ref: '#/components/schemas/SourceEnum'
+          readOnly: true
+          title: Fonte
+        size_bytes:
+          type: integer
+          readOnly: true
+          nullable: true
+          title: Tamanho (bytes)
+        checksum_md5:
+          type: string
+          readOnly: true
+          nullable: true
+        checksum_algo:
+          type: string
+          readOnly: true
+          title: Algoritmo de Checksum
+        download_status:
+          allOf:
+          - $ref: '#/components/schemas/DatasetFileDownloadStatusEnum'
+          readOnly: true
+          title: Status do Download
+        bytes_downloaded:
+          type: integer
+          readOnly: true
+          title: Bytes Baixados
+          description: Progresso/retomada (Range request)
+        downloaded_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          title: Baixado em
+        download_url:
+          type: string
+          format: uri
+          nullable: true
+          readOnly: true
+      required:
+      - accession
+      - bytes_downloaded
+      - checksum_algo
+      - checksum_md5
+      - download_status
+      - download_url
+      - downloaded_at
+      - file_type
+      - id
+      - size_bytes
+      - source
+    DatasetFileDownloadStatusEnum:
+      enum:
+      - pending
+      - queued
+      - downloading
+      - downloaded
+      - failed
+      type: string
+      description: |-
+        * `pending` - Pendente
+        * `queued` - Na Fila
+        * `downloading` - Baixando
+        * `downloaded` - Baixado
+        * `failed` - Falhou
+    DownloadDispatchRequest:
+      type: object
+      description: |-
+        Body do POST .../download/.
+
+        Ambos os campos são opcionais:
+        - `file_kind`: se omitido, a view deriva por source_db do dataset
+          (geo → geo_supplementary; sra → fastq).
+        - `confirm`: obrigatório apenas para file_kind='fastq' (F2, GB–TB).
+          Sem confirm=true, o serviço retorna HTTP 400 com prévia de quota.
+          Ignorado para GEO supplementary (F1).
+
+        Campos NUNCA expostos: nenhum dado sensível — só intenção do usuário.
+      properties:
+        file_kind:
+          nullable: true
+          description: |-
+            Tipo de arquivo a baixar. Se omitido, derivado de source_db do dataset: 'geo' → 'geo_supplementary'; 'sra' → 'fastq'.
+
+            * `geo_supplementary` - geo_supplementary
+            * `fastq` - fastq
+          oneOf:
+          - $ref: '#/components/schemas/FileKindEnum'
+          - $ref: '#/components/schemas/NullEnum'
+        confirm:
+          type: boolean
+          default: false
+          description: Confirmação explícita obrigatória para file_kind='fastq' (F2).
+            Sem confirm=true, retorna HTTP 400 com prévia de uso da quota. Ignorado
+            para GEO supplementary.
+    DownloadDispatchResponse:
+      type: object
+      description: Resposta do POST .../download/ — retorna o IngestionJob criado/ativo.
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        job_type:
+          allOf:
+          - $ref: '#/components/schemas/JobTypeEnum'
+          readOnly: true
+        status:
+          allOf:
+          - $ref: '#/components/schemas/IngestionJobStatusEnum'
+          readOnly: true
+        records_processed:
+          type: integer
+          readOnly: true
+        records_inserted:
+          type: integer
+          readOnly: true
+        error_message:
+          type: string
+          readOnly: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - created_at
+      - error_message
+      - id
+      - job_type
+      - records_inserted
+      - records_processed
+      - status
+    DownloadQuotaPreview:
+      type: object
+      description: |-
+        Resposta de erro de quota (HTTP 400 — confirm ausente; HTTP 409 — quota excedida).
+
+        Campos:
+        - `detail`: mensagem legível explicando o motivo do bloqueio.
+        - `file_kind`: tipo de arquivo solicitado.
+        - `used_bytes`: bytes já baixados no projeto (status='downloaded').
+        - `quota_bytes`: limite configurado (DOWNLOAD_QUOTA_BYTES).
+        - `confirm_required`: true se o bloqueio é por falta de confirm (400);
+          false se é por quota esgotada (409).
+
+        Não expõe storage_key nem credenciais (sensitive-data-handling).
+      properties:
+        detail:
+          type: string
+          readOnly: true
+        file_kind:
+          type: string
+          readOnly: true
+        used_bytes:
+          type: integer
+          readOnly: true
+        quota_bytes:
+          type: integer
+          readOnly: true
+        confirm_required:
+          type: boolean
+          readOnly: true
+      required:
+      - confirm_required
+      - detail
+      - file_kind
+      - quota_bytes
+      - used_bytes
     DrugReference:
       type: object
       description: Paper do projeto que cita o medicamento, com suas sentenças de
@@ -2480,6 +2827,28 @@ components:
         * `disease` - Doença
         * `pathway` - Pathway
         * `mesh` - MeSH Term
+    FileKindEnum:
+      enum:
+      - geo_supplementary
+      - fastq
+      type: string
+      description: |-
+        * `geo_supplementary` - geo_supplementary
+        * `fastq` - fastq
+    FileTypeEnum:
+      enum:
+      - series_matrix
+      - supplementary
+      - cel
+      - fastq
+      - sra
+      type: string
+      description: |-
+        * `series_matrix` - Series Matrix (GEO)
+        * `supplementary` - Suplementar (GEO)
+        * `cel` - CEL (Affymetrix)
+        * `fastq` - FASTQ (reads brutos)
+        * `sra` - SRA
     GeneReference:
       type: object
       description: Paper do projeto que cita o gene, com suas sentenças de contexto.
@@ -2632,6 +3001,8 @@ components:
       - gene_ner
       - drug_ner
       - context_extraction
+      - geo_supplementary_download
+      - fastq_download
       type: string
       description: |-
         * `pubmed_search` - Busca PubMed
@@ -2644,6 +3015,8 @@ components:
         * `gene_ner` - Extração de Genes
         * `drug_ner` - Extração de Drogas
         * `context_extraction` - Extração de Contextos
+        * `geo_supplementary_download` - Download Suplementar GEO
+        * `fastq_download` - Download FASTQ
     LinkedDatasetBrief:
       type: object
       description: |-
@@ -2884,6 +3257,9 @@ components:
       - scope_note
       - tree_numbers
       - ui
+    NullEnum:
+      enum:
+      - null
     OmicDataset:
       type: object
       properties:
@@ -3159,6 +3535,29 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/DaVinciProject'
+    PaginatedDatasetFileList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/DatasetFile'
     PaginatedIngestionJobList:
       type: object
       required:
@@ -4930,6 +5329,16 @@ components:
         * `tcga` - TCGA
         * `bioproject` - BioProject
         * `gwas_catalog` - GWAS Catalog
+    SourceEnum:
+      enum:
+      - geo_ftp
+      - ena_ftp
+      - sra_tools
+      type: string
+      description: |-
+        * `geo_ftp` - GEO FTP (NCBI)
+        * `ena_ftp` - ENA FTP
+        * `sra_tools` - sra-tools
     SuggestionTypeEnum:
       enum:
       - dataset_missing

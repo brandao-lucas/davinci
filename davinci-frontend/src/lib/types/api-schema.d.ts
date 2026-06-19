@@ -358,6 +358,87 @@ export interface paths {
         patch: operations["projects_datasets_partial_update"];
         trace?: never;
     };
+    "/api/v1/projects/{project_pk}/datasets/{id}/download/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Iniciar download de arquivos do dataset
+         * @description Enfileira o download dos arquivos ômicos do dataset.
+         *
+         *     **Derivação de file_kind por source_db:**
+         *     - `source_db='geo'` → `file_kind='geo_supplementary'` (padrão F1, MB).
+         *       Body pode ser vazio ou omitir `file_kind`.
+         *     - `source_db='sra'` → `file_kind='fastq'` (F2, GB–TB). Exige   `confirm=true` no body; sem confirm retorna HTTP 400 com prévia de quota.
+         *
+         *     **Quota (apenas FASTQ):**
+         *     - Soma `DatasetFile.size_bytes` já baixados (`status='downloaded'`) do   projeto e compara com `DOWNLOAD_QUOTA_BYTES` (padrão: 200 GB).
+         *     - Se excedida: HTTP 409 com `used_bytes` / `quota_bytes`.
+         *     - Se `confirm=false`/ausente: HTTP 400 com prévia de quota (mesmo payload).
+         *
+         *     **GEO supplementary (F1):** sem gate de confirm ou quota — fluxo simples.
+         *
+         *     Idempotente: job ativo para o mesmo dataset retorna o existente (202).
+         *     Progresso monitorável via GET /projects/{project_pk}/jobs/ com filtro ?job_type=geo_supplementary_download ou ?job_type=fastq_download.
+         */
+        post: operations["projects_datasets_download_create"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_pk}/datasets/{id}/files/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Listar arquivos do dataset
+         * @description Lista os DatasetFile associados ao dataset, filtrados pelo projeto do usuário autenticado (Regra #3 — sem vazamento cross-project). Cada arquivo expõe uma `download_url` de proxy autenticado (nunca o storage_key cru nem URL pública do MinIO).
+         *
+         *     Arquivos com download_status != 'downloaded' têm download_url=null.
+         */
+        get: operations["projects_datasets_files_list"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_pk}/datasets/{id}/files/{file_id}/content/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Download autenticado do conteúdo de um arquivo
+         * @description Proxy autenticado: valida isolamento por usuário/projeto e serve o conteúdo do arquivo via streaming a partir do object storage (default_storage). Nunca expõe storage_key nem URL pública do MinIO.
+         *
+         *     Apenas arquivos com download_status='downloaded' são servidos (HTTP 200). Outros estados retornam HTTP 404 ou HTTP 409.
+         *
+         *     Content-Disposition inclui o filename original. O path é derivado exclusivamente do storage_key do registro validado — nunca de input do cliente (sem path traversal).
+         */
+        get: operations["projects_datasets_files_content_retrieve"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/projects/{project_pk}/datasets/add_from_suggestion/": {
         parameters: {
             query?: never;
@@ -1151,6 +1232,111 @@ export interface components {
          * @enum {string}
          */
         DatasetCurationStatusEnum: "pending" | "included" | "excluded" | "queued" | "downloaded";
+        /**
+         * @description Serializer read-only de DatasetFile.
+         *
+         *     Campos expostos:
+         *         id, file_type, source, size_bytes, checksum_md5, checksum_algo,
+         *         download_status, bytes_downloaded, downloaded_at, accession,
+         *         download_url (URL de proxy autenticado — nunca storage_key cru).
+         *
+         *     Campos NUNCA expostos: storage_key, remote_url, dataset_id, sample_id.
+         */
+        DatasetFile: {
+            readonly id: number;
+            /** @description Chave natural estável (ex.: GSExxx_supp_<nome>, SRRxxx_1) */
+            readonly accession: string;
+            /** Tipo de Arquivo */
+            readonly file_type: components["schemas"]["FileTypeEnum"];
+            /** Fonte */
+            readonly source: components["schemas"]["SourceEnum"];
+            /** Tamanho (bytes) */
+            readonly size_bytes: number | null;
+            readonly checksum_md5: string | null;
+            /** Algoritmo de Checksum */
+            readonly checksum_algo: string;
+            /** Status do Download */
+            readonly download_status: components["schemas"]["DatasetFileDownloadStatusEnum"];
+            /**
+             * Bytes Baixados
+             * @description Progresso/retomada (Range request)
+             */
+            readonly bytes_downloaded: number;
+            /**
+             * Baixado em
+             * Format: date-time
+             */
+            readonly downloaded_at: string | null;
+            /** Format: uri */
+            readonly download_url: string | null;
+        };
+        /**
+         * @description * `pending` - Pendente
+         *     * `queued` - Na Fila
+         *     * `downloading` - Baixando
+         *     * `downloaded` - Baixado
+         *     * `failed` - Falhou
+         * @enum {string}
+         */
+        DatasetFileDownloadStatusEnum: "pending" | "queued" | "downloading" | "downloaded" | "failed";
+        /**
+         * @description Body do POST .../download/.
+         *
+         *     Ambos os campos são opcionais:
+         *     - `file_kind`: se omitido, a view deriva por source_db do dataset
+         *       (geo → geo_supplementary; sra → fastq).
+         *     - `confirm`: obrigatório apenas para file_kind='fastq' (F2, GB–TB).
+         *       Sem confirm=true, o serviço retorna HTTP 400 com prévia de quota.
+         *       Ignorado para GEO supplementary (F1).
+         *
+         *     Campos NUNCA expostos: nenhum dado sensível — só intenção do usuário.
+         */
+        DownloadDispatchRequest: {
+            /**
+             * @description Tipo de arquivo a baixar. Se omitido, derivado de source_db do dataset: 'geo' → 'geo_supplementary'; 'sra' → 'fastq'.
+             *
+             *     * `geo_supplementary` - geo_supplementary
+             *     * `fastq` - fastq
+             */
+            file_kind?: (components["schemas"]["FileKindEnum"] | components["schemas"]["NullEnum"]) | null;
+            /**
+             * @description Confirmação explícita obrigatória para file_kind='fastq' (F2). Sem confirm=true, retorna HTTP 400 com prévia de uso da quota. Ignorado para GEO supplementary.
+             * @default false
+             */
+            confirm: boolean;
+        };
+        /** @description Resposta do POST .../download/ — retorna o IngestionJob criado/ativo. */
+        DownloadDispatchResponse: {
+            /** Format: uuid */
+            readonly id: string;
+            readonly job_type: components["schemas"]["JobTypeEnum"];
+            readonly status: components["schemas"]["IngestionJobStatusEnum"];
+            readonly records_processed: number;
+            readonly records_inserted: number;
+            readonly error_message: string;
+            /** Format: date-time */
+            readonly created_at: string;
+        };
+        /**
+         * @description Resposta de erro de quota (HTTP 400 — confirm ausente; HTTP 409 — quota excedida).
+         *
+         *     Campos:
+         *     - `detail`: mensagem legível explicando o motivo do bloqueio.
+         *     - `file_kind`: tipo de arquivo solicitado.
+         *     - `used_bytes`: bytes já baixados no projeto (status='downloaded').
+         *     - `quota_bytes`: limite configurado (DOWNLOAD_QUOTA_BYTES).
+         *     - `confirm_required`: true se o bloqueio é por falta de confirm (400);
+         *       false se é por quota esgotada (409).
+         *
+         *     Não expõe storage_key nem credenciais (sensitive-data-handling).
+         */
+        DownloadQuotaPreview: {
+            readonly detail: string;
+            readonly file_kind: string;
+            readonly used_bytes: number;
+            readonly quota_bytes: number;
+            readonly confirm_required: boolean;
+        };
         /** @description Paper do projeto que cita o medicamento, com suas sentenças de contexto. */
         DrugReference: {
             /** @description PK de ProjectPaper — usada no PATCH /projects/{id}/papers/<pk>/ para toggle de curadoria. Distinta da PK de Paper (pmid para exibição). */
@@ -1199,6 +1385,21 @@ export interface components {
          * @enum {string}
          */
         EntityTypeEnum: "gene" | "drug" | "variant" | "disease" | "pathway" | "mesh";
+        /**
+         * @description * `geo_supplementary` - geo_supplementary
+         *     * `fastq` - fastq
+         * @enum {string}
+         */
+        FileKindEnum: "geo_supplementary" | "fastq";
+        /**
+         * @description * `series_matrix` - Series Matrix (GEO)
+         *     * `supplementary` - Suplementar (GEO)
+         *     * `cel` - CEL (Affymetrix)
+         *     * `fastq` - FASTQ (reads brutos)
+         *     * `sra` - SRA
+         * @enum {string}
+         */
+        FileTypeEnum: "series_matrix" | "supplementary" | "cel" | "fastq" | "sra";
         /** @description Paper do projeto que cita o gene, com suas sentenças de contexto. */
         GeneReference: {
             /** @description PK de ProjectPaper — usada no PATCH /projects/{id}/papers/<pk>/ para toggle de curadoria. Distinta da PK de Paper (pmid para exibição). */
@@ -1270,9 +1471,11 @@ export interface components {
          *     * `gene_ner` - Extração de Genes
          *     * `drug_ner` - Extração de Drogas
          *     * `context_extraction` - Extração de Contextos
+         *     * `geo_supplementary_download` - Download Suplementar GEO
+         *     * `fastq_download` - Download FASTQ
          * @enum {string}
          */
-        JobTypeEnum: "pubmed_search" | "pubmed_fetch" | "geo_search" | "sra_search" | "gwas_search" | "sample_fetch" | "variant_annotation" | "gene_ner" | "drug_ner" | "context_extraction";
+        JobTypeEnum: "pubmed_search" | "pubmed_fetch" | "geo_search" | "sra_search" | "gwas_search" | "sample_fetch" | "variant_annotation" | "gene_ner" | "drug_ner" | "context_extraction" | "geo_supplementary_download" | "fastq_download";
         /**
          * @description Resumo de um vínculo ProjectPaperDataset para exibir no detalhe de um paper.
          *
@@ -1381,6 +1584,8 @@ export interface components {
             /** @description Número de artigos no PubMed indexados com este descritor */
             pubmed_count: number;
         };
+        /** @enum {unknown} */
+        NullEnum: null;
         OmicDataset: {
             readonly id: number;
             /** @description GSE, SRP, PRJNA, E-MTAB, etc. */
@@ -1531,6 +1736,21 @@ export interface components {
              */
             previous?: string | null;
             results: components["schemas"]["DaVinciProject"][];
+        };
+        PaginatedDatasetFileList: {
+            /** @example 123 */
+            count: number;
+            /**
+             * Format: uri
+             * @example http://api.example.org/accounts/?page=4
+             */
+            next?: string | null;
+            /**
+             * Format: uri
+             * @example http://api.example.org/accounts/?page=2
+             */
+            previous?: string | null;
+            results: components["schemas"]["DatasetFile"][];
         };
         PaginatedIngestionJobList: {
             /** @example 123 */
@@ -2440,6 +2660,13 @@ export interface components {
          */
         SourceDbEnum: "geo" | "sra" | "arrayexpress" | "tcga" | "bioproject" | "gwas_catalog";
         /**
+         * @description * `geo_ftp` - GEO FTP (NCBI)
+         *     * `ena_ftp` - ENA FTP
+         *     * `sra_tools` - sra-tools
+         * @enum {string}
+         */
+        SourceEnum: "geo_ftp" | "ena_ftp" | "sra_tools";
+        /**
          * @description * `dataset_missing` - dataset_missing
          *     * `paper_missing` - paper_missing
          * @enum {string}
@@ -3128,6 +3355,108 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ProjectDatasetCurate"];
                 };
+            };
+        };
+    };
+    projects_datasets_download_create: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+                project_pk: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["DownloadDispatchRequest"];
+                "application/x-www-form-urlencoded": components["schemas"]["DownloadDispatchRequest"];
+                "multipart/form-data": components["schemas"]["DownloadDispatchRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DownloadDispatchResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DownloadQuotaPreview"];
+                };
+            };
+            /** @description No response body */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DownloadQuotaPreview"];
+                };
+            };
+        };
+    };
+    projects_datasets_files_list: {
+        parameters: {
+            query?: {
+                /** @description Which field to use when ordering the results. */
+                ordering?: string;
+                /** @description A page number within the paginated result set. */
+                page?: number;
+                /** @description A search term. */
+                search?: string;
+            };
+            header?: never;
+            path: {
+                id: number;
+                project_pk: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PaginatedDatasetFileList"];
+                };
+            };
+        };
+    };
+    projects_datasets_files_content_retrieve: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                file_id: number;
+                id: number;
+                project_pk: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No response body */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

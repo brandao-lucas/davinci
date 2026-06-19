@@ -12,6 +12,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
 import { useCurateDataset, useDataset } from '@/lib/hooks/use-datasets';
+import { DatasetDownloadSection } from '@/components/datasets/dataset-download-section';
 import type { OmicDataset } from '@/lib/types/dataset';
 
 interface DatasetDetailPanelProps {
@@ -254,6 +255,14 @@ export function DatasetDetailPanel({ dataset, projectId, onClose }: DatasetDetai
               </div>
             </>
           )}
+
+          {/* Download de dados suplementares */}
+          <Separator />
+          <DatasetDownloadSection
+            projectId={projectId}
+            datasetId={dataset.id}
+            sourceDb={dataset.source_db}
+          />
         </div>
       </SheetContent>
     </Sheet>

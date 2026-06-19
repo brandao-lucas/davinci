@@ -1,4 +1,5 @@
 pub mod bioproject_parser;
+pub mod downloader;
 pub mod elink;
 pub mod geo_parser;
 pub mod gwas_parser;

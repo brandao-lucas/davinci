@@ -19,6 +19,24 @@ export type OmicDatasetRaw = components['schemas']['OmicDataset'];
 // ProjectDatasetDetail: dataset aninhado + curadoria (endpoint de detalhe)
 export type ProjectDatasetDetail = components['schemas']['ProjectDatasetDetail'];
 
+// DatasetFile: arquivo suplementar/rawdata vinculado a um dataset
+export type DatasetFile = components['schemas']['DatasetFile'];
+
+// DatasetFileDownloadStatus: status do download de um DatasetFile
+export type DatasetFileDownloadStatus = components['schemas']['DatasetFileDownloadStatusEnum'];
+
+// DownloadDispatchRequest: body do POST .../download/
+export type DownloadDispatchRequest = components['schemas']['DownloadDispatchRequest'];
+
+// DownloadDispatchResponse: resposta do POST .../download/
+export type DownloadDispatchResponse = components['schemas']['DownloadDispatchResponse'];
+
+// DownloadQuotaPreview: payload de erro 400 (confirm ausente) ou 409 (quota esgotada)
+export type DownloadQuotaPreview = components['schemas']['DownloadQuotaPreview'];
+
+// PaginatedDatasetFileList: lista paginada de DatasetFile
+export type PaginatedDatasetFileList = components['schemas']['PaginatedDatasetFileList'];
+
 // Filtros de listagem (parâmetros de query — não gerados pelo OpenAPI)
 export interface DatasetFilters {
   curation_status?: string;

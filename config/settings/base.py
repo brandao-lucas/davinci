@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'apps.core',
     'apps.accounts',
+    'storages',
 ]
 
 MIDDLEWARE = [
@@ -172,6 +173,13 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_THROTTLE_RATES': {
         'preview': '30/min',
+        # Escopo 'download' cobre o POST que dispara Celery + fetch NCBI (custoso).
+        # Taxa baixa para evitar enfileiramento em massa sobre datasets distintos.
+        'download': '20/min',
+        # Escopo 'download_content' cobre GET de listagem de arquivos e streaming de
+        # conteúdo. Taxa mais generosa para não quebrar uso normal de UI (listar vários
+        # arquivos de um dataset incluído).
+        'download_content': '60/min',
     },
 }
 
@@ -189,6 +197,10 @@ SPECTACULAR_SETTINGS = {
         'CurationStatusEnum': 'apps.core.models.ProjectPaper.CurationStatus',
         # Cobre ProjectDataset.CurationStatus (tem queued/downloaded extras)
         'DatasetCurationStatusEnum': 'apps.core.models.ProjectDataset.CurationStatus',
+        # IngestionJob.JobStatus e DatasetFile.DownloadStatus têm valores sobrepostos
+        # (pending, failed) → sem override drf-spectacular gera "Status2faEnum".
+        'IngestionJobStatusEnum': 'apps.core.models.IngestionJob.JobStatus',
+        'DatasetFileDownloadStatusEnum': 'apps.core.models.DatasetFile.DownloadStatus',
     },
 }
 
@@ -199,6 +211,75 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 
 import os
+
 # NCBI
 NCBI_API_KEY = os.environ.get('NCBI_API_KEY', None)
 NCBI_RATE_LIMIT = 10 if NCBI_API_KEY else 3
+
+# ── Quota de download por projeto/usuário ─────────────────────────────────────
+#
+# Controla o total de bytes já baixados (DatasetFile.download_status='downloaded')
+# por projeto antes de enfileirar um novo download FASTQ.
+#
+# O valor padrão é 200 GB.  Para aumentar ou desativar em produção, defina a
+# variável de ambiente DOWNLOAD_QUOTA_BYTES (em bytes).
+#
+# Apenas downloads FASTQ (F2, GB–TB) estão sujeitos à quota e ao gate de
+# confirmação explícita (confirm=true no POST).  Downloads GEO supplementary
+# (F1, MB) são isentos.
+#
+# NUNCA logar o valor calculado junto de metadados de usuário (sensitive-data-handling).
+DOWNLOAD_QUOTA_BYTES = int(os.environ.get('DOWNLOAD_QUOTA_BYTES', 200 * 1024 ** 3))  # 200 GB
+
+# ── Object Storage (django-storages / boto3) ──────────────────────────────────
+#
+# Em dev aponta para MinIO (docker-compose).  Em produção aponta para S3 ou
+# qualquer endpoint S3-compatível via as mesmas variáveis de ambiente.
+#
+# Variáveis de ambiente necessárias (defaults abaixo servem SOMENTE para dev):
+#
+#   AWS_STORAGE_BUCKET_NAME     — bucket alvo   (default: davinci-omics)
+#   AWS_S3_ENDPOINT_URL         — URL do endpoint S3-compatível
+#                                 (default: http://localhost:9000 — MinIO dev)
+#   AWS_ACCESS_KEY_ID           — access key     (default: davinci_dev)
+#   AWS_SECRET_ACCESS_KEY       — secret key     (NUNCA commitar valor de prod;
+#                                 default de dev apenas)
+#   AWS_S3_REGION_NAME          — região          (default: us-east-1)
+#
+# Para produção, defina estas variáveis via secrets do ambiente de deploy
+# (ex. variáveis de ambiente do servidor / secrets manager).
+# NUNCA coloque credenciais reais aqui ou em .env* versionados.
+#
+# ACL: privado por padrão.  Arquivos NÃO têm URL pública.  O endpoint de
+# download do Django gera proxy autenticado (decisão D6 do plano).
+# Credenciais NUNCA são logadas (skill sensitive-data-handling).
+
+OMICS_STORAGE_BUCKET_NAME = os.environ.get('AWS_STORAGE_BUCKET_NAME', 'davinci-omics')
+
+STORAGES = {
+    # Media files (uploads de usuário genéricos) — não usado no MVP ômico,
+    # mas configurado para evitar warning do Django.
+    'default': {
+        'BACKEND': 'storages.backends.s3boto3.S3Boto3Storage',
+        'OPTIONS': {
+            'bucket_name': OMICS_STORAGE_BUCKET_NAME,
+            'endpoint_url': os.environ.get('AWS_S3_ENDPOINT_URL', 'http://localhost:9000'),
+            'access_key': os.environ.get('AWS_ACCESS_KEY_ID', 'davinci_dev'),
+            'secret_key': os.environ.get('AWS_SECRET_ACCESS_KEY', 'davinci_dev_secret'),
+            'region_name': os.environ.get('AWS_S3_REGION_NAME', 'us-east-1'),
+            # MinIO exige path-style addressing (não virtual-hosted).
+            'addressing_style': 'path',
+            # Arquivos privados: sem URL pública; acesso via proxy autenticado (D6).
+            'default_acl': 'private',
+            # Não gerar querystring de autenticação automática nas URLs retornadas
+            # pelo storage — o Django serve via proxy autenticado, não presigned URL.
+            'querystring_auth': False,
+            # Não sobrescrever arquivos com mesmo nome; gera sufixo único.
+            'file_overwrite': False,
+        },
+    },
+    # Static files continuam no filesystem padrão.
+    'staticfiles': {
+        'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage',
+    },
+}

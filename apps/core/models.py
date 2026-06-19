@@ -635,6 +635,140 @@ class OmicSample(models.Model):
         return f"{self.accession} — {self.title[:60]}"
 
 
+class DatasetFile(models.Model):
+    """
+    Arquivo físico (bytes reais) associado a um dataset ou amostra ômica.
+
+    Relação 1:N — um OmicDataset tem N arquivos (series matrix + várias
+    supplementary + CEL) e um OmicSample pode ter N arquivos (FASTQ R1/R2,
+    .sra). Por isso é tabela própria, não colunas em OmicDataset/OmicSample.
+
+    Exatamente UM de (dataset, sample) é preenchido — garantido por
+    CheckConstraint XOR. O `accession` é a chave natural estável do arquivo
+    remoto (ex.: `GSExxx_supp_<nome>`, `SRRxxx_1`) e, por ser `unique`, serve
+    diretamente ao ON CONFLICT (accession) DO UPDATE do COPY writer do Rust.
+
+    `download_status` é o estado *fino* por arquivo; o estado *agregado* de
+    curadoria do dataset continua em ProjectDataset.CurationStatus
+    (queued/downloaded).
+    """
+
+    class FileType(models.TextChoices):
+        SERIES_MATRIX = 'series_matrix', 'Series Matrix (GEO)'
+        SUPPLEMENTARY = 'supplementary', 'Suplementar (GEO)'
+        CEL = 'cel', 'CEL (Affymetrix)'
+        FASTQ = 'fastq', 'FASTQ (reads brutos)'
+        SRA = 'sra', 'SRA'
+
+    class Source(models.TextChoices):
+        GEO_FTP = 'geo_ftp', 'GEO FTP (NCBI)'
+        ENA_FTP = 'ena_ftp', 'ENA FTP'
+        SRA_TOOLS = 'sra_tools', 'sra-tools'
+
+    class DownloadStatus(models.TextChoices):
+        PENDING = 'pending', 'Pendente'
+        QUEUED = 'queued', 'Na Fila'
+        DOWNLOADING = 'downloading', 'Baixando'
+        DOWNLOADED = 'downloaded', 'Baixado'
+        FAILED = 'failed', 'Falhou'
+
+    # Vínculo — exatamente um preenchido (CheckConstraint XOR abaixo)
+    dataset = models.ForeignKey(
+        OmicDataset,
+        on_delete=models.CASCADE,
+        related_name='files',
+        null=True,
+        blank=True
+    )
+    sample = models.ForeignKey(
+        OmicSample,
+        on_delete=models.CASCADE,
+        related_name='files',
+        null=True,
+        blank=True
+    )
+
+    # Chave natural do arquivo remoto — serve ao ON CONFLICT do COPY do Rust
+    accession = models.CharField(
+        'Accession',
+        max_length=255,
+        unique=True,
+        db_index=True,
+        help_text='Chave natural estável (ex.: GSExxx_supp_<nome>, SRRxxx_1)'
+    )
+
+    # Classificação
+    file_type = models.CharField(
+        'Tipo de Arquivo',
+        max_length=20,
+        choices=FileType.choices
+    )
+    source = models.CharField(
+        'Fonte',
+        max_length=20,
+        choices=Source.choices
+    )
+
+    # Localização
+    remote_url = models.TextField('URL Remota')
+    storage_key = models.TextField(
+        'Storage Key',
+        blank=True,
+        default='',
+        help_text='Path no object storage; vazio até o download concluir'
+    )
+
+    # Integridade
+    size_bytes = models.BigIntegerField('Tamanho (bytes)', null=True, blank=True)
+    checksum_md5 = models.CharField(
+        'Checksum MD5',
+        max_length=128,
+        null=True,
+        blank=True
+    )
+    checksum_algo = models.CharField(
+        'Algoritmo de Checksum',
+        max_length=20,
+        default='md5'
+    )
+
+    # Estado do download (fino, por arquivo)
+    download_status = models.CharField(
+        'Status do Download',
+        max_length=20,
+        choices=DownloadStatus.choices,
+        default=DownloadStatus.PENDING,
+        db_index=True
+    )
+    bytes_downloaded = models.BigIntegerField(
+        'Bytes Baixados',
+        default=0,
+        help_text='Progresso/retomada (Range request)'
+    )
+    error_message = models.TextField('Mensagem de Erro', blank=True, default='')
+
+    # Controle
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    downloaded_at = models.DateTimeField('Baixado em', null=True, blank=True)
+
+    class Meta:
+        # dataset/sample já ganham índice automático por serem FK; download_status
+        # ganha índice via db_index=True acima. Nenhum Index extra para não duplicar.
+        constraints = [
+            models.CheckConstraint(
+                name='datasetfile_dataset_xor_sample',
+                condition=(
+                    models.Q(dataset__isnull=False, sample__isnull=True)
+                    | models.Q(dataset__isnull=True, sample__isnull=False)
+                ),
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.accession} ({self.file_type}/{self.download_status})"
+
+
 class DatasetPaperLink(models.Model):
     """
     Relação entre um dataset ômico e papers que o referenciam.
@@ -1185,6 +1319,8 @@ class IngestionJob(models.Model):
         GENE_NER = 'gene_ner', 'Extração de Genes'
         DRUG_NER = 'drug_ner', 'Extração de Drogas'
         CONTEXT_EXTRACTION = 'context_extraction', 'Extração de Contextos'
+        GEO_SUPPLEMENTARY_DOWNLOAD = 'geo_supplementary_download', 'Download Suplementar GEO'
+        FASTQ_DOWNLOAD = 'fastq_download', 'Download FASTQ'
 
     class JobStatus(models.TextChoices):
         PENDING = 'pending', 'Pendente'

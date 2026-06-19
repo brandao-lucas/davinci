@@ -14,3 +14,5 @@ psycopg-binary==3.3.3
 firebase_admin==7.3.0
 maturin==1.12.6
 PyYAML==6.0.3
+django-storages[s3]==1.14.4
+boto3==1.38.31

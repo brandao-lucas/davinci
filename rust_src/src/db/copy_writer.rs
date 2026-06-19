@@ -1025,6 +1025,162 @@ pub async fn link_project_papers(
     Ok(affected)
 }
 
+// ─── DatasetFile bulk writer ──────────────────────────────────────────────────
+
+/// One row to be inserted/updated in `core_datasetfile`.
+pub struct DatasetFileRow {
+    /// Natural key — used for ON CONFLICT (accession) DO UPDATE.
+    /// Convention for GEO supplementary: `<GSE_accession>__<filename>`
+    /// (e.g. `GSE12345__GSE12345_raw_counts.txt.gz`).
+    pub accession: String,
+    /// `series_matrix | supplementary | cel | fastq | sra`
+    pub file_type: String,
+    /// `geo_ftp | ena_ftp | sra_tools`
+    pub source: String,
+    /// Remote HTTPS/FTP URL.
+    pub remote_url: String,
+    /// Path on local disk where the file was written (relative to dest_dir).
+    /// Django reads this to find the file before uploading to object storage.
+    /// After upload Django overwrites this with the final `storage_key`.
+    pub storage_key: String,
+    /// File size in bytes (None if unknown).
+    pub size_bytes: Option<i64>,
+    /// Hex MD5 checksum (None if not yet computed).
+    pub checksum_md5: Option<String>,
+    /// `pending | queued | downloading | downloaded | failed`
+    pub download_status: String,
+    /// Bytes downloaded so far (for resumable downloads; 0 when complete).
+    pub bytes_downloaded: i64,
+    /// Error message if status = failed; empty string otherwise.
+    pub error_message: String,
+    /// FK to `core_omicdataset.id` (set for dataset-level files like GEO suppl).
+    pub dataset_id: Option<i64>,
+    /// FK to `core_omicsample.id` (set for sample-level files like FASTQ).
+    pub sample_id: Option<i64>,
+}
+
+/// Bulk-upsert dataset file records into `core_datasetfile`.
+///
+/// Uses a temp staging table + COPY FROM STDIN + INSERT … ON CONFLICT DO UPDATE.
+///
+/// Conflict key: UNIQUE on `accession`.
+/// On conflict: updates storage_key, size_bytes, checksum_md5, download_status,
+/// bytes_downloaded, error_message, updated_at. Fields that should survive
+/// re-ingestion unchanged (remote_url, file_type, source, dataset_id, sample_id,
+/// created_at) are intentionally excluded from the UPDATE clause.
+///
+/// NOT NULL / default constraints respected:
+/// - `storage_key`: never NULL — send empty string `""` until Django uploads.
+/// - `checksum_algo`: always `'md5'` (hardcoded in INSERT).
+/// - `bytes_downloaded`, `error_message`: never NULL.
+///
+/// Returns the number of rows inserted or updated.
+pub async fn copy_dataset_files(
+    client: &Client,
+    rows: &[DatasetFileRow],
+) -> Result<u64, tokio_postgres::Error> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    client
+        .execute("DROP TABLE IF EXISTS _staging_datasetfile", &[])
+        .await?;
+    client
+        .execute(
+            "CREATE TEMP TABLE _staging_datasetfile (
+                accession         VARCHAR(255),
+                file_type         VARCHAR(20),
+                source            VARCHAR(20),
+                remote_url        TEXT,
+                storage_key       TEXT,
+                size_bytes        BIGINT,
+                checksum_md5      VARCHAR(128),
+                download_status   VARCHAR(20),
+                bytes_downloaded  BIGINT,
+                error_message     TEXT,
+                dataset_id        BIGINT,
+                sample_id         BIGINT,
+                created_at        TIMESTAMPTZ,
+                updated_at        TIMESTAMPTZ
+            )",
+            &[],
+        )
+        .await?;
+
+    let csv = build_dataset_file_csv(rows);
+    bulk_insert_csv(
+        client,
+        "COPY _staging_datasetfile (
+            accession, file_type, source, remote_url, storage_key,
+            size_bytes, checksum_md5, download_status, bytes_downloaded,
+            error_message, dataset_id, sample_id, created_at, updated_at
+        ) FROM STDIN WITH (FORMAT csv, NULL 'NULL')",
+        &csv,
+    )
+    .await?;
+
+    let affected = client
+        .execute(
+            "INSERT INTO core_datasetfile (
+                accession, file_type, source, remote_url, storage_key,
+                checksum_md5, checksum_algo, size_bytes, download_status,
+                bytes_downloaded, error_message, dataset_id, sample_id,
+                created_at, updated_at
+            )
+            SELECT
+                accession, file_type, source, remote_url, storage_key,
+                checksum_md5, 'md5', size_bytes, download_status,
+                bytes_downloaded, error_message, dataset_id, sample_id,
+                created_at, updated_at
+            FROM _staging_datasetfile
+            ON CONFLICT (accession) DO UPDATE SET
+                storage_key      = EXCLUDED.storage_key,
+                size_bytes       = COALESCE(EXCLUDED.size_bytes, core_datasetfile.size_bytes),
+                checksum_md5     = COALESCE(EXCLUDED.checksum_md5, core_datasetfile.checksum_md5),
+                download_status  = EXCLUDED.download_status,
+                bytes_downloaded = EXCLUDED.bytes_downloaded,
+                error_message    = EXCLUDED.error_message,
+                updated_at       = NOW()",
+            &[],
+        )
+        .await?;
+
+    client
+        .execute("DROP TABLE IF EXISTS _staging_datasetfile", &[])
+        .await?;
+
+    Ok(affected)
+}
+
+fn build_dataset_file_csv(rows: &[DatasetFileRow]) -> String {
+    let now = Utc::now().format("%Y-%m-%d %H:%M:%S%.6f+00").to_string();
+    let mut csv = String::new();
+    for r in rows {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            escape_csv_field(&sanitize_str(&r.accession, 255)),
+            escape_csv_field(&sanitize_str(&r.file_type, 20)),
+            escape_csv_field(&sanitize_str(&r.source, 20)),
+            escape_csv_field(&r.remote_url),
+            // storage_key: never NULL — empty string when not yet uploaded
+            escape_csv_field(&r.storage_key),
+            r.size_bytes.map_or("NULL".to_string(), |v| v.to_string()),
+            r.checksum_md5
+                .as_deref()
+                .map_or("NULL".to_string(), |v| escape_csv_field(&sanitize_str(v, 128))),
+            escape_csv_field(&sanitize_str(&r.download_status, 20)),
+            r.bytes_downloaded,
+            escape_csv_field(&r.error_message),
+            r.dataset_id.map_or("NULL".to_string(), |v| v.to_string()),
+            r.sample_id.map_or("NULL".to_string(), |v| v.to_string()),
+            &now, // created_at
+            &now, // updated_at
+        ));
+    }
+    csv
+}
+
 // ─── OmicSample bulk writer ───────────────────────────────────────────────────
 
 /// Bulk-upsert omics samples into `core_omicsample`.

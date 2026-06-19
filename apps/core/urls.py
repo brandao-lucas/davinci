@@ -31,6 +31,9 @@ dataset_detail = ProjectDatasetViewSet.as_view({'get': 'retrieve', 'patch': 'par
 dataset_bulk_curate = ProjectDatasetViewSet.as_view({'post': 'bulk_curate'})
 dataset_search = ProjectDatasetViewSet.as_view({'get': 'search'})
 dataset_add_from_suggestion = ProjectDatasetViewSet.as_view({'post': 'add_from_suggestion'})
+dataset_download = ProjectDatasetViewSet.as_view({'post': 'download'})
+dataset_files = ProjectDatasetViewSet.as_view({'get': 'files'})
+dataset_file_content = ProjectDatasetViewSet.as_view({'get': 'file_content'})
 
 # Samples — rota plana (todos os samples do projeto) e rota por dataset
 sample_list = ProjectSampleViewSet.as_view({'get': 'list'})
@@ -87,6 +90,11 @@ urlpatterns = [
     # add_from_suggestion deve vir antes de <int:pk>/ para não ser capturada como pk
     path(f'{PROJECT_PREFIX}datasets/add_from_suggestion/', dataset_add_from_suggestion, name='project-dataset-add-from-suggestion'),
     path(f'{PROJECT_PREFIX}datasets/<int:pk>/', dataset_detail, name='project-dataset-detail'),
+    # Download — ações sob um dataset específico; rotas de arquivo antes de <int:pk>/
+    # file_content deve vir antes de files/ para que o regex não fique ambíguo
+    path(f'{PROJECT_PREFIX}datasets/<int:pk>/files/<int:file_id>/content/', dataset_file_content, name='project-dataset-file-content'),
+    path(f'{PROJECT_PREFIX}datasets/<int:pk>/files/', dataset_files, name='project-dataset-files'),
+    path(f'{PROJECT_PREFIX}datasets/<int:pk>/download/', dataset_download, name='project-dataset-download'),
 
     # Samples por dataset — para a página de samples de um dataset específico (Op 4.4)
     path(

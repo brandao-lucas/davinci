@@ -1,6 +1,7 @@
 import logging
 
 from django.contrib.postgres.search import SearchQuery
+from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema
@@ -8,13 +9,26 @@ from rest_framework import mixins, viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from apps.core.models import DaVinciProject, IngestionJob, OmicDataset, OmicSample, ProjectDataset
+from apps.core.models import (
+    DatasetFile,
+    DaVinciProject,
+    IngestionJob,
+    OmicDataset,
+    OmicSample,
+    ProjectDataset,
+)
 from apps.core.serializers.dataset import (
     ProjectDatasetListSerializer,
     ProjectDatasetDetailSerializer,
     ProjectDatasetCurateSerializer,
     DatasetBulkCurateRequestSerializer,
     BulkCurateResponseSerializer,
+)
+from apps.core.serializers.download import (
+    DatasetFileSerializer,
+    DownloadDispatchRequestSerializer,
+    DownloadDispatchResponseSerializer,
+    DownloadQuotaPreviewSerializer,
 )
 from apps.core.serializers.link import AddDatasetToProjectRequestSerializer
 from apps.core.tasks.ingestion_tasks import run_sample_ingestion
@@ -208,6 +222,246 @@ class ProjectDatasetViewSet(
         )
         serializer = ProjectDatasetListSerializer(qs, many=True)
         return Response(serializer.data)
+
+    @extend_schema(
+        request=DownloadDispatchRequestSerializer,
+        responses={
+            202: DownloadDispatchResponseSerializer,
+            400: DownloadQuotaPreviewSerializer,
+            409: DownloadQuotaPreviewSerializer,
+            404: None,
+        },
+        summary="Iniciar download de arquivos do dataset",
+        description=(
+            "Enfileira o download dos arquivos ômicos do dataset.\n\n"
+            "**Derivação de file_kind por source_db:**\n"
+            "- `source_db='geo'` → `file_kind='geo_supplementary'` (padrão F1, MB).\n"
+            "  Body pode ser vazio ou omitir `file_kind`.\n"
+            "- `source_db='sra'` → `file_kind='fastq'` (F2, GB–TB). Exige "
+            "  `confirm=true` no body; sem confirm retorna HTTP 400 com prévia de quota.\n\n"
+            "**Quota (apenas FASTQ):**\n"
+            "- Soma `DatasetFile.size_bytes` já baixados (`status='downloaded'`) do "
+            "  projeto e compara com `DOWNLOAD_QUOTA_BYTES` (padrão: 200 GB).\n"
+            "- Se excedida: HTTP 409 com `used_bytes` / `quota_bytes`.\n"
+            "- Se `confirm=false`/ausente: HTTP 400 com prévia de quota (mesmo payload).\n\n"
+            "**GEO supplementary (F1):** sem gate de confirm ou quota — fluxo simples.\n\n"
+            "Idempotente: job ativo para o mesmo dataset retorna o existente (202).\n"
+            "Progresso monitorável via GET /projects/{project_pk}/jobs/ com filtro "
+            "?job_type=geo_supplementary_download ou ?job_type=fastq_download."
+        ),
+    )
+    @action(detail=True, methods=['post'], url_path='download', throttle_scope='download')
+    def download(self, request, project_pk=None, pk=None):
+        """
+        POST /projects/{project_pk}/datasets/{pk}/download/
+
+        Body (opcional para GEO; obrigatório para SRA):
+          {
+            "file_kind": "fastq",   // opcional — derivado de source_db se omitido
+            "confirm": true         // obrigatório para FASTQ (arquivo GB–TB)
+          }
+
+        Seta ProjectDataset.curation_status='queued' e despacha
+        DownloadService.dispatch para enfileirar o job Celery.
+        Retorna HTTP 202 com o IngestionJob criado/ativo.
+
+        Erros:
+          HTTP 400 — FASTQ sem confirm=true (retorna prévia de quota)
+          HTTP 409 — quota de download excedida
+          HTTP 404 — projeto ou dataset não pertence ao usuário
+        """
+        from apps.core.services.download_service import (
+            DownloadService,
+            FastqConfirmRequiredError,
+            QuotaExceededError,
+        )
+
+        project = self._get_project()  # 404 se projeto não pertence ao user
+        project_dataset = get_object_or_404(ProjectDataset, pk=pk, project=project)
+        dataset = project_dataset.dataset
+
+        # ── Derivação de file_kind por source_db ──────────────────────────────
+        # O body pode sobrescrever, mas o comportamento padrão é derivado da fonte.
+        # GEO → geo_supplementary (F1, sem quota/confirm)
+        # SRA → fastq (F2, exige confirm + quota)
+        # Outras fontes sem suporte ainda retornam 400 explícito.
+        _SOURCE_FILE_KIND = {
+            'geo': 'geo_supplementary',
+            'sra': 'fastq',
+        }
+
+        body_serializer = DownloadDispatchRequestSerializer(data=request.data)
+        body_serializer.is_valid(raise_exception=True)
+        body_data = body_serializer.validated_data
+
+        file_kind = body_data.get('file_kind') or _SOURCE_FILE_KIND.get(dataset.source_db)
+        confirm = body_data.get('confirm', False)
+
+        if file_kind is None:
+            return Response(
+                {
+                    'detail': (
+                        f"Download não suportado para source_db={dataset.source_db!r}. "
+                        "Fontes suportadas: 'geo' (geo_supplementary), 'sra' (fastq)."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Valida consistência: file_kind='fastq' só faz sentido para SRA
+        if file_kind == 'fastq' and dataset.source_db not in ('sra', 'ena'):
+            return Response(
+                {'detail': "file_kind='fastq' é válido apenas para source_db='sra'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Seta status agregado do ProjectDataset como 'queued'
+        # (curation-audit-trail: não toca curated_at/exclusion_reason/notes)
+        ProjectDataset.objects.filter(pk=project_dataset.pk).update(
+            curation_status=ProjectDataset.CurationStatus.QUEUED_DOWNLOAD,
+        )
+
+        try:
+            job = DownloadService.dispatch(
+                project=project,
+                dataset=dataset,
+                file_kind=file_kind,
+                user=request.user,
+                confirm=confirm,
+            )
+        except FastqConfirmRequiredError as exc:
+            # Retorna HTTP 400 com prévia de uso — cliente reenvia com confirm=true
+            preview_serializer = DownloadQuotaPreviewSerializer({
+                'detail': (
+                    "Download FASTQ requer confirmação explícita. "
+                    "Reenvie com confirm=true para confirmar o download."
+                ),
+                'file_kind': file_kind,
+                'used_bytes': exc.used_bytes,
+                'quota_bytes': exc.quota_bytes,
+                'confirm_required': True,
+            })
+            return Response(preview_serializer.data, status=status.HTTP_400_BAD_REQUEST)
+        except QuotaExceededError as exc:
+            # Retorna HTTP 409 — quota esgotada, download bloqueado
+            preview_serializer = DownloadQuotaPreviewSerializer({
+                'detail': (
+                    "Quota de download do projeto excedida. "
+                    "Remova arquivos existentes ou contate o suporte."
+                ),
+                'file_kind': file_kind,
+                'used_bytes': exc.used_bytes,
+                'quota_bytes': exc.quota_bytes,
+                'confirm_required': False,
+            })
+            return Response(preview_serializer.data, status=status.HTTP_409_CONFLICT)
+
+        serializer = DownloadDispatchResponseSerializer(job)
+        return Response(serializer.data, status=status.HTTP_202_ACCEPTED)
+
+    @extend_schema(
+        responses={200: DatasetFileSerializer(many=True)},
+        summary="Listar arquivos do dataset",
+        description=(
+            "Lista os DatasetFile associados ao dataset, filtrados pelo projeto "
+            "do usuário autenticado (Regra #3 — sem vazamento cross-project). "
+            "Cada arquivo expõe uma `download_url` de proxy autenticado "
+            "(nunca o storage_key cru nem URL pública do MinIO).\n\n"
+            "Arquivos com download_status != 'downloaded' têm download_url=null."
+        ),
+    )
+    @action(detail=True, methods=['get'], url_path='files', throttle_scope='download_content')
+    def files(self, request, project_pk=None, pk=None):
+        """
+        GET /projects/{project_pk}/datasets/{pk}/files/
+
+        Retorna DatasetFile do dataset, garantindo isolamento por user via
+        validação do ProjectDataset (dataset deve estar no projeto do user).
+        """
+        project = self._get_project()  # 404 se projeto não pertence ao user
+        project_dataset = get_object_or_404(ProjectDataset, pk=pk, project=project)
+        dataset = project_dataset.dataset
+
+        dataset_files = DatasetFile.objects.filter(dataset=dataset).order_by('created_at')
+        serializer = DatasetFileSerializer(
+            dataset_files,
+            many=True,
+            context={'request': request, 'view': self},
+        )
+        return Response(serializer.data)
+
+    @extend_schema(
+        responses={200: None},
+        summary="Download autenticado do conteúdo de um arquivo",
+        description=(
+            "Proxy autenticado: valida isolamento por usuário/projeto e serve o "
+            "conteúdo do arquivo via streaming a partir do object storage "
+            "(default_storage). Nunca expõe storage_key nem URL pública do MinIO.\n\n"
+            "Apenas arquivos com download_status='downloaded' são servidos (HTTP 200). "
+            "Outros estados retornam HTTP 404 ou HTTP 409.\n\n"
+            "Content-Disposition inclui o filename original. O path é derivado "
+            "exclusivamente do storage_key do registro validado — nunca de input "
+            "do cliente (sem path traversal)."
+        ),
+    )
+    @action(detail=True, methods=['get'], url_path=r'files/(?P<file_id>[0-9]+)/content', throttle_scope='download_content')
+    def file_content(self, request, project_pk=None, pk=None, file_id=None):
+        """
+        GET /projects/{project_pk}/datasets/{pk}/files/{file_id}/content/
+
+        Proxy autenticado de conteúdo.
+        Isolamento garantido: valida que o DatasetFile pertence ao dataset
+        que pertence ao ProjectDataset do projeto do usuário autenticado.
+        O storage_key vem apenas do registro do banco — nunca do cliente.
+        """
+        from django.core.files.storage import default_storage
+        import os
+
+        project = self._get_project()  # 404 se projeto não pertence ao user
+        project_dataset = get_object_or_404(ProjectDataset, pk=pk, project=project)
+        dataset = project_dataset.dataset
+
+        # Valida que o arquivo pertence ao dataset validado acima
+        dataset_file = get_object_or_404(DatasetFile, pk=file_id, dataset=dataset)
+
+        if dataset_file.download_status != DatasetFile.DownloadStatus.DOWNLOADED:
+            return Response(
+                {'detail': f"Arquivo não disponível (status={dataset_file.download_status!r})."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        if not dataset_file.storage_key:
+            return Response(
+                {'detail': 'Arquivo sem storage_key — download incompleto.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # storage_key vem do banco (nunca do cliente): sem risco de path traversal
+        storage_key = dataset_file.storage_key
+        filename = os.path.basename(storage_key)
+
+        try:
+            f = default_storage.open(storage_key, 'rb')
+        except Exception as exc:
+            logger.error(
+                'Falha ao abrir arquivo %s do object storage (DatasetFile %s): %s',
+                storage_key,
+                dataset_file.id,
+                exc,
+            )
+            return Response(
+                {'detail': 'Arquivo não encontrado no storage.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        response = StreamingHttpResponse(
+            streaming_content=f,
+            content_type='application/octet-stream',
+        )
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        if dataset_file.size_bytes:
+            response['Content-Length'] = str(dataset_file.size_bytes)
+        return response
 
     @extend_schema(
         request=AddDatasetToProjectRequestSerializer,
