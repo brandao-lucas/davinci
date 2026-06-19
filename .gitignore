@@ -20,6 +20,12 @@ rust_src/target/
 .env
 .env.local
 
+# Celery
+celerybeat-schedule*
+
+# macOS
+.DS_Store
+
 
 #ia
 .claude/
