@@ -28,9 +28,9 @@ function SamplesPageContent({ projectId }: { projectId: string }) {
   const debouncedQuery = useDebounce(searchQuery, 300);
   const [page, setPage] = useState(1);
 
-  const { setSampleFilters } = useFilterStore();
   // Usa projectId como chave do store — consistente com paperFilters/datasetFilters.
-  const filters = useFilterStore((s) => s.sampleFilters[projectId] ?? {});
+  const { sampleFilters, setSampleFilters } = useFilterStore();
+  const filters = sampleFilters[projectId] ?? {};
 
   // Seed do filtro a partir da URL — roda uma única vez ao montar.
   // Sem parâmetro na URL, não toca no store (não sobrepõe estado de visita anterior).

@@ -43,11 +43,8 @@ function PapersPageContent({ projectId }: { projectId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Re-lê o store após possível seed para garantir valor atualizado.
-  const currentFilters = useFilterStore((s) => s.paperFilters[projectId] ?? {});
-
   const activeFilters = {
-    ...currentFilters,
+    ...filters,
     search: debouncedQuery || undefined,
   };
 
@@ -70,7 +67,7 @@ function PapersPageContent({ projectId }: { projectId: string }) {
       <div className="flex gap-4">
         <div className="w-56 shrink-0 space-y-4">
           <PaperFiltersPanel
-            filters={currentFilters}
+            filters={filters}
             onChange={(f) => setPaperFilters(projectId, f)}
           />
         </div>

@@ -38,9 +38,8 @@ function DatasetsPageContent({ projectId }: { projectId: string }) {
   const [searchQuery, setSearchQuery] = useState('');
   const debouncedQuery = useDebounce(searchQuery, 300);
 
-  const { setDatasetFilters } = useFilterStore();
-  // Re-lê do store para reflectir seed e mudanças manuais no dropdown.
-  const filters = useFilterStore((s) => s.datasetFilters[projectId] ?? {});
+  const { datasetFilters, setDatasetFilters } = useFilterStore();
+  const filters = datasetFilters[projectId] ?? {};
 
   // Seed do filtro a partir da URL — roda uma única vez ao montar.
   const seededRef = useRef(false);
