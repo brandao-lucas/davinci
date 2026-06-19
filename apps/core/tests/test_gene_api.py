@@ -1528,3 +1528,326 @@ class GeneDetailReferenceIdTests(APITestCase):
         self.assertEqual(refs[0]['curation_status'], 'included')
         # campo 'id' não deve existir
         self.assertNotIn('id', refs[0])
+
+
+# =============================================================================
+# 9. Testes de regressão do fix 007 — project_paper_id vs Paper.pk (mismatch)
+#
+# Garante que:
+#   a) project_paper_id == ProjectPaper.pk e != Paper.pk, com fixtures onde os
+#      dois PKs divergem por construção (Papers extras criados antes).
+#   b) 'id' não aparece no payload de references[] (campo removido — regressão).
+#   c) PATCH papers/<project_paper_id>/ usando a PK do detalhe de gene altera o
+#      ProjectPaper correto (curation_status muda no registro esperado).
+#   d) PATCH com ProjectPaper.pk de outro projeto/usuário → 404.
+# =============================================================================
+
+def _patch_paper_url(project_id, project_paper_pk):
+    return f'/api/v1/projects/{project_id}/papers/{project_paper_pk}/'
+
+
+class GeneDetailPatchCurationTests(APITestCase):
+    """
+    Testes end-to-end: project_paper_id exposto pelo detalhe de gene é a PK
+    correta para o PATCH de curadoria.
+
+    Estratégia de divergência de PKs:
+        Criamos Papers "fantasma" antes dos Papers do teste para que o
+        auto-increment de Paper.pk avance. Os ProjectPaper são criados depois,
+        então seus PKs auto-increment já são diferentes dos Paper.pk. Isso evita
+        que o bug original (usar Paper.pk no lugar de ProjectPaper.pk) passe
+        despercebido por coincidência numérica.
+    """
+
+    def setUp(self):
+        self.user = make_user('patch_curation_user')
+        self.client.force_authenticate(user=self.user)
+        self.project = make_project(self.user, title='Patch Curation Tests')
+
+        # --- Divergência forçada de PKs ---
+        # Criar Papers "fantasma" para avançar o auto-increment de Paper.pk
+        # de modo que Paper.pk dos nossos papers do teste seja alto.
+        # ProjectPaper é criado depois: seus PKs auto-increment partem de um
+        # contador independente e menor (ou diferente). O importante é que
+        # ao final Paper.pk != ProjectPaper.pk para ao menos um dos papers.
+        # Criar 5 papers fantasma faz com que o Paper.pk dos nossos papers
+        # seja >= 6 (assumindo sequência limpa) enquanto o ProjectPaper.pk
+        # pode ser 1 ou 2 — garantindo divergência na grande maioria dos casos.
+        # Em bancos com sequências avançadas (testes acumulados) isso também
+        # funciona porque Paper.pk e ProjectPaper.pk usam sequências distintas.
+        for i in range(5):
+            Paper.objects.create(
+                pmid=19900 + i,
+                title=f'Fantasma {i}',
+                journal='Ghost',
+                pub_year=2000,
+                abstract='',
+            )
+
+        # Papers reais do teste
+        self.paper_a = make_paper(
+            pmid=19910, title='BRCA1 study', pub_year=2023,
+            abstract='BRCA1 mutation found in patients.',
+        )
+        self.paper_b = make_paper(
+            pmid=19911, title='BRCA1 meta', pub_year=2022,
+            abstract='BRCA1 is a tumor suppressor.',
+        )
+
+        # ProjectPaper para o projeto do usuário
+        self.pp_a = make_project_paper(self.project, self.paper_a, curation_status='pending')
+        self.pp_b = make_project_paper(self.project, self.paper_b, curation_status='pending')
+
+        make_paper_gene(self.paper_a, 'BRCA1', entrez_id=672, mention_count=2)
+        make_paper_gene(self.paper_b, 'BRCA1', entrez_id=672, mention_count=1)
+
+        # Popular EntityContext para context_status='ready'
+        now = timezone.now()
+        make_entity_context(self.paper_a, 'BRCA1', 'BRCA1 mutation found in patients.', 0, now)
+        make_entity_context(self.paper_b, 'BRCA1', 'BRCA1 is a tumor suppressor.', 0, now)
+
+    # ------------------------------------------------------------------
+    # a) Divergência de PKs: Paper.pk != ProjectPaper.pk
+    # ------------------------------------------------------------------
+
+    def test_paper_pk_and_project_paper_pk_differ(self):
+        """
+        Garante que Paper.pk != ProjectPaper.pk para ao menos um dos papers do teste.
+        Se esse teste falhar, a estratégia de divergência de PKs não está funcionando
+        e os testes de regressão abaixo perderiam sua validade como trava.
+        """
+        # Para ao menos um par, os PKs devem diferir
+        diverge_a = self.paper_a.pk != self.pp_a.pk
+        diverge_b = self.paper_b.pk != self.pp_b.pk
+        self.assertTrue(
+            diverge_a or diverge_b,
+            f'Paper.pk e ProjectPaper.pk coincidem em ambos os pares — '
+            f'paper_a.pk={self.paper_a.pk} pp_a.pk={self.pp_a.pk}; '
+            f'paper_b.pk={self.paper_b.pk} pp_b.pk={self.pp_b.pk}. '
+            f'A trava de regressão seria ineficaz.',
+        )
+
+    # ------------------------------------------------------------------
+    # b) project_paper_id == ProjectPaper.pk; 'id' ausente (regressão)
+    # ------------------------------------------------------------------
+
+    def test_project_paper_id_equals_pp_pk_with_divergent_fixtures(self):
+        """
+        project_paper_id no detalhe de gene == ProjectPaper.pk,
+        em fixture onde Paper.pk e ProjectPaper.pk necessariamente divergem
+        (papers fantasma criam gap no auto-increment de Paper).
+
+        Trava de regressão do bug original: se o serviço retornasse Paper.pk
+        no lugar de ProjectPaper.pk, ao menos um assert falharia.
+        """
+        resp = self.client.get(gene_detail_url(self.project.id, 'BRCA1'))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        refs_by_pmid = {r['pmid']: r for r in resp.data['references']}
+
+        # Ambos devem apontar para o ProjectPaper.pk correto
+        self.assertEqual(
+            refs_by_pmid[19910]['project_paper_id'],
+            self.pp_a.pk,
+            f'project_paper_id ({refs_by_pmid[19910]["project_paper_id"]}) '
+            f'deve ser pp_a.pk ({self.pp_a.pk}), não paper_a.pk ({self.paper_a.pk}).',
+        )
+        self.assertEqual(
+            refs_by_pmid[19911]['project_paper_id'],
+            self.pp_b.pk,
+            f'project_paper_id ({refs_by_pmid[19911]["project_paper_id"]}) '
+            f'deve ser pp_b.pk ({self.pp_b.pk}), não paper_b.pk ({self.paper_b.pk}).',
+        )
+
+    def test_project_paper_id_not_equal_to_paper_pk_with_divergent_fixtures(self):
+        """
+        Trava do bug original: project_paper_id NÃO deve ser igual ao Paper.pk.
+        Como Paper.pk é avançado pelos papers fantasma, ao menos um par diverge —
+        se o serviço expusesse Paper.pk erroneamente, esse assert detectaria.
+        """
+        resp = self.client.get(gene_detail_url(self.project.id, 'BRCA1'))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        refs_by_pmid = {r['pmid']: r for r in resp.data['references']}
+
+        # Para ao menos um dos papers, project_paper_id != Paper.pk
+        # (verificamos ambos e exigimos que ao menos um deles divirja)
+        mismatch_a = refs_by_pmid[19910]['project_paper_id'] != self.paper_a.pk
+        mismatch_b = refs_by_pmid[19911]['project_paper_id'] != self.paper_b.pk
+        self.assertTrue(
+            mismatch_a or mismatch_b,
+            f'project_paper_id coincide com Paper.pk em ambos os pares — '
+            f'isso invalida a trava de regressão do bug de mismatch. '
+            f'paper_a.pk={self.paper_a.pk} pp_a.pk={self.pp_a.pk}; '
+            f'paper_b.pk={self.paper_b.pk} pp_b.pk={self.pp_b.pk}.',
+        )
+
+    def test_id_field_absent_in_references_with_divergent_fixtures(self):
+        """
+        Campo 'id' (Paper.pk ambíguo, removido pelo fix) não deve aparecer
+        em nenhum item de references[].
+        Trava de regressão em fixtures com divergência garantida de PKs.
+        """
+        resp = self.client.get(gene_detail_url(self.project.id, 'BRCA1'))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        for ref in resp.data['references']:
+            self.assertNotIn(
+                'id',
+                ref,
+                f'Campo id não deve existir em references[] após correção do 007; '
+                f'pmid={ref.get("pmid")}.',
+            )
+
+    # ------------------------------------------------------------------
+    # c) PATCH end-to-end usando project_paper_id do detalhe de gene
+    # ------------------------------------------------------------------
+
+    def test_patch_using_project_paper_id_from_gene_detail_changes_correct_record(self):
+        """
+        Fluxo completo do toggle de curadoria via painel de genes:
+          1. GET detalhe do gene → obter project_paper_id de cada referência.
+          2. PATCH papers/<project_paper_id>/ com curation_status='included'.
+          3. Verificar que o ProjectPaper correto foi alterado no banco.
+          4. Verificar que o outro ProjectPaper NÃO foi alterado.
+
+        Garante que a PK exposta pelo serviço é exatamente a que o endpoint
+        de curadoria espera — eliminando o mismatch Paper.pk vs ProjectPaper.pk.
+        """
+        # Passo 1: obter project_paper_id do detalhe de gene
+        resp_detail = self.client.get(gene_detail_url(self.project.id, 'BRCA1'))
+        self.assertEqual(resp_detail.status_code, status.HTTP_200_OK)
+
+        refs_by_pmid = {r['pmid']: r for r in resp_detail.data['references']}
+        pp_id_a = refs_by_pmid[19910]['project_paper_id']  # deve ser self.pp_a.pk
+
+        # Passo 2: PATCH usando a PK vinda do detalhe de gene
+        patch_url = _patch_paper_url(self.project.id, pp_id_a)
+        resp_patch = self.client.patch(
+            patch_url,
+            data={'curation_status': 'included'},
+            format='json',
+        )
+        self.assertEqual(
+            resp_patch.status_code,
+            status.HTTP_200_OK,
+            f'PATCH {patch_url} retornou {resp_patch.status_code}: {resp_patch.data}',
+        )
+
+        # Passo 3: verificar que pp_a foi atualizado
+        self.pp_a.refresh_from_db()
+        self.assertEqual(
+            self.pp_a.curation_status,
+            'included',
+            'ProjectPaper alvo deve ter curation_status=included após o PATCH.',
+        )
+
+        # Passo 4: verificar que pp_b NÃO foi alterado
+        self.pp_b.refresh_from_db()
+        self.assertEqual(
+            self.pp_b.curation_status,
+            'pending',
+            'ProjectPaper não-alvo NÃO deve ter sido alterado pelo PATCH.',
+        )
+
+    def test_patch_using_project_paper_id_preserves_curated_at(self):
+        """
+        Skill curation-audit-trail: curated_at deve ser gravado no PATCH
+        (via perform_update → serializer.save(curated_at=timezone.now())).
+        """
+        # Obter project_paper_id do detalhe de gene
+        resp_detail = self.client.get(gene_detail_url(self.project.id, 'BRCA1'))
+        self.assertEqual(resp_detail.status_code, status.HTTP_200_OK)
+
+        refs_by_pmid = {r['pmid']: r for r in resp_detail.data['references']}
+        pp_id_a = refs_by_pmid[19910]['project_paper_id']
+
+        before = timezone.now()
+        self.client.patch(
+            _patch_paper_url(self.project.id, pp_id_a),
+            data={'curation_status': 'included'},
+            format='json',
+        )
+        after = timezone.now()
+
+        self.pp_a.refresh_from_db()
+        self.assertIsNotNone(
+            self.pp_a.curated_at,
+            'curated_at deve ser gravado após PATCH (skill curation-audit-trail).',
+        )
+        self.assertGreaterEqual(self.pp_a.curated_at, before)
+        self.assertLessEqual(self.pp_a.curated_at, after)
+
+    # ------------------------------------------------------------------
+    # d) Isolamento cross-user: PATCH com ProjectPaper.pk de outro projeto → 404
+    # ------------------------------------------------------------------
+
+    def test_patch_with_other_users_project_paper_pk_returns_404(self):
+        """
+        Isolamento: PATCH papers/<pp_pk>/ onde pp_pk pertence a projeto de outro
+        usuário deve retornar 404 — não vaza dados nem corrompe curadoria cross-user.
+
+        O endpoint filtra por (project_pk + request.user) via _get_project():
+        a combinação (project_id_correto, pp_pk_de_outro_projeto) é inválida,
+        e a combinação (project_id_errado, pp_pk_de_outro_projeto) também retorna 404
+        porque o projeto não pertence ao usuário logado.
+        """
+        # Criar outro usuário com projeto e ProjectPaper próprios
+        other_user = make_user('other_patch_user')
+        other_project = make_project(other_user, title='Outro Projeto Patch')
+        other_paper = make_paper(pmid=19920, title='Other Paper', pub_year=2021, abstract='BRCA1 study.')
+        other_pp = make_project_paper(other_project, other_paper, curation_status='pending')
+        make_paper_gene(other_paper, 'BRCA1', entrez_id=672, mention_count=1)
+
+        # Usuário logado tenta PATCH no ProjectPaper do outro usuário,
+        # usando o project_pk do próprio projeto (combinação inválida)
+        patch_url = _patch_paper_url(self.project.id, other_pp.pk)
+        resp = self.client.patch(
+            patch_url,
+            data={'curation_status': 'included'},
+            format='json',
+        )
+        self.assertEqual(
+            resp.status_code,
+            status.HTTP_404_NOT_FOUND,
+            f'PATCH com ProjectPaper.pk de outro usuário deve retornar 404; '
+            f'retornou {resp.status_code}.',
+        )
+
+        # Verificar que o ProjectPaper do outro usuário NÃO foi alterado
+        other_pp.refresh_from_db()
+        self.assertEqual(
+            other_pp.curation_status,
+            'pending',
+            'ProjectPaper de outro usuário não deve ter sido alterado.',
+        )
+
+    def test_patch_with_other_users_project_id_returns_404(self):
+        """
+        PATCH usando o project_pk de outro usuário (mesmo que a pk do paper seja válida
+        dentro daquele projeto) deve retornar 404 — _get_project() filtra por request.user.
+        """
+        # Criar outro usuário com projeto e ProjectPaper
+        other_user = make_user('other_patch_user2')
+        other_project = make_project(other_user, title='Projeto Alheio 2')
+        other_paper = make_paper(pmid=19921, title='Other Paper 2', pub_year=2020, abstract='BRCA1.')
+        other_pp = make_project_paper(other_project, other_paper, curation_status='pending')
+        make_paper_gene(other_paper, 'BRCA1', entrez_id=672, mention_count=1)
+
+        # Usuário logado tenta acessar o projeto de outro usuário
+        patch_url = _patch_paper_url(other_project.id, other_pp.pk)
+        resp = self.client.patch(
+            patch_url,
+            data={'curation_status': 'included'},
+            format='json',
+        )
+        self.assertEqual(
+            resp.status_code,
+            status.HTTP_404_NOT_FOUND,
+            f'PATCH no project_pk de outro usuário deve retornar 404; '
+            f'retornou {resp.status_code}.',
+        )
+
+        # Registros não modificados
+        other_pp.refresh_from_db()
+        self.assertEqual(other_pp.curation_status, 'pending')
