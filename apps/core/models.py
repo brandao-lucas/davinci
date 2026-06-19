@@ -355,6 +355,7 @@ class PaperVariant(models.Model):
     """
     paper = models.ForeignKey(Paper, on_delete=models.CASCADE, related_name='variants')
     rs_number = models.CharField('RS Number', max_length=20, db_index=True)
+    mention_count = models.PositiveIntegerField('Menções no Abstract', default=1)
 
     class Meta:
         unique_together = ['paper', 'rs_number']

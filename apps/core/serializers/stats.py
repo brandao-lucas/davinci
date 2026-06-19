@@ -77,7 +77,14 @@ class ProjectStatsSerializer(serializers.ModelSerializer):
 
     @extend_schema_field({
         'type': 'array',
-        'items': {'type': 'object'},
+        'items': {
+            'type': 'object',
+            'properties': {
+                'rs_number': {'type': 'string'},
+                'count': {'type': 'integer'},
+            },
+            'required': ['rs_number', 'count'],
+        },
     })
     def get_top_variants(self, obj):
         return obj.top_variants

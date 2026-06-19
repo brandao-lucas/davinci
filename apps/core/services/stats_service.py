@@ -2,7 +2,7 @@ from django.db.models import Count, Sum, Q
 
 from apps.core.models import (
     DaVinciProject, ProjectStats, ProjectPaper, ProjectDataset, ProjectSample,
-    PaperAuthor, PaperGene, PaperDrug, PaperMeSHTerm,
+    PaperAuthor, PaperGene, PaperDrug, PaperMeSHTerm, PaperVariant,
     ProjectPaperClinicalCategory,
 )
 
@@ -155,6 +155,15 @@ class StatsService:
             .order_by('-n')[:20]
         ]
 
+        # ── Top variants ─────────────────────────────────────────────
+        top_variants = [
+            {'rs_number': row['rs_number'], 'count': row['total']}
+            for row in PaperVariant.objects.filter(paper_id__in=included_paper_ids)
+            .values('rs_number')
+            .annotate(total=Sum('mention_count'))
+            .order_by('-total')[:20]
+        ]
+
         stats, _ = ProjectStats.objects.update_or_create(
             project=project,
             defaults={
@@ -175,7 +184,7 @@ class StatsService:
                 'top_genes': top_genes,
                 'top_drugs': top_drugs,
                 'top_mesh_terms': top_mesh_terms,
-                'top_variants': [],
+                'top_variants': top_variants,
             },
         )
         return stats

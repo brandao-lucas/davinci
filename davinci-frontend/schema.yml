@@ -816,6 +816,53 @@ paths:
               schema:
                 $ref: '#/components/schemas/ProjectDatasetCurate'
           description: ''
+  /api/v1/projects/{project_pk}/datasets/add_from_suggestion/:
+    post:
+      operationId: projects_datasets_add_from_suggestion_create
+      description: |-
+        Vincula um OmicDataset global existente ao projeto como ProjectDataset (curation_status='pending'). Idempotente: se o vínculo já existir, retorna o existente com HTTP 200. Criação nova retorna HTTP 201.
+
+        Após criar o vínculo, dispara materialize_project_links para que a ponta recém-adicionada promova automaticamente o par órfão a ProjectPaperDataset(confidence='auto') (Nível 1).
+
+        Request body: { "dataset_id": <int> }  — dataset_id vindo de GET /links/suggestions/ (campo OrphanLinkSuggestionSerializer.dataset_id).
+      summary: Adicionar dataset ao projeto a partir de sugestão de órfão
+      parameters:
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddDatasetToProjectRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/AddDatasetToProjectRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/AddDatasetToProjectRequest'
+        required: true
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectDatasetList'
+          description: ''
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectDatasetList'
+          description: ''
   /api/v1/projects/{project_pk}/datasets/bulk_curate/:
     post:
       operationId: projects_datasets_bulk_curate_create
@@ -1221,9 +1268,10 @@ paths:
       description: |-
         Literature ↔ Omics links within a project.
 
-        list:    GET  /projects/{project_pk}/links/
-        confirm: POST /projects/{project_pk}/links/{id}/confirm/
-        reject:  POST /projects/{project_pk}/links/{id}/reject/
+        list:        GET  /projects/{project_pk}/links/
+        suggestions: GET  /projects/{project_pk}/links/suggestions/
+        confirm:     POST /projects/{project_pk}/links/{id}/confirm/
+        reject:      POST /projects/{project_pk}/links/{id}/reject/
       parameters:
       - name: ordering
         required: false
@@ -1318,6 +1366,61 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ProjectPaperDataset'
+          description: ''
+  /api/v1/projects/{project_pk}/links/suggestions/:
+    get:
+      operationId: projects_links_suggestions_list
+      description: |-
+        Retorna lista paginada de sugestões de vínculos onde apenas UMA ponta do DatasetPaperLink global já está no projeto. Dois casos:
+
+        - **dataset_missing**: paper já é ProjectPaper do projeto, mas o dataset vinculado (via elink/GEO) NÃO é ProjectDataset → sugerir adicionar o dataset.
+        - **paper_missing**: dataset já é ProjectDataset do projeto, mas o paper vinculado NÃO é ProjectPaper → sugerir adicionar o paper.
+
+        READ-ONLY: nunca grava em ProjectPaperDataset. Filtros: ?type=dataset_missing|paper_missing (opcional). Paginação: ?page=, ?page_size= (máx 200).
+      summary: Sugestões de vínculos órfãos (Nível 2)
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      - in: query
+        name: type
+        schema:
+          type: string
+        description: 'Filtrar por tipo de sugestão: ''dataset_missing'' (paper no
+          projeto, dataset ausente) ou ''paper_missing'' (dataset no projeto, paper
+          ausente). Omitir retorna ambos.'
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedOrphanLinkSuggestionList'
           description: ''
   /api/v1/projects/{project_pk}/mesh/:
     get:
@@ -1594,6 +1697,53 @@ paths:
               schema:
                 $ref: '#/components/schemas/ProjectPaperDetail'
           description: ''
+  /api/v1/projects/{project_pk}/papers/add_from_suggestion/:
+    post:
+      operationId: projects_papers_add_from_suggestion_create
+      description: |-
+        Vincula um Paper global existente ao projeto como ProjectPaper (curation_status='pending'). Idempotente: se o vínculo já existir, retorna o existente com HTTP 200. Criação nova retorna HTTP 201.
+
+        Após criar o vínculo, dispara materialize_project_links para que a ponta recém-adicionada promova automaticamente o par órfão a ProjectPaperDataset(confidence='auto') (Nível 1).
+
+        Request body: { "pmid": <int> }  — paper_pmid vindo de GET /links/suggestions/ (campo OrphanLinkSuggestionSerializer.paper_pmid).
+      summary: Adicionar paper ao projeto a partir de sugestão de órfão
+      parameters:
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddPaperToProjectRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/AddPaperToProjectRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/AddPaperToProjectRequest'
+        required: true
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectPaperList'
+          description: ''
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectPaperList'
+          description: ''
   /api/v1/projects/{project_pk}/papers/bulk_curate/:
     post:
       operationId: projects_papers_bulk_curate_create
@@ -1864,8 +2014,137 @@ paths:
               schema:
                 $ref: '#/components/schemas/BulkCurateResponse'
           description: ''
+  /api/v1/projects/{project_pk}/variants/:
+    get:
+      operationId: projects_variants_list
+      description: 'Retorna lista paginada de variantes (rs numbers) mencionadas nos
+        papers do projeto, agrupadas por rs_number. Inclui contagens de citações únicas
+        (included e total), soma de menções e anotação clínica resumida (nullable).
+        Filtros: ?q= (icontains no rs_number), ?ordering= (unique_citations_included
+        | unique_citations_total | mention_count_total | rs_number; prefixe com ''-''
+        para DESC), ?included_only=true (omite variantes sem nenhum paper incluído).
+        Default: -unique_citations_included. Paginação: ?page=, ?page_size= (máx 100).'
+      summary: Lista variantes do projeto (agregada)
+      parameters:
+      - in: query
+        name: included_only
+        schema:
+          type: boolean
+        description: 'Quando true, retorna apenas variantes com ao menos um paper
+          com curation_status=included (unique_citations_included > 0). Aceita true/false/1/0.
+          Default: false.'
+      - in: query
+        name: ordering
+        schema:
+          type: string
+        description: 'Campo de ordenação. Valores válidos: unique_citations_included,
+          unique_citations_total, mention_count_total, rs_number (prefixe com - para
+          DESC).'
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: page_size
+        required: false
+        in: query
+        description: Number of results to return per page.
+        schema:
+          type: integer
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: query
+        name: q
+        schema:
+          type: string
+        description: Filtro por rs_number (icontains).
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedProjectVariantListList'
+          description: ''
+  /api/v1/projects/{project_pk}/variants/{rs_number}/:
+    get:
+      operationId: projects_variants_retrieve
+      description: Retorna métricas da variante, anotação clínica completa (nullable)
+        e, para cada paper do projeto que a cita, as sentenças do abstract onde a
+        variante aparece (snippets). Se o cache de snippets estiver frio ou stale
+        para algum paper, uma task Celery é disparada e context_status='computing'
+        é retornado; chamadas subsequentes retornam 'ready' quando o cache estiver
+        pronto. rs_number inválido (> 32 chars) ou inexistente no projeto → 404.
+      summary: Detalhe de variante do projeto (com snippets de contexto)
+      parameters:
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: path
+        name: rs_number
+        schema:
+          type: string
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectVariantDetail'
+          description: ''
 components:
   schemas:
+    AddDatasetToProjectRequest:
+      type: object
+      description: |-
+        Request body para POST /projects/{project_pk}/datasets/add_from_suggestion/.
+
+        O campo `dataset_id` identifica o OmicDataset global a ser vinculado.
+        Esse id vem de OrphanLinkSuggestionSerializer.dataset_id (Nível 2).
+      properties:
+        dataset_id:
+          type: integer
+          minimum: 1
+          description: PK de OmicDataset (dataset global) a adicionar ao projeto.
+      required:
+      - dataset_id
+    AddPaperToProjectRequest:
+      type: object
+      description: |-
+        Request body para POST /projects/{project_pk}/papers/add_from_suggestion/.
+
+        O campo `pmid` identifica o Paper global a ser vinculado ao projeto.
+        Esse PMID vem de OrphanLinkSuggestionSerializer.paper_pmid (Nível 2).
+      properties:
+        pmid:
+          type: integer
+          minimum: 1
+          description: PMID do paper global (Paper.pmid) a adicionar ao projeto.
+      required:
+      - pmid
     BlankEnum:
       enum:
       - ''
@@ -2365,6 +2644,74 @@ components:
         * `gene_ner` - Extração de Genes
         * `drug_ner` - Extração de Drogas
         * `context_extraction` - Extração de Contextos
+    LinkedDatasetBrief:
+      type: object
+      description: |-
+        Resumo de um vínculo ProjectPaperDataset para exibir no detalhe de um paper.
+
+        Expõe os campos do dataset vinculado + metadados do link.
+        Filtrado pelo project_pk da rota — sem vazamento cross-project (Regra #3).
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        project_dataset_id:
+          type: integer
+          readOnly: true
+        dataset_accession:
+          type: string
+          readOnly: true
+        dataset_title:
+          type: string
+          readOnly: true
+        omic_type:
+          type: string
+          readOnly: true
+        confidence:
+          $ref: '#/components/schemas/ConfidenceEnum'
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - created_at
+      - dataset_accession
+      - dataset_title
+      - id
+      - omic_type
+      - project_dataset_id
+    LinkedPaperBrief:
+      type: object
+      description: |-
+        Resumo de um vínculo ProjectPaperDataset para exibir no detalhe de um dataset.
+
+        Expõe os campos do paper vinculado + metadados do link.
+        Filtrado pelo project_pk da rota — sem vazamento cross-project (Regra #3).
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        project_paper_id:
+          type: integer
+          readOnly: true
+        paper_pmid:
+          type: integer
+          readOnly: true
+        paper_title:
+          type: string
+          readOnly: true
+        confidence:
+          $ref: '#/components/schemas/ConfidenceEnum'
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - created_at
+      - id
+      - paper_pmid
+      - paper_title
+      - project_paper_id
     MagnitudePreview:
       type: object
       description: Resposta do endpoint POST /projects/{id}/search/preview/
@@ -2700,6 +3047,72 @@ components:
           type: integer
           default: 500
           description: Máximo de registros por fonte.
+    OrphanLinkSuggestion:
+      type: object
+      description: |-
+        Serializer READ-ONLY para sugestões de órfãos (Nível 2).
+
+        Recebe dicts vindos de suggest_orphan_links() — não é um ModelSerializer
+        porque o resultado é uma projeção SQL, não uma instância de model.
+
+        Nunca grava nada: não há create/update.
+      properties:
+        suggestion_type:
+          allOf:
+          - $ref: '#/components/schemas/SuggestionTypeEnum'
+          description: |-
+            'dataset_missing': paper já no projeto, dataset ausente. 'paper_missing': dataset já no projeto, paper ausente.
+
+            * `dataset_missing` - dataset_missing
+            * `paper_missing` - paper_missing
+        global_link_id:
+          type: integer
+          description: PK de DatasetPaperLink (vínculo global descoberto pelo Rust
+            via elink).
+        link_source:
+          type: string
+          description: 'Origem do vínculo global: ''elink'', ''geo_xml'', ''manual''.'
+        project_paper_id:
+          type: integer
+          nullable: true
+          description: PK de ProjectPaper (paper já no projeto). null quando suggestion_type
+            == paper_missing (paper ainda não está no projeto).
+        paper_pmid:
+          type: integer
+          description: PMID do paper (ponta existente ou sugerida).
+        paper_title:
+          type: string
+          description: Título do paper.
+        project_dataset_id:
+          type: integer
+          nullable: true
+          description: PK de ProjectDataset (dataset já no projeto). null quando suggestion_type
+            == dataset_missing (dataset ainda não está no projeto).
+        dataset_id:
+          type: integer
+          description: PK de OmicDataset (dataset global — usado para adicionar ao
+            projeto depois).
+        dataset_accession:
+          type: string
+          description: Accession do dataset (GSE*, SRP*, etc.).
+        dataset_title:
+          type: string
+          description: Título do dataset.
+        omic_type:
+          type: string
+          description: Tipo ômico do dataset (transcriptomic, genomic, etc.).
+      required:
+      - dataset_accession
+      - dataset_id
+      - dataset_title
+      - global_link_id
+      - link_source
+      - omic_type
+      - paper_pmid
+      - paper_title
+      - project_dataset_id
+      - project_paper_id
+      - suggestion_type
     PaginatedClinicalCategoryList:
       type: object
       required:
@@ -2792,6 +3205,29 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/MeshSuggestion'
+    PaginatedOrphanLinkSuggestionList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrphanLinkSuggestion'
     PaginatedProjectDatasetListList:
       type: object
       required:
@@ -2953,6 +3389,29 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ProjectSampleList'
+    PaginatedProjectVariantListList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProjectVariantList'
     PaginatedUserCategoryList:
       type: object
       required:
@@ -3446,7 +3905,7 @@ components:
           nullable: true
     ProjectDatasetDetail:
       type: object
-      description: 'Full detail: dataset content + curation fields.'
+      description: 'Full detail: dataset content + curation fields + linked papers.'
       properties:
         id:
           type: integer
@@ -3475,11 +3934,17 @@ components:
           format: date-time
           readOnly: true
           nullable: true
+        linked_papers:
+          type: array
+          items:
+            $ref: '#/components/schemas/LinkedPaperBrief'
+          readOnly: true
       required:
       - added_at
       - curated_at
       - dataset
       - id
+      - linked_papers
     ProjectDatasetList:
       type: object
       description: Compact list — includes summary and platform for the detail panel.
@@ -3845,13 +4310,13 @@ components:
         id:
           type: integer
           readOnly: true
-        pmid:
+        paper_pmid:
           type: integer
           readOnly: true
         paper_title:
           type: string
           readOnly: true
-        accession:
+        dataset_accession:
           type: string
           readOnly: true
         dataset_title:
@@ -3867,16 +4332,16 @@ components:
           format: date-time
           readOnly: true
       required:
-      - accession
       - created_at
+      - dataset_accession
       - dataset_title
       - id
       - omic_type
+      - paper_pmid
       - paper_title
-      - pmid
     ProjectPaperDetail:
       type: object
-      description: 'Full detail: paper content + curation fields.'
+      description: 'Full detail: paper content + curation fields + linked datasets.'
       properties:
         id:
           type: integer
@@ -3921,11 +4386,17 @@ components:
           readOnly: true
           nullable: true
           title: Curado em
+        linked_datasets:
+          type: array
+          items:
+            $ref: '#/components/schemas/LinkedDatasetBrief'
+          readOnly: true
       required:
       - added_at
       - clinical_categories
       - curated_at
       - id
+      - linked_datasets
       - paper
       - user_categories
     ProjectPaperList:
@@ -4227,6 +4698,14 @@ components:
           type: array
           items:
             type: object
+            properties:
+              rs_number:
+                type: string
+              count:
+                type: integer
+            required:
+            - rs_number
+            - count
           readOnly: true
         last_computed:
           type: string
@@ -4252,6 +4731,143 @@ components:
       - total_datasets
       - total_papers
       - total_samples
+    ProjectVariantDetail:
+      type: object
+      description: |-
+        Detalhe de uma variante no projeto: métricas agregadas + anotação clínica
+        + referências com snippets.
+
+        context_status:
+            'ready'     — cache de snippets completo e fresco para todos os papers.
+            'computing' — task de derivação foi disparada; alguns snippets podem faltar.
+
+        annotation:
+            Objeto VariantAnnotationSerializer completo quando disponível.
+            Null quando não há VariantAnnotation para este rs_number (D2).
+      properties:
+        rs_number:
+          type: string
+          description: 'RS Number da variante (ex.: rs1801133).'
+        unique_citations_included:
+          type: integer
+          description: Papers distintos com status 'included' que citam a variante.
+        unique_citations_total:
+          type: integer
+          description: Papers distintos (qualquer status) que citam a variante neste
+            projeto.
+        mention_count_total:
+          type: integer
+          description: Soma de mention_count de todos os PaperVariant do projeto para
+            esta variante.
+        annotation:
+          oneOf:
+          - type: object
+            properties:
+              gene_symbol:
+                type: string
+              gene_name:
+                type: string
+              entrez_id:
+                type: integer
+                nullable: true
+              chromosome:
+                type: string
+              position:
+                type: integer
+                nullable: true
+              alleles:
+                type: string
+              maf:
+                type: number
+                nullable: true
+              clinical_significance:
+                type: string
+            required:
+            - gene_symbol
+            - gene_name
+            - entrez_id
+            - chromosome
+            - position
+            - alleles
+            - maf
+            - clinical_significance
+          - type: 'null'
+          description: Anotação completa da variante (dbSNP/ClinVar). Null quando
+            não há VariantAnnotation para este rs_number.
+          readOnly: true
+        references:
+          type: array
+          items:
+            $ref: '#/components/schemas/VariantReference'
+        context_status:
+          allOf:
+          - $ref: '#/components/schemas/ContextStatusEnum'
+          description: |-
+            'ready' | 'computing' — estado do cache de snippets.
+
+            * `ready` - ready
+            * `computing` - computing
+      required:
+      - annotation
+      - context_status
+      - mention_count_total
+      - references
+      - rs_number
+      - unique_citations_included
+      - unique_citations_total
+    ProjectVariantList:
+      type: object
+      description: |-
+        Item da lista agregada de variantes do projeto.
+
+        Cada registro representa um rs_number único com contagens
+        agregadas calculadas numa única query no VariantService.
+        O campo 'annotation' é preenchido via in_bulk() pós-paginação
+        no ViewSet e pode ser None quando não há VariantAnnotation (D2).
+      properties:
+        rs_number:
+          type: string
+          description: 'RS Number da variante (ex.: rs1801133).'
+        unique_citations_included:
+          type: integer
+          description: Número de papers distintos com curation_status='included' que
+            citam a variante.
+        unique_citations_total:
+          type: integer
+          description: Número de papers distintos (qualquer status) do projeto que
+            citam a variante.
+        mention_count_total:
+          type: integer
+          description: Soma de mention_count de todos os PaperVariant do projeto para
+            esta variante.
+        annotation:
+          oneOf:
+          - type: object
+            properties:
+              gene_symbol:
+                type: string
+              clinical_significance:
+                type: string
+              chromosome:
+                type: string
+              maf:
+                type: number
+                nullable: true
+            required:
+            - gene_symbol
+            - clinical_significance
+            - chromosome
+            - maf
+          - type: 'null'
+          description: Anotação resumida (gene_symbol, clinical_significance, chromosome,
+            maf). Null quando não há VariantAnnotation para este rs_number.
+          readOnly: true
+      required:
+      - annotation
+      - mention_count_total
+      - rs_number
+      - unique_citations_included
+      - unique_citations_total
     SampleBulkCurateRequest:
       type: object
       description: Body de bulk_curate de samples.
@@ -4314,6 +4930,14 @@ components:
         * `tcga` - TCGA
         * `bioproject` - BioProject
         * `gwas_catalog` - GWAS Catalog
+    SuggestionTypeEnum:
+      enum:
+      - dataset_missing
+      - paper_missing
+      type: string
+      description: |-
+        * `dataset_missing` - dataset_missing
+        * `paper_missing` - paper_missing
     UserCategory:
       type: object
       properties:
@@ -4409,6 +5033,56 @@ components:
       - first_name
       - id
       - last_name
+    VariantReference:
+      type: object
+      description: Paper do projeto que cita a variante, com suas sentenças de contexto.
+      properties:
+        project_paper_id:
+          type: integer
+          description: PK de ProjectPaper — usada no PATCH /projects/{id}/papers/<pk>/
+            para toggle de curadoria. Distinta da PK de Paper (pmid para exibição).
+        pmid:
+          type: integer
+          description: PubMed ID do paper.
+        title:
+          type: string
+          description: Título do paper.
+        pub_year:
+          type: integer
+          nullable: true
+          description: Ano de publicação.
+        journal:
+          type: string
+          description: Periódico (ISO abbrev).
+        curation_status:
+          type: string
+          description: Status de curadoria do paper neste projeto (included, excluded,
+            pending, maybe).
+        snippets:
+          type: array
+          items:
+            $ref: '#/components/schemas/VariantSnippet'
+      required:
+      - curation_status
+      - journal
+      - pmid
+      - project_paper_id
+      - pub_year
+      - snippets
+      - title
+    VariantSnippet:
+      type: object
+      description: Uma sentença do abstract que contém a variante.
+      properties:
+        sentence:
+          type: string
+          description: Sentença do abstract contendo a variante.
+        sentence_position:
+          type: integer
+          description: Índice 0-based da sentença no abstract.
+      required:
+      - sentence
+      - sentence_position
     _VerifyTokenOk:
       type: object
       properties:

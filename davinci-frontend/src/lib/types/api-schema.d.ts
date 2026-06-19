@@ -358,6 +358,30 @@ export interface paths {
         patch: operations["projects_datasets_partial_update"];
         trace?: never;
     };
+    "/api/v1/projects/{project_pk}/datasets/add_from_suggestion/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Adicionar dataset ao projeto a partir de sugestão de órfão
+         * @description Vincula um OmicDataset global existente ao projeto como ProjectDataset (curation_status='pending'). Idempotente: se o vínculo já existir, retorna o existente com HTTP 200. Criação nova retorna HTTP 201.
+         *
+         *     Após criar o vínculo, dispara materialize_project_links para que a ponta recém-adicionada promova automaticamente o par órfão a ProjectPaperDataset(confidence='auto') (Nível 1).
+         *
+         *     Request body: { "dataset_id": <int> }  — dataset_id vindo de GET /links/suggestions/ (campo OrphanLinkSuggestionSerializer.dataset_id).
+         */
+        post: operations["projects_datasets_add_from_suggestion_create"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/projects/{project_pk}/datasets/bulk_curate/": {
         parameters: {
             query?: never;
@@ -554,9 +578,10 @@ export interface paths {
         /**
          * @description Literature ↔ Omics links within a project.
          *
-         *     list:    GET  /projects/{project_pk}/links/
-         *     confirm: POST /projects/{project_pk}/links/{id}/confirm/
-         *     reject:  POST /projects/{project_pk}/links/{id}/reject/
+         *     list:        GET  /projects/{project_pk}/links/
+         *     suggestions: GET  /projects/{project_pk}/links/suggestions/
+         *     confirm:     POST /projects/{project_pk}/links/{id}/confirm/
+         *     reject:      POST /projects/{project_pk}/links/{id}/reject/
          */
         get: operations["projects_links_list"];
         put?: never;
@@ -601,6 +626,31 @@ export interface paths {
          * @description Define confidence=rejected no link entre paper e dataset.
          */
         post: operations["projects_links_reject_create"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_pk}/links/suggestions/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Sugestões de vínculos órfãos (Nível 2)
+         * @description Retorna lista paginada de sugestões de vínculos onde apenas UMA ponta do DatasetPaperLink global já está no projeto. Dois casos:
+         *
+         *     - **dataset_missing**: paper já é ProjectPaper do projeto, mas o dataset vinculado (via elink/GEO) NÃO é ProjectDataset → sugerir adicionar o dataset.
+         *     - **paper_missing**: dataset já é ProjectDataset do projeto, mas o paper vinculado NÃO é ProjectPaper → sugerir adicionar o paper.
+         *
+         *     READ-ONLY: nunca grava em ProjectPaperDataset. Filtros: ?type=dataset_missing|paper_missing (opcional). Paginação: ?page=, ?page_size= (máx 200).
+         */
+        get: operations["projects_links_suggestions_list"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -723,6 +773,30 @@ export interface paths {
          * @description Adiciona ou remove categorias clínicas e de usuário de um ProjectPaper.
          */
         post: operations["projects_papers_categorize_create"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_pk}/papers/add_from_suggestion/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Adicionar paper ao projeto a partir de sugestão de órfão
+         * @description Vincula um Paper global existente ao projeto como ProjectPaper (curation_status='pending'). Idempotente: se o vínculo já existir, retorna o existente com HTTP 200. Criação nova retorna HTTP 201.
+         *
+         *     Após criar o vínculo, dispara materialize_project_links para que a ponta recém-adicionada promova automaticamente o par órfão a ProjectPaperDataset(confidence='auto') (Nível 1).
+         *
+         *     Request body: { "pmid": <int> }  — paper_pmid vindo de GET /links/suggestions/ (campo OrphanLinkSuggestionSerializer.paper_pmid).
+         */
+        post: operations["projects_papers_add_from_suggestion_create"];
         delete?: never;
         options?: never;
         head?: never;
@@ -875,10 +949,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/projects/{project_pk}/variants/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Lista variantes do projeto (agregada)
+         * @description Retorna lista paginada de variantes (rs numbers) mencionadas nos papers do projeto, agrupadas por rs_number. Inclui contagens de citações únicas (included e total), soma de menções e anotação clínica resumida (nullable). Filtros: ?q= (icontains no rs_number), ?ordering= (unique_citations_included | unique_citations_total | mention_count_total | rs_number; prefixe com '-' para DESC), ?included_only=true (omite variantes sem nenhum paper incluído). Default: -unique_citations_included. Paginação: ?page=, ?page_size= (máx 100).
+         */
+        get: operations["projects_variants_list"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_pk}/variants/{rs_number}/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Detalhe de variante do projeto (com snippets de contexto)
+         * @description Retorna métricas da variante, anotação clínica completa (nullable) e, para cada paper do projeto que a cita, as sentenças do abstract onde a variante aparece (snippets). Se o cache de snippets estiver frio ou stale para algum paper, uma task Celery é disparada e context_status='computing' é retornado; chamadas subsequentes retornam 'ready' quando o cache estiver pronto. rs_number inválido (> 32 chars) ou inexistente no projeto → 404.
+         */
+        get: operations["projects_variants_retrieve"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * @description Request body para POST /projects/{project_pk}/datasets/add_from_suggestion/.
+         *
+         *     O campo `dataset_id` identifica o OmicDataset global a ser vinculado.
+         *     Esse id vem de OrphanLinkSuggestionSerializer.dataset_id (Nível 2).
+         */
+        AddDatasetToProjectRequest: {
+            /** @description PK de OmicDataset (dataset global) a adicionar ao projeto. */
+            dataset_id: number;
+        };
+        /**
+         * @description Request body para POST /projects/{project_pk}/papers/add_from_suggestion/.
+         *
+         *     O campo `pmid` identifica o Paper global a ser vinculado ao projeto.
+         *     Esse PMID vem de OrphanLinkSuggestionSerializer.paper_pmid (Nível 2).
+         */
+        AddPaperToProjectRequest: {
+            /** @description PMID do paper global (Paper.pmid) a adicionar ao projeto. */
+            pmid: number;
+        };
         /** @enum {unknown} */
         BlankEnum: "";
         /** @description Resposta genérica de operações bulk: quantidade de registros atualizados. */
@@ -1139,6 +1273,37 @@ export interface components {
          * @enum {string}
          */
         JobTypeEnum: "pubmed_search" | "pubmed_fetch" | "geo_search" | "sra_search" | "gwas_search" | "sample_fetch" | "variant_annotation" | "gene_ner" | "drug_ner" | "context_extraction";
+        /**
+         * @description Resumo de um vínculo ProjectPaperDataset para exibir no detalhe de um paper.
+         *
+         *     Expõe os campos do dataset vinculado + metadados do link.
+         *     Filtrado pelo project_pk da rota — sem vazamento cross-project (Regra #3).
+         */
+        LinkedDatasetBrief: {
+            readonly id: number;
+            readonly project_dataset_id: number;
+            readonly dataset_accession: string;
+            readonly dataset_title: string;
+            readonly omic_type: string;
+            confidence?: components["schemas"]["ConfidenceEnum"];
+            /** Format: date-time */
+            readonly created_at: string;
+        };
+        /**
+         * @description Resumo de um vínculo ProjectPaperDataset para exibir no detalhe de um dataset.
+         *
+         *     Expõe os campos do paper vinculado + metadados do link.
+         *     Filtrado pelo project_pk da rota — sem vazamento cross-project (Regra #3).
+         */
+        LinkedPaperBrief: {
+            readonly id: number;
+            readonly project_paper_id: number;
+            readonly paper_pmid: number;
+            readonly paper_title: string;
+            confidence?: components["schemas"]["ConfidenceEnum"];
+            /** Format: date-time */
+            readonly created_at: string;
+        };
         /** @description Resposta do endpoint POST /projects/{id}/search/preview/ */
         MagnitudePreview: {
             /** @description Artigos encontrados só pela query de texto livre */
@@ -1300,6 +1465,43 @@ export interface components {
              */
             max_per_source: number;
         };
+        /**
+         * @description Serializer READ-ONLY para sugestões de órfãos (Nível 2).
+         *
+         *     Recebe dicts vindos de suggest_orphan_links() — não é um ModelSerializer
+         *     porque o resultado é uma projeção SQL, não uma instância de model.
+         *
+         *     Nunca grava nada: não há create/update.
+         */
+        OrphanLinkSuggestion: {
+            /**
+             * @description 'dataset_missing': paper já no projeto, dataset ausente. 'paper_missing': dataset já no projeto, paper ausente.
+             *
+             *     * `dataset_missing` - dataset_missing
+             *     * `paper_missing` - paper_missing
+             */
+            suggestion_type: components["schemas"]["SuggestionTypeEnum"];
+            /** @description PK de DatasetPaperLink (vínculo global descoberto pelo Rust via elink). */
+            global_link_id: number;
+            /** @description Origem do vínculo global: 'elink', 'geo_xml', 'manual'. */
+            link_source: string;
+            /** @description PK de ProjectPaper (paper já no projeto). null quando suggestion_type == paper_missing (paper ainda não está no projeto). */
+            project_paper_id: number | null;
+            /** @description PMID do paper (ponta existente ou sugerida). */
+            paper_pmid: number;
+            /** @description Título do paper. */
+            paper_title: string;
+            /** @description PK de ProjectDataset (dataset já no projeto). null quando suggestion_type == dataset_missing (dataset ainda não está no projeto). */
+            project_dataset_id: number | null;
+            /** @description PK de OmicDataset (dataset global — usado para adicionar ao projeto depois). */
+            dataset_id: number;
+            /** @description Accession do dataset (GSE*, SRP*, etc.). */
+            dataset_accession: string;
+            /** @description Título do dataset. */
+            dataset_title: string;
+            /** @description Tipo ômico do dataset (transcriptomic, genomic, etc.). */
+            omic_type: string;
+        };
         PaginatedClinicalCategoryList: {
             /** @example 123 */
             count: number;
@@ -1359,6 +1561,21 @@ export interface components {
              */
             previous?: string | null;
             results: components["schemas"]["MeshSuggestion"][];
+        };
+        PaginatedOrphanLinkSuggestionList: {
+            /** @example 123 */
+            count: number;
+            /**
+             * Format: uri
+             * @example http://api.example.org/accounts/?page=4
+             */
+            next?: string | null;
+            /**
+             * Format: uri
+             * @example http://api.example.org/accounts/?page=2
+             */
+            previous?: string | null;
+            results: components["schemas"]["OrphanLinkSuggestion"][];
         };
         PaginatedProjectDatasetListList: {
             /** @example 123 */
@@ -1464,6 +1681,21 @@ export interface components {
              */
             previous?: string | null;
             results: components["schemas"]["ProjectSampleList"][];
+        };
+        PaginatedProjectVariantListList: {
+            /** @example 123 */
+            count: number;
+            /**
+             * Format: uri
+             * @example http://api.example.org/accounts/?page=4
+             */
+            next?: string | null;
+            /**
+             * Format: uri
+             * @example http://api.example.org/accounts/?page=2
+             */
+            previous?: string | null;
+            results: components["schemas"]["ProjectVariantList"][];
         };
         PaginatedUserCategoryList: {
             /** @example 123 */
@@ -1727,7 +1959,7 @@ export interface components {
             /** Format: double */
             relevance_score?: number | null;
         };
-        /** @description Full detail: dataset content + curation fields. */
+        /** @description Full detail: dataset content + curation fields + linked papers. */
         ProjectDatasetDetail: {
             readonly id: number;
             readonly dataset: components["schemas"]["OmicDataset"];
@@ -1740,6 +1972,7 @@ export interface components {
             readonly added_at: string;
             /** Format: date-time */
             readonly curated_at: string | null;
+            readonly linked_papers: components["schemas"]["LinkedPaperBrief"][];
         };
         /** @description Compact list — includes summary and platform for the detail panel. */
         ProjectDatasetList: {
@@ -1933,16 +2166,16 @@ export interface components {
         };
         ProjectPaperDataset: {
             readonly id: number;
-            readonly pmid: number;
+            readonly paper_pmid: number;
             readonly paper_title: string;
-            readonly accession: string;
+            readonly dataset_accession: string;
             readonly dataset_title: string;
             readonly omic_type: string;
             confidence?: components["schemas"]["ConfidenceEnum"];
             /** Format: date-time */
             readonly created_at: string;
         };
-        /** @description Full detail: paper content + curation fields. */
+        /** @description Full detail: paper content + curation fields + linked datasets. */
         ProjectPaperDetail: {
             readonly id: number;
             readonly paper: components["schemas"]["PaperDetail"];
@@ -1969,6 +2202,7 @@ export interface components {
              * Format: date-time
              */
             readonly curated_at: string | null;
+            readonly linked_datasets: components["schemas"]["LinkedDatasetBrief"][];
         };
         /** @description Compact representation for list views — includes abstract for detail panel. */
         ProjectPaperList: {
@@ -2088,9 +2322,78 @@ export interface components {
                 term: string;
                 count: number;
             }[];
-            readonly top_variants: Record<string, never>[];
+            readonly top_variants: {
+                rs_number: string;
+                count: number;
+            }[];
             /** Format: date-time */
             readonly last_computed: string;
+        };
+        /**
+         * @description Detalhe de uma variante no projeto: métricas agregadas + anotação clínica
+         *     + referências com snippets.
+         *
+         *     context_status:
+         *         'ready'     — cache de snippets completo e fresco para todos os papers.
+         *         'computing' — task de derivação foi disparada; alguns snippets podem faltar.
+         *
+         *     annotation:
+         *         Objeto VariantAnnotationSerializer completo quando disponível.
+         *         Null quando não há VariantAnnotation para este rs_number (D2).
+         */
+        ProjectVariantDetail: {
+            /** @description RS Number da variante (ex.: rs1801133). */
+            rs_number: string;
+            /** @description Papers distintos com status 'included' que citam a variante. */
+            unique_citations_included: number;
+            /** @description Papers distintos (qualquer status) que citam a variante neste projeto. */
+            unique_citations_total: number;
+            /** @description Soma de mention_count de todos os PaperVariant do projeto para esta variante. */
+            mention_count_total: number;
+            /** @description Anotação completa da variante (dbSNP/ClinVar). Null quando não há VariantAnnotation para este rs_number. */
+            readonly annotation: {
+                gene_symbol: string;
+                gene_name: string;
+                entrez_id: number | null;
+                chromosome: string;
+                position: number | null;
+                alleles: string;
+                maf: number | null;
+                clinical_significance: string;
+            } | null;
+            references: components["schemas"]["VariantReference"][];
+            /**
+             * @description 'ready' | 'computing' — estado do cache de snippets.
+             *
+             *     * `ready` - ready
+             *     * `computing` - computing
+             */
+            context_status: components["schemas"]["ContextStatusEnum"];
+        };
+        /**
+         * @description Item da lista agregada de variantes do projeto.
+         *
+         *     Cada registro representa um rs_number único com contagens
+         *     agregadas calculadas numa única query no VariantService.
+         *     O campo 'annotation' é preenchido via in_bulk() pós-paginação
+         *     no ViewSet e pode ser None quando não há VariantAnnotation (D2).
+         */
+        ProjectVariantList: {
+            /** @description RS Number da variante (ex.: rs1801133). */
+            rs_number: string;
+            /** @description Número de papers distintos com curation_status='included' que citam a variante. */
+            unique_citations_included: number;
+            /** @description Número de papers distintos (qualquer status) do projeto que citam a variante. */
+            unique_citations_total: number;
+            /** @description Soma de mention_count de todos os PaperVariant do projeto para esta variante. */
+            mention_count_total: number;
+            /** @description Anotação resumida (gene_symbol, clinical_significance, chromosome, maf). Null quando não há VariantAnnotation para este rs_number. */
+            readonly annotation: {
+                gene_symbol: string;
+                clinical_significance: string;
+                chromosome: string;
+                maf: number | null;
+            } | null;
         };
         /** @description Body de bulk_curate de samples. */
         SampleBulkCurateRequest: {
@@ -2136,6 +2439,12 @@ export interface components {
          * @enum {string}
          */
         SourceDbEnum: "geo" | "sra" | "arrayexpress" | "tcga" | "bioproject" | "gwas_catalog";
+        /**
+         * @description * `dataset_missing` - dataset_missing
+         *     * `paper_missing` - paper_missing
+         * @enum {string}
+         */
+        SuggestionTypeEnum: "dataset_missing" | "paper_missing";
         UserCategory: {
             readonly id: number;
             /** Nome da Categoria */
@@ -2179,6 +2488,29 @@ export interface components {
             avatar_url?: string;
             /** @description NCBI API Key pessoal (eleva rate limit de 3 para 10 req/s) */
             ncbi_api_key?: string;
+        };
+        /** @description Paper do projeto que cita a variante, com suas sentenças de contexto. */
+        VariantReference: {
+            /** @description PK de ProjectPaper — usada no PATCH /projects/{id}/papers/<pk>/ para toggle de curadoria. Distinta da PK de Paper (pmid para exibição). */
+            project_paper_id: number;
+            /** @description PubMed ID do paper. */
+            pmid: number;
+            /** @description Título do paper. */
+            title: string;
+            /** @description Ano de publicação. */
+            pub_year: number | null;
+            /** @description Periódico (ISO abbrev). */
+            journal: string;
+            /** @description Status de curadoria do paper neste projeto (included, excluded, pending, maybe). */
+            curation_status: string;
+            snippets: components["schemas"]["VariantSnippet"][];
+        };
+        /** @description Uma sentença do abstract que contém a variante. */
+        VariantSnippet: {
+            /** @description Sentença do abstract contendo a variante. */
+            sentence: string;
+            /** @description Índice 0-based da sentença no abstract. */
+            sentence_position: number;
         };
         _VerifyTokenOk: {
             status: string;
@@ -2799,6 +3131,41 @@ export interface operations {
             };
         };
     };
+    projects_datasets_add_from_suggestion_create: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_pk: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddDatasetToProjectRequest"];
+                "application/x-www-form-urlencoded": components["schemas"]["AddDatasetToProjectRequest"];
+                "multipart/form-data": components["schemas"]["AddDatasetToProjectRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectDatasetList"];
+                };
+            };
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectDatasetList"];
+                };
+            };
+        };
+    };
     projects_datasets_bulk_curate_create: {
         parameters: {
             query?: never;
@@ -3118,6 +3485,36 @@ export interface operations {
             };
         };
     };
+    projects_links_suggestions_list: {
+        parameters: {
+            query?: {
+                /** @description Which field to use when ordering the results. */
+                ordering?: string;
+                /** @description A page number within the paginated result set. */
+                page?: number;
+                /** @description A search term. */
+                search?: string;
+                /** @description Filtrar por tipo de sugestão: 'dataset_missing' (paper no projeto, dataset ausente) ou 'paper_missing' (dataset no projeto, paper ausente). Omitir retorna ambos. */
+                type?: string;
+            };
+            header?: never;
+            path: {
+                project_pk: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PaginatedOrphanLinkSuggestionList"];
+                };
+            };
+        };
+    };
     projects_mesh_list: {
         parameters: {
             query?: {
@@ -3280,6 +3677,41 @@ export interface operations {
             };
         };
     };
+    projects_papers_add_from_suggestion_create: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_pk: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddPaperToProjectRequest"];
+                "application/x-www-form-urlencoded": components["schemas"]["AddPaperToProjectRequest"];
+                "multipart/form-data": components["schemas"]["AddPaperToProjectRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectPaperList"];
+                };
+            };
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectPaperList"];
+                };
+            };
+        };
+    };
     projects_papers_bulk_curate_create: {
         parameters: {
             query?: never;
@@ -3436,6 +3868,62 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["BulkCurateResponse"];
+                };
+            };
+        };
+    };
+    projects_variants_list: {
+        parameters: {
+            query?: {
+                /** @description Quando true, retorna apenas variantes com ao menos um paper com curation_status=included (unique_citations_included > 0). Aceita true/false/1/0. Default: false. */
+                included_only?: boolean;
+                /** @description Campo de ordenação. Valores válidos: unique_citations_included, unique_citations_total, mention_count_total, rs_number (prefixe com - para DESC). */
+                ordering?: string;
+                /** @description A page number within the paginated result set. */
+                page?: number;
+                /** @description Number of results to return per page. */
+                page_size?: number;
+                /** @description Filtro por rs_number (icontains). */
+                q?: string;
+                /** @description A search term. */
+                search?: string;
+            };
+            header?: never;
+            path: {
+                project_pk: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PaginatedProjectVariantListList"];
+                };
+            };
+        };
+    };
+    projects_variants_retrieve: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_pk: string;
+                rs_number: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectVariantDetail"];
                 };
             };
         };

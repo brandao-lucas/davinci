@@ -14,6 +14,7 @@ import {
   Briefcase,
   Download,
   Settings,
+  Dna,
 } from 'lucide-react';
 
 interface NavItem {
@@ -34,6 +35,7 @@ const projectNavItems: NavItem[] = [
   { label: 'Samples', href: '/samples', icon: FlaskConical, projectScoped: true },
   { label: 'Links', href: '/links', icon: Link2, projectScoped: true },
   { label: 'Analysis', href: '/analysis', icon: BarChart2, projectScoped: true },
+  { label: 'Variantes', href: '/variants', icon: Dna, projectScoped: true },
   { label: 'Jobs', href: '/jobs', icon: Briefcase, projectScoped: true },
   { label: 'Export', href: '/export', icon: Download, projectScoped: true },
 ];

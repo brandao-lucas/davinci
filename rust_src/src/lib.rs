@@ -167,6 +167,16 @@ fn search_and_ingest_pubmed(
             }
         }
 
+        // 4c. Variant NER on abstracts (rs-numbers)
+        let mut variant_mentions: Vec<(i64, String, i32)> = Vec::new();
+        for paper in &papers {
+            let variants =
+                crate::categorization::variant_ner::extract_variants(&paper.abstract_text);
+            for (rs_number, count) in variants {
+                variant_mentions.push((paper.pmid, rs_number, count));
+            }
+        }
+
         // 5. Bulk upsert papers + resolve pmid→paper_id
         let (records_inserted, pmid_to_id) =
             crate::db::copy_writer::copy_papers(&client, &papers)
@@ -199,6 +209,12 @@ fn search_and_ingest_pubmed(
             crate::db::copy_writer::copy_paper_drugs(&client, &drug_mentions, &pmid_to_id).await
         {
             errors.push(format!("copy_paper_drugs: {:?}", e));
+        }
+        if let Err(e) =
+            crate::db::copy_writer::copy_paper_variants(&client, &variant_mentions, &pmid_to_id)
+                .await
+        {
+            errors.push(format!("copy_paper_variants: {:?}", e));
         }
 
         // 6b. Resolve any pending dataset-paper links (from prior omics runs)

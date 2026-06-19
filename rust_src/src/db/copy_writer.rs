@@ -795,6 +795,78 @@ pub async fn copy_paper_drugs(
     Ok(affected)
 }
 
+/// Bulk-upsert variant (rs-number) mentions into `core_papervariant`.
+///
+/// `variants` is a list of `(pmid, rs_number, mention_count)` tuples produced
+/// by `categorization::variant_ner::extract_variants`.
+///
+/// The staging table groups by `(paper_id, rs_number)` with `SUM(mention_count)`
+/// before the final upsert, so duplicate rows within the same batch are safe.
+///
+/// ON CONFLICT (paper_id, rs_number) DO UPDATE overwrites mention_count with
+/// EXCLUDED.mention_count (the SUM already computed in the staging SELECT),
+/// identical to the genes/drugs pattern. This is idempotent: re-ingesting the
+/// same paper replaces the count rather than doubling it.
+pub async fn copy_paper_variants(
+    client: &Client,
+    variants: &[(i64, String, i32)],
+    pmid_to_id: &HashMap<i64, i64>,
+) -> Result<u64, tokio_postgres::Error> {
+    let mut csv = String::new();
+    for (pmid, rs_number, count) in variants {
+        let paper_id = match pmid_to_id.get(pmid) {
+            Some(id) => *id,
+            None => continue,
+        };
+        csv.push_str(&format!(
+            "{},{},{}\n",
+            paper_id,
+            escape_csv_field(&sanitize_str(rs_number, 20)),
+            count,
+        ));
+    }
+    if csv.is_empty() {
+        return Ok(0);
+    }
+
+    client
+        .execute("DROP TABLE IF EXISTS _staging_variant", &[])
+        .await?;
+    client
+        .execute(
+            "CREATE TEMP TABLE _staging_variant (
+                paper_id      BIGINT,
+                rs_number     TEXT,
+                mention_count INTEGER
+            )",
+            &[],
+        )
+        .await?;
+
+    bulk_insert_csv(
+        client,
+        "COPY _staging_variant (paper_id, rs_number, mention_count) FROM STDIN WITH (FORMAT csv, NULL 'NULL')",
+        &csv,
+    )
+    .await?;
+
+    let affected = client
+        .execute(
+            "INSERT INTO core_papervariant (paper_id, rs_number, mention_count)
+             SELECT paper_id, rs_number, SUM(mention_count) FROM _staging_variant
+             GROUP BY paper_id, rs_number
+             ON CONFLICT (paper_id, rs_number) DO UPDATE
+                 SET mention_count = EXCLUDED.mention_count",
+            &[],
+        )
+        .await?;
+
+    client
+        .execute("DROP TABLE IF EXISTS _staging_variant", &[])
+        .await?;
+    Ok(affected)
+}
+
 /// Store dataset-paper links in the pending table for deferred FK resolution.
 ///
 /// This avoids the ordering problem where omics ingestion runs before PubMed

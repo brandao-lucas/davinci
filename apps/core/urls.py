@@ -11,6 +11,7 @@ from .views.job_views import IngestionJobViewSet
 from .views.gene_views import ProjectGeneViewSet
 from .views.mesh_views import ProjectMeSHViewSet
 from .views.drug_views import ProjectDrugViewSet
+from .views.variant_views import ProjectVariantViewSet
 
 router = DefaultRouter()
 router.register(r'projects', DaVinciProjectViewSet, basename='project')
@@ -58,6 +59,9 @@ mesh_detail = ProjectMeSHViewSet.as_view({'get': 'mesh_detail'})
 
 drug_list = ProjectDrugViewSet.as_view({'get': 'list'})
 drug_detail = ProjectDrugViewSet.as_view({'get': 'drug_detail'})
+
+variant_list = ProjectVariantViewSet.as_view({'get': 'list'})
+variant_detail = ProjectVariantViewSet.as_view({'get': 'variant_detail'})
 
 PROJECT_PREFIX = r'projects/<uuid:project_pk>/'
 
@@ -114,4 +118,8 @@ urlpatterns = [
     # Drugs — lista agregada e detalhe por drug_name_lower
     path(f'{PROJECT_PREFIX}drugs/', drug_list, name='project-drug-list'),
     path(f'{PROJECT_PREFIX}drugs/<str:drug_name_lower>/', drug_detail, name='project-drug-detail'),
+
+    # Variants — lista agregada e detalhe por rs_number
+    path(f'{PROJECT_PREFIX}variants/', variant_list, name='project-variant-list'),
+    path(f'{PROJECT_PREFIX}variants/<str:rs_number>/', variant_detail, name='project-variant-detail'),
 ]

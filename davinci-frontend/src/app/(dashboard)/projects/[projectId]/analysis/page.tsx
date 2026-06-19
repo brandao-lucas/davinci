@@ -159,6 +159,33 @@ export default function AnalysisPage({ params }: { params: Promise<{ projectId: 
                     </div>
                   </CardContent>
                 </Card>
+
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">
+                      <Link
+                        href={`/projects/${projectId}/variants`}
+                        className="hover:underline text-foreground"
+                      >
+                        Top Variantes
+                      </Link>
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="flex flex-wrap gap-2">
+                      {stats.top_variants.map((v, i) => (
+                        <Badge key={i} variant="outline" className="font-mono">
+                          {v.rs_number} <span className="ml-1 text-muted-foreground">×{v.count}</span>
+                        </Badge>
+                      ))}
+                      {stats.top_variants.length === 0 && (
+                        <span className="text-muted-foreground text-sm">
+                          Nenhuma variante anotada ainda.
+                        </span>
+                      )}
+                    </div>
+                  </CardContent>
+                </Card>
               </div>
             </>
           )}
