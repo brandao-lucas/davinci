@@ -977,19 +977,22 @@ pub async fn link_project_datasets(
     client: &Client,
     project_id: uuid::Uuid,
     accessions: &[String],
+    job_id: &str,
 ) -> Result<u64, tokio_postgres::Error> {
     if accessions.is_empty() {
         return Ok(0);
     }
 
+    let job_id_uuid: Option<uuid::Uuid> = uuid::Uuid::parse_str(job_id).ok();
+
     let affected = client
         .execute(
             "INSERT INTO core_projectdataset \
-                (project_id, dataset_id, curation_status, exclusion_reason, notes, added_at)
-             SELECT $1, id, 'pending', '', '', NOW()
+                (project_id, dataset_id, curation_status, exclusion_reason, notes, added_at, ingestion_job_id)
+             SELECT $1, id, 'pending', '', '', NOW(), $3
              FROM core_omicdataset WHERE accession = ANY($2)
              ON CONFLICT (project_id, dataset_id) DO NOTHING",
-            &[&project_id, &accessions],
+            &[&project_id, &accessions, &job_id_uuid],
         )
         .await?;
 
@@ -1006,19 +1009,22 @@ pub async fn link_project_papers(
     client: &Client,
     project_id: uuid::Uuid,
     pmids: &[i64],
+    job_id: &str,
 ) -> Result<u64, tokio_postgres::Error> {
     if pmids.is_empty() {
         return Ok(0);
     }
 
+    let job_id_uuid: Option<uuid::Uuid> = uuid::Uuid::parse_str(job_id).ok();
+
     let affected = client
         .execute(
             "INSERT INTO core_projectpaper \
-                (project_id, paper_id, curation_status, exclusion_reason, notes, added_at)
-             SELECT $1, id, 'pending', '', '', NOW()
+                (project_id, paper_id, curation_status, exclusion_reason, notes, added_at, ingestion_job_id)
+             SELECT $1, id, 'pending', '', '', NOW(), $3
              FROM core_paper WHERE pmid = ANY($2)
              ON CONFLICT (project_id, paper_id) DO NOTHING",
-            &[&project_id, &pmids],
+            &[&project_id, &pmids, &job_id_uuid],
         )
         .await?;
 

@@ -41,6 +41,9 @@ export function useUpdateProject(id: string) {
     mutationFn: (data: UpdateProjectInput) => projectsApi.update(id, data).then(r => r.data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['projects'] });
+      // Quando um campo de busca muda em status=searching, o backend reverte para draft
+      // e aborta o job ativo. Invalida jobs para a UI refletir o job cancelado.
+      queryClient.invalidateQueries({ queryKey: ['jobs', id] });
     },
   });
 }

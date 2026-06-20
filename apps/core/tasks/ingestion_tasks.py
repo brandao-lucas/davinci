@@ -129,6 +129,17 @@ def run_pubmed_ingestion(self, job_id: str):
                 job_id, e,
             )
 
+        # Tenta avançar para curating se não há mais jobs de busca ativos.
+        # Chamado APÓS o encadeamento para que o GEO job já exista antes de checar.
+        try:
+            from apps.core.services.project_status import advance_to_curating_if_done
+            advance_to_curating_if_done(job.project)
+        except Exception as e:
+            logger.error(
+                'advance_to_curating_if_done falhou após PubMed job %s (projeto %s): %s',
+                job_id, job.project_id, e,
+            )
+
         return {
             'processed': result.records_processed,
             'inserted': result.records_inserted,
@@ -233,6 +244,16 @@ def run_omics_ingestion(self, job_id: str):
             logger.error(
                 'materialize_project_links falhou após omics job %s (projeto %s): %s',
                 job_id, job.project_id if 'job' in dir() else '?', e,
+            )
+
+        # Tenta avançar para curating se não há mais jobs de busca ativos.
+        try:
+            from apps.core.services.project_status import advance_to_curating_if_done
+            advance_to_curating_if_done(job.project)
+        except Exception as e:
+            logger.error(
+                'advance_to_curating_if_done falhou após omics job %s (projeto %s): %s',
+                job_id, job.project_id, e,
             )
 
         return {

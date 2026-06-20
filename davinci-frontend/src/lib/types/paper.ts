@@ -26,3 +26,16 @@ export interface PaperFilters {
   ordering?: string;
   page?: number;
 }
+
+// Payload de bulk_curate por filtro (novo contrato do backend)
+// Envia `filters` em vez de `paper_ids` para excluir todos os papers filtrados de uma vez.
+export interface BulkCurateByFilterInput {
+  filters: PaperFilters;
+  curation_status: string;
+  exclusion_reason?: string;
+}
+
+// Resposta comum de bulk_curate (por IDs ou por filtro)
+export interface BulkCurateResponse {
+  updated: number;
+}

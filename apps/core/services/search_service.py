@@ -3,6 +3,7 @@ from django.db import transaction
 from apps.core.models import DaVinciProject, IngestionJob
 from apps.core.tasks.ingestion_tasks import run_omics_ingestion, run_pubmed_ingestion
 from apps.core.services.query_builder import build_pubmed_query
+from apps.core.services.project_status import start_searching
 
 class SearchService:
     """
@@ -46,6 +47,9 @@ class SearchService:
                 error_message=f'Failed to dispatch Celery task: {exc}',
             )
             raise
+
+        # Transição draft → searching (idempotente).
+        start_searching(project)
 
         return job
 
@@ -97,6 +101,9 @@ class SearchService:
                 error_message=f'Failed to dispatch Celery task: {exc}',
             )
             raise
+
+        # Transição draft → searching (idempotente).
+        start_searching(project)
 
         return job
 

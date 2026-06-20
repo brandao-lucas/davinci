@@ -48,7 +48,9 @@ export function ProjectCard({ project }: { project: DaVinciProject }) {
   const deleteProject = useDeleteProject();
   const updateProject = useUpdateProject(project.id);
 
-  const isDraft = project.status === 'draft';
+  // Edit disponível em draft e searching.
+  // Em searching, o backend reverte para draft e aborta o job ao detectar mudança de campo de busca.
+  const canEdit = project.status === 'draft' || project.status === 'searching';
 
   const { register, handleSubmit, formState: { errors }, reset } = useForm<EditFormData>({
     resolver: zodResolver(editSchema),
@@ -99,13 +101,13 @@ export function ProjectCard({ project }: { project: DaVinciProject }) {
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
-                  {isDraft && (
+                  {canEdit && (
                     <DropdownMenuItem onClick={() => setEditOpen(true)}>
                       <Pencil className="h-4 w-4 mr-2" />
                       Edit
                     </DropdownMenuItem>
                   )}
-                  {isDraft && <DropdownMenuSeparator />}
+                  {canEdit && <DropdownMenuSeparator />}
                   <DropdownMenuItem
                     className="text-destructive focus:text-destructive"
                     onClick={() => setConfirmDelete(true)}

@@ -225,7 +225,7 @@ fn search_and_ingest_pubmed(
         // 7. Link papers to project
         let pmid_list: Vec<i64> = papers.iter().map(|p| p.pmid).collect();
         if let Err(e) =
-            crate::db::copy_writer::link_project_papers(&client, project_id_uuid, &pmid_list).await
+            crate::db::copy_writer::link_project_papers(&client, project_id_uuid, &pmid_list, &job_id).await
         {
             errors.push(format!("link_project_papers: {:?}", e));
         }
@@ -434,7 +434,7 @@ fn search_and_ingest_omics(
         // 5. Link datasets to project (non-fatal)
         let accessions: Vec<String> = all_datasets.iter().map(|d| d.accession.clone()).collect();
         if let Err(e) = crate::db::copy_writer::link_project_datasets(
-            &db_client, project_id_uuid, &accessions,
+            &db_client, project_id_uuid, &accessions, &job_id,
         )
         .await
         {

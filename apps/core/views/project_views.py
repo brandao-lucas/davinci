@@ -16,6 +16,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 
 from apps.core.models import DaVinciProject, ProjectPaper
+from apps.core.services.project_status import revert_to_draft
 from apps.core.serializers.project import (
     DaVinciProjectSerializer,
     JobDispatchResponseSerializer,
@@ -59,6 +60,29 @@ class DaVinciProjectViewSet(viewsets.ModelViewSet):
             total_papers=Count('project_papers', distinct=True),
             total_datasets=Count('project_datasets', distinct=True),
         )
+
+    # Campos de busca que disparam revert_to_draft quando alterados em searching.
+    # Mudanças em title/description/magnitude_snapshot NÃO revertem o status.
+    _SEARCH_FIELDS = frozenset({
+        'query_term', 'query_synonyms', 'date_from', 'date_to',
+        'target_organisms', 'target_tissues', 'selected_mesh',
+        'mesh_default_mode', 'advanced_search_enabled',
+    })
+
+    def perform_update(self, serializer):
+        # Captura valores dos campos de busca ANTES de salvar.
+        instance = serializer.instance
+        was_searching = instance.status == DaVinciProject.PipelineStatus.SEARCHING
+        before = {f: getattr(instance, f) for f in self._SEARCH_FIELDS}
+
+        serializer.save()
+
+        # Após save, compara. Se algum campo de busca mudou E o projeto estava
+        # em searching → reverte para draft e cancela os jobs ativos.
+        if was_searching:
+            after = {f: getattr(instance, f) for f in self._SEARCH_FIELDS}
+            if any(before[f] != after[f] for f in self._SEARCH_FIELDS):
+                revert_to_draft(instance)
 
     def perform_create(self, serializer):
         title = serializer.validated_data.get('title', 'project')

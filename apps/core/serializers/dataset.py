@@ -122,11 +122,65 @@ class ProjectDatasetCurateSerializer(serializers.ModelSerializer):
 
 # ── Serializers de schema para ações customizadas ─────────────────────────────
 
+class DatasetBulkFiltersSerializer(serializers.Serializer):
+    """
+    Filtros opcionais para bulk_curate por filtro (em vez de lista de IDs).
+
+    Corresponde exatamente aos parâmetros aceitos por apply_dataset_filters().
+    """
+    curation_status = serializers.ChoiceField(
+        choices=ProjectDataset.CurationStatus.choices,
+        required=False,
+        help_text="Filtrar por status de curadoria atual.",
+    )
+    omic_type = serializers.CharField(
+        required=False,
+        help_text="Tipo ômico exato (ex: 'transcriptomic', 'genomic').",
+    )
+    organism = serializers.CharField(
+        required=False,
+        help_text="Filtro parcial (icontains) no organismo.",
+    )
+    source_db = serializers.CharField(
+        required=False,
+        help_text="Banco de origem exato (ex: 'geo', 'sra').",
+    )
+    has_summary = serializers.CharField(
+        required=False,
+        help_text="'true' para incluir apenas datasets com summary.",
+    )
+    relevance_min = serializers.FloatField(
+        required=False,
+        help_text="Score de relevância mínimo (0.0–1.0).",
+    )
+    relevance_max = serializers.FloatField(
+        required=False,
+        help_text="Score de relevância máximo (0.0–1.0).",
+    )
+    ingestion_job = serializers.UUIDField(
+        required=False,
+        help_text="UUID do IngestionJob de proveniência.",
+    )
+
+
 class DatasetBulkCurateRequestSerializer(serializers.Serializer):
-    """Body de bulk_curate de datasets."""
+    """
+    Body de bulk_curate de datasets.
+
+    Modos mutuamente exclusivos:
+      - dataset_ids: lista explícita de IDs de ProjectDataset
+      - filters: objeto de filtros (mesmos params da listagem + relevance_min/max + ingestion_job)
+
+    Exatamente um dos dois deve estar presente.
+    """
     dataset_ids = serializers.ListField(
         child=serializers.IntegerField(),
+        required=False,
         help_text="Lista de IDs de ProjectDataset a atualizar.",
+    )
+    filters = DatasetBulkFiltersSerializer(
+        required=False,
+        help_text="Filtros para selecionar datasets (alternativa a dataset_ids).",
     )
     curation_status = serializers.ChoiceField(
         choices=ProjectDataset.CurationStatus.choices,
@@ -138,6 +192,15 @@ class DatasetBulkCurateRequestSerializer(serializers.Serializer):
         allow_blank=True,
         help_text="Motivo de exclusão (usado quando curation_status=excluded).",
     )
+
+    def validate(self, data):
+        has_ids = data.get('dataset_ids') is not None
+        has_filters = data.get('filters') is not None
+        if not has_ids and not has_filters:
+            raise serializers.ValidationError(
+                "Forneça 'dataset_ids' ou 'filters'."
+            )
+        return data
 
 
 class BulkCurateResponseSerializer(serializers.Serializer):

@@ -1,5 +1,5 @@
 import apiClient from './client';
-import type { Paper, PaperDetail, PaperFilters } from '@/lib/types/paper';
+import type { Paper, PaperDetail, PaperFilters, BulkCurateByFilterInput, BulkCurateResponse } from '@/lib/types/paper';
 import type { PaginatedResponse } from '@/lib/types/api';
 
 export const papersApi = {
@@ -25,6 +25,11 @@ export const papersApi = {
     exclusion_reason?: string;
   }) =>
     apiClient.post(`/projects/${projectId}/papers/bulk_curate/`, data),
+
+  // Bulk-curate por filtro: envia `filters` no body em vez de `paper_ids`.
+  // O backend aplica os filtros e retorna { updated: n }.
+  bulkCurateByFilter: (projectId: string, data: BulkCurateByFilterInput) =>
+    apiClient.post<BulkCurateResponse>(`/projects/${projectId}/papers/bulk_curate/`, data),
 
   search: (projectId: string, query: string) =>
     apiClient.get<PaginatedResponse<Paper>>(`/projects/${projectId}/papers/search/`, {

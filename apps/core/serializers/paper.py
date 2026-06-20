@@ -184,16 +184,97 @@ class ProjectPaperCurateSerializer(serializers.ModelSerializer):
 
 # ── Serializers de schema para ações customizadas ─────────────────────────────
 
+class PaperBulkFiltersSerializer(serializers.Serializer):
+    """
+    Filtros opcionais para bulk_curate por filtro (em vez de lista de IDs).
+
+    Corresponde exatamente aos parâmetros aceitos por apply_paper_filters().
+    """
+    curation_status = serializers.ChoiceField(
+        choices=ProjectPaper.CurationStatus.choices,
+        required=False,
+        help_text="Filtrar por status de curadoria atual.",
+    )
+    pub_year_min = serializers.IntegerField(
+        required=False,
+        help_text="Ano de publicação mínimo (inclusive).",
+    )
+    pub_year_max = serializers.IntegerField(
+        required=False,
+        help_text="Ano de publicação máximo (inclusive).",
+    )
+    journal = serializers.CharField(
+        required=False,
+        help_text="Filtro parcial (icontains) no nome do periódico.",
+    )
+    pub_type = serializers.CharField(
+        required=False,
+        help_text="Tipo de publicação exato (ex: 'Review', 'Clinical Trial').",
+    )
+    has_abstract = serializers.CharField(
+        required=False,
+        help_text="'true' para incluir apenas papers com abstract.",
+    )
+    free_full_text = serializers.CharField(
+        required=False,
+        help_text="'true' para incluir apenas papers com PMC ID (full text disponível).",
+    )
+    clinical_category = serializers.CharField(
+        required=False,
+        help_text="Slug de ClinicalCategory.",
+    )
+    relevance_min = serializers.FloatField(
+        required=False,
+        help_text="Score de relevância mínimo (0.0–1.0).",
+    )
+    relevance_max = serializers.FloatField(
+        required=False,
+        help_text="Score de relevância máximo (0.0–1.0).",
+    )
+    ingestion_job = serializers.UUIDField(
+        required=False,
+        help_text="UUID do IngestionJob de proveniência.",
+    )
+
+
 class PaperBulkCurateRequestSerializer(serializers.Serializer):
-    """Body de bulk_curate: atualiza curation_status para múltiplos papers."""
+    """
+    Body de bulk_curate: atualiza curation_status para múltiplos papers.
+
+    Modos mutuamente exclusivos:
+      - paper_ids: lista explícita de IDs de ProjectPaper
+      - filters: objeto de filtros (mesmos params da listagem + relevance_min/max + ingestion_job)
+
+    Exatamente um dos dois deve estar presente.
+    """
     paper_ids = serializers.ListField(
         child=serializers.IntegerField(),
+        required=False,
         help_text="Lista de IDs de ProjectPaper a atualizar.",
+    )
+    filters = PaperBulkFiltersSerializer(
+        required=False,
+        help_text="Filtros para selecionar papers (alternativa a paper_ids).",
     )
     curation_status = serializers.ChoiceField(
         choices=ProjectPaper.CurationStatus.choices,
         help_text="Status de curadoria a aplicar.",
     )
+    exclusion_reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default='',
+        help_text="Motivo de exclusão (recomendado quando curation_status=excluded).",
+    )
+
+    def validate(self, data):
+        has_ids = data.get('paper_ids') is not None
+        has_filters = data.get('filters') is not None
+        if not has_ids and not has_filters:
+            raise serializers.ValidationError(
+                "Forneça 'paper_ids' ou 'filters'."
+            )
+        return data
 
 
 class PaperBulkCurateResponseSerializer(serializers.Serializer):

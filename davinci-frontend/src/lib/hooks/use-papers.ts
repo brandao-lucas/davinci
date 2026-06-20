@@ -2,7 +2,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { papersApi } from '@/lib/api/papers';
 import { extractApiErrorMessage } from '@/lib/utils/api-error';
-import type { PaperFilters, Paper } from '@/lib/types/paper';
+import type { PaperFilters, Paper, BulkCurateByFilterInput } from '@/lib/types/paper';
 import type { PaginatedResponse } from '@/lib/types/api';
 
 export function usePapers(projectId: string, filters?: PaperFilters) {
@@ -114,6 +114,26 @@ export function useCuratePaper(projectId: string) {
     onSettled: () => {
       // Contadores agregados do projeto (leve — não bloqueia UI).
       queryClient.invalidateQueries({ queryKey: ['projects', projectId] });
+    },
+  });
+}
+
+// Hook de bulk-curate por filtro: usa os filtros da listagem atual como critério de seleção.
+// Não faz patch otimista (volume desconhecido); invalida a listagem no onSuccess.
+export function useBulkCurateByFilter(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (data: BulkCurateByFilterInput) =>
+      papersApi.bulkCurateByFilter(projectId, data).then(r => r.data),
+
+    onSuccess: (responseData) => {
+      toast.success(`${responseData.updated} papers atualizados`);
+      queryClient.invalidateQueries({ queryKey: ['papers', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['projects', projectId] });
+    },
+
+    onError: (err) => {
+      toast.error(extractApiErrorMessage(err, 'Falha na curadoria em lote por filtro'));
     },
   });
 }

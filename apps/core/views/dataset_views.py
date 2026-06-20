@@ -17,6 +17,56 @@ from apps.core.models import (
     OmicSample,
     ProjectDataset,
 )
+
+
+def apply_dataset_filters(queryset, params):
+    """
+    Aplica filtros de listagem/bulk a um queryset de ProjectDataset.
+
+    params: dict-like (ex.: request.query_params ou dict explícito do bulk body).
+
+    Filtros disponíveis:
+      curation_status  — valor exato de ProjectDataset.CurationStatus
+      omic_type        — dataset__omic_type exato
+      organism         — dataset__organism__icontains
+      source_db        — dataset__source_db exato
+      has_summary      — 'true' exclui datasets sem summary
+      relevance_min    — relevance_score >= valor
+      relevance_max    — relevance_score <= valor
+      ingestion_job    — ingestion_job_id == valor (proveniência)
+    """
+    curation_status = params.get('curation_status')
+    if curation_status:
+        queryset = queryset.filter(curation_status=curation_status)
+
+    omic_type = params.get('omic_type')
+    if omic_type:
+        queryset = queryset.filter(dataset__omic_type=omic_type)
+
+    organism = params.get('organism')
+    if organism:
+        queryset = queryset.filter(dataset__organism__icontains=organism)
+
+    source_db = params.get('source_db')
+    if source_db:
+        queryset = queryset.filter(dataset__source_db=source_db)
+
+    if params.get('has_summary') == 'true':
+        queryset = queryset.exclude(dataset__summary='')
+
+    relevance_min = params.get('relevance_min')
+    if relevance_min is not None:
+        queryset = queryset.filter(relevance_score__gte=relevance_min)
+
+    relevance_max = params.get('relevance_max')
+    if relevance_max is not None:
+        queryset = queryset.filter(relevance_score__lte=relevance_max)
+
+    ingestion_job = params.get('ingestion_job')
+    if ingestion_job:
+        queryset = queryset.filter(ingestion_job_id=ingestion_job)
+
+    return queryset
 from apps.core.serializers.dataset import (
     ProjectDatasetListSerializer,
     ProjectDatasetDetailSerializer,
@@ -124,24 +174,7 @@ class ProjectDatasetViewSet(
                 'projectpaperdataset_set__project_paper__paper',
             )
 
-        curation_status = self.request.query_params.get('curation_status')
-        if curation_status:
-            qs = qs.filter(curation_status=curation_status)
-
-        omic_type = self.request.query_params.get('omic_type')
-        if omic_type:
-            qs = qs.filter(dataset__omic_type=omic_type)
-
-        organism = self.request.query_params.get('organism')
-        if organism:
-            qs = qs.filter(dataset__organism__icontains=organism)
-
-        source_db = self.request.query_params.get('source_db')
-        if source_db:
-            qs = qs.filter(dataset__source_db=source_db)
-
-        if self.request.query_params.get('has_summary') == 'true':
-            qs = qs.exclude(dataset__summary='')
+        qs = apply_dataset_filters(qs, self.request.query_params)
 
         return qs.order_by('-added_at')
 
@@ -169,10 +202,20 @@ class ProjectDatasetViewSet(
         """
         Bulk-update curation_status for multiple project datasets.
 
-        Body: {"dataset_ids": [int, ...], "curation_status": "included"}
+        Body (por IDs):
+          {"dataset_ids": [int, ...], "curation_status": "excluded",
+           "exclusion_reason": "irrelevante"}
+
+        Body (por filtro):
+          {"filters": {"curation_status": "pending", "omic_type": "transcriptomic", ...},
+           "curation_status": "excluded", "exclusion_reason": "irrelevante"}
+
+        Exatamente um de dataset_ids ou filters deve estar presente.
         """
-        dataset_ids = request.data.get('dataset_ids', [])
+        dataset_ids = request.data.get('dataset_ids')
+        filters = request.data.get('filters')
         new_status = request.data.get('curation_status')
+        exclusion_reason = request.data.get('exclusion_reason', '')
 
         valid_statuses = [s.value for s in ProjectDataset.CurationStatus]
         if new_status not in valid_statuses:
@@ -180,22 +223,50 @@ class ProjectDatasetViewSet(
                 {'detail': f"Invalid status {new_status!r}. Choose from {valid_statuses}."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if not dataset_ids:
-            return Response({'detail': 'dataset_ids is required.'}, status=400)
+
+        if dataset_ids is not None and len(dataset_ids) == 0:
+            return Response(
+                {'detail': 'dataset_ids não pode ser uma lista vazia.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if dataset_ids is None and not filters:
+            return Response(
+                {'detail': 'Forneça dataset_ids ou filters.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         project = self._get_project()
-        exclusion_reason = request.data.get('exclusion_reason', '')
-        updated = ProjectDataset.objects.filter(
-            project=project, id__in=dataset_ids
-        ).update(
-            curation_status=new_status,
-            exclusion_reason=exclusion_reason,
-            curated_at=timezone.now(),
-        )
 
-        # Trigger sob demanda: dispara SAMPLE_FETCH para cada dataset incluído (curation-audit-trail)
+        if dataset_ids is not None:
+            qs = ProjectDataset.objects.filter(project=project, id__in=dataset_ids)
+        else:
+            qs = ProjectDataset.objects.filter(project=project)
+            qs = apply_dataset_filters(qs, filters)
+
+        update_kwargs = {
+            'curation_status': new_status,
+            'curated_at': timezone.now(),
+        }
+        # exclusion_reason: só sobrescreve se enviado explicitamente no body.
+        # bulk de inclusão não apaga motivo anterior (curation-audit-trail).
+        if 'exclusion_reason' in request.data:
+            update_kwargs['exclusion_reason'] = exclusion_reason
+
+        updated = qs.update(**update_kwargs)
+
+        # Trigger sob demanda: dispara SAMPLE_FETCH para cada dataset incluído (curation-audit-trail).
+        # Necessário apenas quando o update é por IDs (filtro por filter não tem lista explícita
+        # de IDs, mas precisamos buscar os datasets incluídos para disparar o sample fetch).
         if new_status == ProjectDataset.CurationStatus.INCLUDED:
-            for pd in ProjectDataset.objects.filter(project=project, id__in=dataset_ids).select_related('dataset'):
+            if dataset_ids is not None:
+                included_qs = ProjectDataset.objects.filter(
+                    project=project, id__in=dataset_ids
+                ).select_related('dataset')
+            else:
+                included_qs = ProjectDataset.objects.filter(project=project)
+                included_qs = apply_dataset_filters(included_qs, filters).select_related('dataset')
+
+            for pd in included_qs:
                 _maybe_dispatch_sample_ingestion(pd)
 
         return Response({'updated': updated})

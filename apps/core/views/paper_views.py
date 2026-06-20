@@ -10,6 +10,72 @@ from rest_framework.response import Response
 from apps.core.models import (
     DaVinciProject, Paper, ProjectPaper, ClinicalCategory, UserCategory,
 )
+
+
+def apply_paper_filters(queryset, params):
+    """
+    Aplica filtros de listagem/bulk a um queryset de ProjectPaper.
+
+    params: dict-like (ex.: request.query_params ou dict explícito do bulk body).
+
+    Filtros disponíveis:
+      curation_status     — valor exato de ProjectPaper.CurationStatus
+      pub_year_min        — paper__pub_year >= valor
+      pub_year_max        — paper__pub_year <= valor
+      journal             — paper__journal__icontains
+      pub_type            — paper__pub_type exato
+      has_abstract        — 'true' exclui papers sem abstract
+      free_full_text      — 'true' exclui papers sem pmc_id
+      clinical_category   — slug de ClinicalCategory
+      relevance_min       — relevance_score >= valor
+      relevance_max       — relevance_score <= valor
+      ingestion_job       — ingestion_job_id == valor (proveniência)
+    """
+    curation_status = params.get('curation_status')
+    if curation_status:
+        queryset = queryset.filter(curation_status=curation_status)
+
+    pub_year_min = params.get('pub_year_min')
+    if pub_year_min:
+        queryset = queryset.filter(paper__pub_year__gte=pub_year_min)
+
+    pub_year_max = params.get('pub_year_max')
+    if pub_year_max:
+        queryset = queryset.filter(paper__pub_year__lte=pub_year_max)
+
+    journal = params.get('journal')
+    if journal:
+        queryset = queryset.filter(paper__journal__icontains=journal)
+
+    pub_type = params.get('pub_type')
+    if pub_type:
+        queryset = queryset.filter(paper__pub_type=pub_type)
+
+    if params.get('has_abstract') == 'true':
+        queryset = queryset.exclude(paper__abstract='')
+
+    if params.get('free_full_text') == 'true':
+        queryset = queryset.exclude(paper__pmc_id='')
+
+    clinical_category = params.get('clinical_category')
+    if clinical_category:
+        queryset = queryset.filter(clinical_categories__slug=clinical_category)
+
+    relevance_min = params.get('relevance_min')
+    if relevance_min is not None:
+        queryset = queryset.filter(relevance_score__gte=relevance_min)
+
+    relevance_max = params.get('relevance_max')
+    if relevance_max is not None:
+        queryset = queryset.filter(relevance_score__lte=relevance_max)
+
+    ingestion_job = params.get('ingestion_job')
+    if ingestion_job:
+        queryset = queryset.filter(ingestion_job_id=ingestion_job)
+
+    return queryset
+
+
 from apps.core.serializers.paper import (
     ProjectPaperListSerializer,
     ProjectPaperDetailSerializer,
@@ -63,36 +129,7 @@ class ProjectPaperViewSet(
                 'projectpaperdataset_set__project_dataset__dataset',
             )
 
-        # Filters
-        curation_status = self.request.query_params.get('curation_status')
-        if curation_status:
-            qs = qs.filter(curation_status=curation_status)
-
-        pub_year_min = self.request.query_params.get('pub_year_min')
-        if pub_year_min:
-            qs = qs.filter(paper__pub_year__gte=pub_year_min)
-
-        pub_year_max = self.request.query_params.get('pub_year_max')
-        if pub_year_max:
-            qs = qs.filter(paper__pub_year__lte=pub_year_max)
-
-        journal = self.request.query_params.get('journal')
-        if journal:
-            qs = qs.filter(paper__journal__icontains=journal)
-
-        pub_type = self.request.query_params.get('pub_type')
-        if pub_type:
-            qs = qs.filter(paper__pub_type=pub_type)
-
-        if self.request.query_params.get('has_abstract') == 'true':
-            qs = qs.exclude(paper__abstract='')
-
-        if self.request.query_params.get('free_full_text') == 'true':
-            qs = qs.exclude(paper__pmc_id='')
-
-        clinical_category = self.request.query_params.get('clinical_category')
-        if clinical_category:
-            qs = qs.filter(clinical_categories__slug=clinical_category)
+        qs = apply_paper_filters(qs, self.request.query_params)
 
         return qs.order_by('-added_at')
 
@@ -190,10 +227,20 @@ class ProjectPaperViewSet(
         """
         Bulk-update curation_status for multiple project papers.
 
-        Body: {"paper_ids": [int, ...], "curation_status": "included"}
+        Body (por IDs):
+          {"paper_ids": [int, ...], "curation_status": "excluded",
+           "exclusion_reason": "fora do escopo"}
+
+        Body (por filtro):
+          {"filters": {"curation_status": "pending", "pub_year_max": 2010, ...},
+           "curation_status": "excluded", "exclusion_reason": "fora do escopo"}
+
+        Exatamente um de paper_ids ou filters deve estar presente.
         """
-        paper_ids = request.data.get('paper_ids', [])
+        paper_ids = request.data.get('paper_ids')
+        filters = request.data.get('filters')
         new_status = request.data.get('curation_status')
+        exclusion_reason = request.data.get('exclusion_reason', '')
 
         valid_statuses = [s.value for s in ProjectPaper.CurationStatus]
         if new_status not in valid_statuses:
@@ -201,14 +248,38 @@ class ProjectPaperViewSet(
                 {'detail': f"Invalid status {new_status!r}. Choose from {valid_statuses}."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if not paper_ids:
-            return Response({'detail': 'paper_ids is required.'}, status=400)
+
+        # paper_ids presente mas vazio → 400 (contrato pré-existente preservado).
+        # paper_ids ausente E filters ausente/vazio → 400.
+        if paper_ids is not None and len(paper_ids) == 0:
+            return Response(
+                {'detail': 'paper_ids não pode ser uma lista vazia.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if paper_ids is None and not filters:
+            return Response(
+                {'detail': 'Forneça paper_ids ou filters.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         project = self._get_project()
-        updated = ProjectPaper.objects.filter(
-            project=project, id__in=paper_ids
-        ).update(curation_status=new_status, curated_at=timezone.now())
 
+        if paper_ids is not None:
+            qs = ProjectPaper.objects.filter(project=project, id__in=paper_ids)
+        else:
+            qs = ProjectPaper.objects.filter(project=project)
+            qs = apply_paper_filters(qs, filters)
+
+        update_kwargs = {
+            'curation_status': new_status,
+            'curated_at': timezone.now(),
+        }
+        # exclusion_reason: só sobrescreve se enviado explicitamente no body.
+        # bulk de inclusão/maybe não apaga motivo anterior (curation-audit-trail).
+        if 'exclusion_reason' in request.data:
+            update_kwargs['exclusion_reason'] = exclusion_reason
+
+        updated = qs.update(**update_kwargs)
         return Response({'updated': updated})
 
     @extend_schema(

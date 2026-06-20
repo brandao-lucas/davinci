@@ -996,6 +996,13 @@ class ProjectPaper(models.Model):
         on_delete=models.CASCADE,
         related_name='in_projects'
     )
+    ingestion_job = models.ForeignKey(
+        'IngestionJob',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='created_papers',
+        help_text='Job de ingestão que criou este vínculo (proveniência da busca)',
+    )
 
     # Curadoria
     curation_status = models.CharField(
@@ -1044,6 +1051,7 @@ class ProjectPaper(models.Model):
         indexes = [
             models.Index(fields=['project', 'curation_status']),
             models.Index(fields=['relevance_score']),
+            models.Index(fields=['project', 'ingestion_job']),
         ]
 
     def __str__(self):
@@ -1109,6 +1117,13 @@ class ProjectDataset(models.Model):
         on_delete=models.CASCADE,
         related_name='in_projects'
     )
+    ingestion_job = models.ForeignKey(
+        'IngestionJob',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='created_datasets',
+        help_text='Job de ingestão que criou este vínculo (proveniência da busca)',
+    )
 
     # Curadoria
     curation_status = models.CharField(
@@ -1128,6 +1143,7 @@ class ProjectDataset(models.Model):
         unique_together = ['project', 'dataset']
         indexes = [
             models.Index(fields=['project', 'curation_status']),
+            models.Index(fields=['project', 'ingestion_job']),
         ]
 
     def __str__(self):

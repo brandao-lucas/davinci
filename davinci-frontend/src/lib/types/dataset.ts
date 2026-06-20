@@ -48,3 +48,16 @@ export interface DatasetFilters {
   ordering?: string;
   page?: number;
 }
+
+// Payload de bulk_curate por filtro (novo contrato do backend)
+// Envia `filters` em vez de `dataset_ids` para excluir todos os datasets filtrados de uma vez.
+export interface BulkCurateDatasetByFilterInput {
+  filters: DatasetFilters;
+  curation_status: string;
+  exclusion_reason?: string;
+}
+
+// Resposta comum de bulk_curate (por IDs ou por filtro)
+export interface BulkCurateResponse {
+  updated: number;
+}

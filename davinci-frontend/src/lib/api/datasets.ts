@@ -6,6 +6,8 @@ import type {
   DownloadDispatchRequest,
   DownloadDispatchResponse,
   PaginatedDatasetFileList,
+  BulkCurateDatasetByFilterInput,
+  BulkCurateResponse,
 } from '@/lib/types/dataset';
 import type { PaginatedResponse } from '@/lib/types/api';
 
@@ -30,6 +32,11 @@ export const datasetsApi = {
     exclusion_reason?: string;
   }) =>
     apiClient.post(`/projects/${projectId}/datasets/bulk_curate/`, data),
+
+  // Bulk-curate por filtro: envia `filters` no body em vez de `dataset_ids`.
+  // O backend aplica os filtros e retorna { updated: n }.
+  bulkCurateByFilter: (projectId: string, data: BulkCurateDatasetByFilterInput) =>
+    apiClient.post<BulkCurateResponse>(`/projects/${projectId}/datasets/bulk_curate/`, data),
 
   search: (projectId: string, query: string) =>
     apiClient.get<PaginatedResponse<OmicDataset>>(`/projects/${projectId}/datasets/search/`, {

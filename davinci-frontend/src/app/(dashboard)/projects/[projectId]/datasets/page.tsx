@@ -208,6 +208,8 @@ function DatasetsPageContent({ projectId }: { projectId: string }) {
         projectId={projectId}
         selectedIds={selectedIds}
         onClear={() => setSelectedIds([])}
+        activeFilters={activeFilters}
+        filteredTotal={data?.count}
       />
     </div>
   );
