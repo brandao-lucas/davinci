@@ -26,14 +26,24 @@ def apply_dataset_filters(queryset, params):
     params: dict-like (ex.: request.query_params ou dict explícito do bulk body).
 
     Filtros disponíveis:
-      curation_status  — valor exato de ProjectDataset.CurationStatus
-      omic_type        — dataset__omic_type exato
-      organism         — dataset__organism__icontains
-      source_db        — dataset__source_db exato
-      has_summary      — 'true' exclui datasets sem summary
-      relevance_min    — relevance_score >= valor
-      relevance_max    — relevance_score <= valor
-      ingestion_job    — ingestion_job_id == valor (proveniência)
+      curation_status    — valor exato de ProjectDataset.CurationStatus
+      omic_type          — dataset__omic_type exato
+      organism           — dataset__organism__icontains
+      source_db          — dataset__source_db exato
+      has_summary        — 'true' exclui datasets sem summary
+      relevance_min      — relevance_score >= valor
+      relevance_max      — relevance_score <= valor
+      ingestion_job      — ingestion_job_id == valor (proveniência)
+      --- Contrato OmnisPathway (campos adicionados em migrations 0017/0018) ---
+      has_control_group  — dataset__has_control_group exato (yes/no/unknown)
+      disease_axis       — dataset__disease_axis exato (monogenic/multifactorial/indeterminate)
+      is_single_cell     — dataset__is_single_cell exato (single_cell/bulk/unknown)
+      data_format        — dataset__data_format exato (raw/processed/unknown)
+      access_type        — dataset__access_type exato (public/controlled/unknown)
+      omics_count_min    — dataset__omics_count >= valor (int)
+      omics_count_max    — dataset__omics_count <= valor (int)
+      omics_layer        — dataset__omics_layers contains [valor] (containment)
+      has_sample_join_key — 'true' → dataset__sample_join_key não vazio
     """
     curation_status = params.get('curation_status')
     if curation_status:
@@ -65,6 +75,50 @@ def apply_dataset_filters(queryset, params):
     ingestion_job = params.get('ingestion_job')
     if ingestion_job:
         queryset = queryset.filter(ingestion_job_id=ingestion_job)
+
+    # ── Filtros do contrato OmnisPathway ──────────────────────────────────────
+
+    has_control_group = params.get('has_control_group')
+    if has_control_group:
+        queryset = queryset.filter(dataset__has_control_group=has_control_group)
+
+    disease_axis = params.get('disease_axis')
+    if disease_axis:
+        queryset = queryset.filter(dataset__disease_axis=disease_axis)
+
+    is_single_cell = params.get('is_single_cell')
+    if is_single_cell:
+        queryset = queryset.filter(dataset__is_single_cell=is_single_cell)
+
+    data_format = params.get('data_format')
+    if data_format:
+        queryset = queryset.filter(dataset__data_format=data_format)
+
+    access_type = params.get('access_type')
+    if access_type:
+        queryset = queryset.filter(dataset__access_type=access_type)
+
+    omics_count_min = params.get('omics_count_min')
+    if omics_count_min is not None:
+        try:
+            queryset = queryset.filter(dataset__omics_count__gte=int(omics_count_min))
+        except (ValueError, TypeError):
+            pass
+
+    omics_count_max = params.get('omics_count_max')
+    if omics_count_max is not None:
+        try:
+            queryset = queryset.filter(dataset__omics_count__lte=int(omics_count_max))
+        except (ValueError, TypeError):
+            pass
+
+    omics_layer = params.get('omics_layer')
+    if omics_layer:
+        queryset = queryset.filter(dataset__omics_layers__contains=[omics_layer])
+
+    has_sample_join_key = params.get('has_sample_join_key')
+    if has_sample_join_key == 'true' or has_sample_join_key is True:
+        queryset = queryset.filter(dataset__sample_join_key__len__gt=0)
 
     return queryset
 from apps.core.serializers.dataset import (

@@ -50,6 +50,7 @@ from django.db import models
 from django.contrib.auth.models import User
 from django.contrib.postgres.search import SearchVectorField
 from django.contrib.postgres.indexes import GinIndex
+from django.contrib.postgres.fields import ArrayField
 
 
 # =============================================================================
@@ -459,6 +460,38 @@ class OmicDataset(models.Model):
         MULTI_OMIC = 'multi_omic', 'Multi-ômica'
         OTHER = 'other', 'Outro'
 
+    # --- Contrato de dados (OmnisPathway) — campos aditivos ---
+    class SingleCell(models.TextChoices):
+        SINGLE_CELL = 'single_cell', 'Single-cell'
+        BULK = 'bulk', 'Bulk'
+        UNKNOWN = 'unknown', 'Desconhecido'
+
+    class ControlGroup(models.TextChoices):
+        YES = 'yes', 'Sim'
+        NO = 'no', 'Não'
+        UNKNOWN = 'unknown', 'Desconhecido'
+
+    class DiseaseAxis(models.TextChoices):
+        MONOGENIC = 'monogenic', 'Monogênica'
+        MULTIFACTORIAL = 'multifactorial', 'Multifatorial'
+        INDETERMINATE = 'indeterminate', 'Indeterminado'
+
+    class DataFormat(models.TextChoices):
+        RAW = 'raw', 'Bruto (raw)'
+        PROCESSED = 'processed', 'Processado'
+        UNKNOWN = 'unknown', 'Desconhecido'
+
+    class AccessType(models.TextChoices):
+        PUBLIC = 'public', 'Público'
+        CONTROLLED = 'controlled', 'Controlado'
+        UNKNOWN = 'unknown', 'Desconhecido'
+
+    # Vocabulário canônico de camadas ômicas (minúsculas, alinhado ao OmicType)
+    OMICS_LAYER_VOCAB = [
+        'genomic', 'transcriptomic', 'proteomic', 'metabolomic',
+        'epigenomic', 'metagenomic', 'microbiome',
+    ]
+
     # Identificação — accession como chave natural
     accession = models.CharField(
         'Accession',
@@ -531,6 +564,63 @@ class OmicDataset(models.Model):
         blank=True
     )
 
+    # --- Contrato de dados (OmnisPathway) — campos aditivos ---
+    # Populados parcialmente por backfill (Fase 0) e refinados nas Fases 2/3.
+    omics_count = models.PositiveSmallIntegerField(
+        'Nº de Camadas Ômicas',
+        null=True,
+        blank=True,
+        help_text='Nº de camadas ômicas distintas. NULL = não avaliado'
+    )
+    omics_layers = ArrayField(
+        models.CharField(max_length=40),
+        default=list,
+        blank=True,
+        help_text='Camadas ômicas normalizadas (genomic, transcriptomic, ...)'
+    )
+    is_single_cell = models.CharField(
+        'Single-cell?',
+        max_length=20,  # folga p/ futuro 'spatial' (P1)
+        choices=SingleCell.choices,
+        default=SingleCell.UNKNOWN
+    )
+    has_control_group = models.CharField(
+        'Tem grupo controle?',
+        max_length=10,
+        choices=ControlGroup.choices,
+        default=ControlGroup.UNKNOWN
+    )
+    disease_axis = models.CharField(
+        'Eixo da Doença',
+        max_length=15,
+        choices=DiseaseAxis.choices,
+        default=DiseaseAxis.INDETERMINATE
+    )
+    data_format = models.CharField(
+        'Formato dos Dados',
+        max_length=15,  # folga (P1)
+        choices=DataFormat.choices,
+        default=DataFormat.UNKNOWN
+    )
+    access_type = models.CharField(
+        'Tipo de Acesso',
+        max_length=20,  # folga p/ futuro 'embargoed' (P1)
+        choices=AccessType.choices,
+        default=AccessType.UNKNOWN
+    )
+    sample_join_key = ArrayField(
+        models.CharField(max_length=255),
+        default=list,
+        blank=True,
+        help_text='Chaves de junção entre datasets (N chaves). [] = ausente'
+    )
+    contract_confidence = models.JSONField(
+        'Confiança do Contrato',
+        default=dict,
+        blank=True,
+        help_text='{eixo: score 0..1}, populado nas Fases 2/3'
+    )
+
     # FTS
     search_vector = SearchVectorField(null=True)
 
@@ -546,6 +636,44 @@ class OmicDataset(models.Model):
             models.Index(fields=['organism']),
             models.Index(fields=['source_db']),
             models.Index(fields=['n_samples']),
+            # --- Contrato de dados (OmnisPathway) ---
+            GinIndex(fields=['omics_layers'], name='omicdataset_layers_gin'),
+            GinIndex(fields=['sample_join_key'], name='omicdataset_join_key_gin'),
+            models.Index(fields=['is_single_cell'], name='omicdataset_single_cell_idx'),
+            models.Index(fields=['has_control_group'], name='omicdataset_control_grp_idx'),
+            models.Index(fields=['disease_axis'], name='omicdataset_disease_axis_idx'),
+            models.Index(fields=['data_format'], name='omicdataset_data_format_idx'),
+            models.Index(fields=['access_type'], name='omicdataset_access_type_idx'),
+            models.Index(fields=['omics_count'], name='omicdataset_omics_count_idx'),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                name='omicdataset_is_single_cell_valid',
+                condition=models.Q(is_single_cell__in=['single_cell', 'bulk', 'unknown']),
+            ),
+            models.CheckConstraint(
+                name='omicdataset_has_control_group_valid',
+                condition=models.Q(has_control_group__in=['yes', 'no', 'unknown']),
+            ),
+            models.CheckConstraint(
+                name='omicdataset_disease_axis_valid',
+                condition=models.Q(disease_axis__in=['monogenic', 'multifactorial', 'indeterminate']),
+            ),
+            models.CheckConstraint(
+                name='omicdataset_data_format_valid',
+                condition=models.Q(data_format__in=['raw', 'processed', 'unknown']),
+            ),
+            models.CheckConstraint(
+                name='omicdataset_access_type_valid',
+                condition=models.Q(access_type__in=['public', 'controlled', 'unknown']),
+            ),
+            models.CheckConstraint(
+                name='omicdataset_omics_layers_valid',
+                condition=models.Q(omics_layers__contained_by=[
+                    'genomic', 'transcriptomic', 'proteomic', 'metabolomic',
+                    'epigenomic', 'metagenomic', 'microbiome',
+                ]),
+            ),
         ]
 
     def __str__(self):

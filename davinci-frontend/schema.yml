@@ -2272,6 +2272,16 @@ paths:
           description: ''
 components:
   schemas:
+    AccessTypeEnum:
+      enum:
+      - public
+      - controlled
+      - unknown
+      type: string
+      description: |-
+        * `public` - Público
+        * `controlled` - Controlado
+        * `unknown` - Desconhecido
     AddDatasetToProjectRequest:
       type: object
       description: |-
@@ -2503,15 +2513,36 @@ components:
         * `curating` - Em Curadoria
         * `analyzing` - Analisando
         * `complete` - Completo
+    DataFormatEnum:
+      enum:
+      - raw
+      - processed
+      - unknown
+      type: string
+      description: |-
+        * `raw` - Bruto (raw)
+        * `processed` - Processado
+        * `unknown` - Desconhecido
     DatasetBulkCurateRequest:
       type: object
-      description: Body de bulk_curate de datasets.
+      description: |-
+        Body de bulk_curate de datasets.
+
+        Modos mutuamente exclusivos:
+          - dataset_ids: lista explícita de IDs de ProjectDataset
+          - filters: objeto de filtros (mesmos params da listagem + relevance_min/max + ingestion_job)
+
+        Exatamente um dos dois deve estar presente.
       properties:
         dataset_ids:
           type: array
           items:
             type: integer
           description: Lista de IDs de ProjectDataset a atualizar.
+        filters:
+          allOf:
+          - $ref: '#/components/schemas/DatasetBulkFilters'
+          description: Filtros para selecionar datasets (alternativa a dataset_ids).
         curation_status:
           allOf:
           - $ref: '#/components/schemas/DatasetCurationStatusEnum'
@@ -2529,7 +2560,105 @@ components:
           description: Motivo de exclusão (usado quando curation_status=excluded).
       required:
       - curation_status
-      - dataset_ids
+    DatasetBulkFilters:
+      type: object
+      description: |-
+        Filtros opcionais para bulk_curate por filtro (em vez de lista de IDs).
+
+        Corresponde exatamente aos parâmetros aceitos por apply_dataset_filters().
+      properties:
+        curation_status:
+          allOf:
+          - $ref: '#/components/schemas/DatasetCurationStatusEnum'
+          description: |-
+            Filtrar por status de curadoria atual.
+
+            * `pending` - Pendente
+            * `included` - Incluído
+            * `excluded` - Excluído
+            * `queued` - Na Fila de Download
+            * `downloaded` - Baixado
+        omic_type:
+          type: string
+          description: 'Tipo ômico exato (ex: ''transcriptomic'', ''genomic'').'
+        organism:
+          type: string
+          description: Filtro parcial (icontains) no organismo.
+        source_db:
+          type: string
+          description: 'Banco de origem exato (ex: ''geo'', ''sra'').'
+        has_summary:
+          type: string
+          description: '''true'' para incluir apenas datasets com summary.'
+        relevance_min:
+          type: number
+          format: double
+          description: Score de relevância mínimo (0.0–1.0).
+        relevance_max:
+          type: number
+          format: double
+          description: Score de relevância máximo (0.0–1.0).
+        ingestion_job:
+          type: string
+          format: uuid
+          description: UUID do IngestionJob de proveniência.
+        has_control_group:
+          allOf:
+          - $ref: '#/components/schemas/HasControlGroupEnum'
+          description: |-
+            Presença de grupo controle (yes/no/unknown).
+
+            * `yes` - Sim
+            * `no` - Não
+            * `unknown` - Desconhecido
+        disease_axis:
+          allOf:
+          - $ref: '#/components/schemas/DiseaseAxisEnum'
+          description: |-
+            Eixo de doença (monogenic/multifactorial/indeterminate).
+
+            * `monogenic` - Monogênica
+            * `multifactorial` - Multifatorial
+            * `indeterminate` - Indeterminado
+        is_single_cell:
+          allOf:
+          - $ref: '#/components/schemas/IsSingleCellEnum'
+          description: |-
+            Tipo de sequenciamento (single_cell/bulk/unknown).
+
+            * `single_cell` - Single-cell
+            * `bulk` - Bulk
+            * `unknown` - Desconhecido
+        data_format:
+          allOf:
+          - $ref: '#/components/schemas/DataFormatEnum'
+          description: |-
+            Formato dos dados (raw/processed/unknown).
+
+            * `raw` - Bruto (raw)
+            * `processed` - Processado
+            * `unknown` - Desconhecido
+        access_type:
+          allOf:
+          - $ref: '#/components/schemas/AccessTypeEnum'
+          description: |-
+            Tipo de acesso (public/controlled/unknown).
+
+            * `public` - Público
+            * `controlled` - Controlado
+            * `unknown` - Desconhecido
+        omics_count_min:
+          type: integer
+          description: Número mínimo de camadas ômicas.
+        omics_count_max:
+          type: integer
+          description: Número máximo de camadas ômicas.
+        omics_layer:
+          type: string
+          description: 'Camada ômica a filtrar por containment (ex: ''transcriptomic'').'
+        has_sample_join_key:
+          type: boolean
+          description: True para retornar apenas datasets com sample_join_key preenchido.
     DatasetCurationStatusEnum:
       enum:
       - pending
@@ -2633,6 +2762,16 @@ components:
         * `downloading` - Baixando
         * `downloaded` - Baixado
         * `failed` - Falhou
+    DiseaseAxisEnum:
+      enum:
+      - monogenic
+      - multifactorial
+      - indeterminate
+      type: string
+      description: |-
+        * `monogenic` - Monogênica
+        * `multifactorial` - Multifatorial
+        * `indeterminate` - Indeterminado
     DownloadDispatchRequest:
       type: object
       description: |-
@@ -2899,6 +3038,16 @@ components:
       required:
       - sentence
       - sentence_position
+    HasControlGroupEnum:
+      enum:
+      - 'yes'
+      - 'no'
+      - unknown
+      type: string
+      description: |-
+        * `yes` - Sim
+        * `no` - Não
+        * `unknown` - Desconhecido
     IngestionJob:
       type: object
       properties:
@@ -2969,6 +3118,16 @@ components:
         * `completed` - Completo
         * `failed` - Falhou
         * `cancelled` - Cancelado
+    IsSingleCellEnum:
+      enum:
+      - single_cell
+      - bulk
+      - unknown
+      type: string
+      description: |-
+        * `single_cell` - Single-cell
+        * `bulk` - Bulk
+        * `unknown` - Desconhecido
     JobCancelError:
       type: object
       description: Resposta de erro quando o job já está em estado terminal.
@@ -3323,6 +3482,48 @@ components:
           type: string
           format: date-time
           readOnly: true
+        omics_count:
+          type: integer
+          maximum: 32767
+          minimum: 0
+          nullable: true
+          title: Nº de Camadas Ômicas
+          description: Nº de camadas ômicas distintas. NULL = não avaliado
+        omics_layers:
+          type: array
+          items:
+            type: string
+            maxLength: 40
+          description: Camadas ômicas normalizadas (genomic, transcriptomic, ...)
+        is_single_cell:
+          allOf:
+          - $ref: '#/components/schemas/IsSingleCellEnum'
+          title: Single-cell?
+        has_control_group:
+          allOf:
+          - $ref: '#/components/schemas/HasControlGroupEnum'
+          title: Tem grupo controle?
+        disease_axis:
+          allOf:
+          - $ref: '#/components/schemas/DiseaseAxisEnum'
+          title: Eixo da Doença
+        data_format:
+          allOf:
+          - $ref: '#/components/schemas/DataFormatEnum'
+          title: Formato dos Dados
+        access_type:
+          allOf:
+          - $ref: '#/components/schemas/AccessTypeEnum'
+          title: Tipo de Acesso
+        sample_join_key:
+          type: array
+          items:
+            type: string
+            maxLength: 255
+          description: Chaves de junção entre datasets (N chaves). [] = ausente
+        contract_confidence:
+          title: Confiança do Contrato
+          description: '{eixo: score 0..1}, populado nas Fases 2/3'
       required:
       - accession
       - extra_metadata
@@ -3888,13 +4089,24 @@ components:
       - position
     PaperBulkCurateRequest:
       type: object
-      description: 'Body de bulk_curate: atualiza curation_status para múltiplos papers.'
+      description: |-
+        Body de bulk_curate: atualiza curation_status para múltiplos papers.
+
+        Modos mutuamente exclusivos:
+          - paper_ids: lista explícita de IDs de ProjectPaper
+          - filters: objeto de filtros (mesmos params da listagem + relevance_min/max + ingestion_job)
+
+        Exatamente um dos dois deve estar presente.
       properties:
         paper_ids:
           type: array
           items:
             type: integer
           description: Lista de IDs de ProjectPaper a atualizar.
+        filters:
+          allOf:
+          - $ref: '#/components/schemas/PaperBulkFilters'
+          description: Filtros para selecionar papers (alternativa a paper_ids).
         curation_status:
           allOf:
           - $ref: '#/components/schemas/CurationStatusEnum'
@@ -3905,9 +4117,12 @@ components:
             * `included` - Incluído
             * `excluded` - Excluído
             * `maybe` - Talvez
+        exclusion_reason:
+          type: string
+          default: ''
+          description: Motivo de exclusão (recomendado quando curation_status=excluded).
       required:
       - curation_status
-      - paper_ids
     PaperBulkCurateResponse:
       type: object
       description: 'Resposta de bulk_curate: quantidade de registros atualizados.'
@@ -3916,6 +4131,57 @@ components:
           type: integer
       required:
       - updated
+    PaperBulkFilters:
+      type: object
+      description: |-
+        Filtros opcionais para bulk_curate por filtro (em vez de lista de IDs).
+
+        Corresponde exatamente aos parâmetros aceitos por apply_paper_filters().
+      properties:
+        curation_status:
+          allOf:
+          - $ref: '#/components/schemas/CurationStatusEnum'
+          description: |-
+            Filtrar por status de curadoria atual.
+
+            * `pending` - Pendente
+            * `included` - Incluído
+            * `excluded` - Excluído
+            * `maybe` - Talvez
+        pub_year_min:
+          type: integer
+          description: Ano de publicação mínimo (inclusive).
+        pub_year_max:
+          type: integer
+          description: Ano de publicação máximo (inclusive).
+        journal:
+          type: string
+          description: Filtro parcial (icontains) no nome do periódico.
+        pub_type:
+          type: string
+          description: 'Tipo de publicação exato (ex: ''Review'', ''Clinical Trial'').'
+        has_abstract:
+          type: string
+          description: '''true'' para incluir apenas papers com abstract.'
+        free_full_text:
+          type: string
+          description: '''true'' para incluir apenas papers com PMC ID (full text
+            disponível).'
+        clinical_category:
+          type: string
+          description: Slug de ClinicalCategory.
+        relevance_min:
+          type: number
+          format: double
+          description: Score de relevância mínimo (0.0–1.0).
+        relevance_max:
+          type: number
+          format: double
+          description: Score de relevância máximo (0.0–1.0).
+        ingestion_job:
+          type: string
+          format: uuid
+          description: UUID do IngestionJob de proveniência.
     PaperCategorizeRequest:
       type: object
       description: 'Body de categorize: adiciona/remove categorias clínicas e de usuário.'
@@ -4404,15 +4670,46 @@ components:
           type: string
           format: date-time
           nullable: true
+        has_control_group:
+          type: string
+          readOnly: true
+        disease_axis:
+          type: string
+          readOnly: true
+        omics_count:
+          type: integer
+          readOnly: true
+          nullable: true
+        is_single_cell:
+          type: string
+          readOnly: true
+        access_type:
+          type: string
+          readOnly: true
+        data_format:
+          type: string
+          readOnly: true
+        omics_layers:
+          type: array
+          items:
+            type: string
+          readOnly: true
       required:
+      - access_type
       - accession
       - added_at
       - bioproject_id
+      - data_format
+      - disease_axis
       - extra_metadata
+      - has_control_group
       - id
+      - is_single_cell
       - n_samples
       - omic_subcategory
       - omic_type
+      - omics_count
+      - omics_layers
       - organism
       - platform
       - source_db

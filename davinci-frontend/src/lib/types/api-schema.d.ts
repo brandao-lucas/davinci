@@ -1075,6 +1075,13 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
+         * @description * `public` - Público
+         *     * `controlled` - Controlado
+         *     * `unknown` - Desconhecido
+         * @enum {string}
+         */
+        AccessTypeEnum: "public" | "controlled" | "unknown";
+        /**
          * @description Request body para POST /projects/{project_pk}/datasets/add_from_suggestion/.
          *
          *     O campo `dataset_id` identifica o OmicDataset global a ser vinculado.
@@ -1203,10 +1210,27 @@ export interface components {
          * @enum {string}
          */
         DaVinciProjectStatusEnum: "draft" | "searching" | "curating" | "analyzing" | "complete";
-        /** @description Body de bulk_curate de datasets. */
+        /**
+         * @description * `raw` - Bruto (raw)
+         *     * `processed` - Processado
+         *     * `unknown` - Desconhecido
+         * @enum {string}
+         */
+        DataFormatEnum: "raw" | "processed" | "unknown";
+        /**
+         * @description Body de bulk_curate de datasets.
+         *
+         *     Modos mutuamente exclusivos:
+         *       - dataset_ids: lista explícita de IDs de ProjectDataset
+         *       - filters: objeto de filtros (mesmos params da listagem + relevance_min/max + ingestion_job)
+         *
+         *     Exatamente um dos dois deve estar presente.
+         */
         DatasetBulkCurateRequest: {
             /** @description Lista de IDs de ProjectDataset a atualizar. */
-            dataset_ids: number[];
+            dataset_ids?: number[];
+            /** @description Filtros para selecionar datasets (alternativa a dataset_ids). */
+            filters?: components["schemas"]["DatasetBulkFilters"];
             /**
              * @description Status de curadoria a aplicar.
              *
@@ -1222,6 +1246,94 @@ export interface components {
              * @default
              */
             exclusion_reason: string;
+        };
+        /**
+         * @description Filtros opcionais para bulk_curate por filtro (em vez de lista de IDs).
+         *
+         *     Corresponde exatamente aos parâmetros aceitos por apply_dataset_filters().
+         */
+        DatasetBulkFilters: {
+            /**
+             * @description Filtrar por status de curadoria atual.
+             *
+             *     * `pending` - Pendente
+             *     * `included` - Incluído
+             *     * `excluded` - Excluído
+             *     * `queued` - Na Fila de Download
+             *     * `downloaded` - Baixado
+             */
+            curation_status?: components["schemas"]["DatasetCurationStatusEnum"];
+            /** @description Tipo ômico exato (ex: 'transcriptomic', 'genomic'). */
+            omic_type?: string;
+            /** @description Filtro parcial (icontains) no organismo. */
+            organism?: string;
+            /** @description Banco de origem exato (ex: 'geo', 'sra'). */
+            source_db?: string;
+            /** @description 'true' para incluir apenas datasets com summary. */
+            has_summary?: string;
+            /**
+             * Format: double
+             * @description Score de relevância mínimo (0.0–1.0).
+             */
+            relevance_min?: number;
+            /**
+             * Format: double
+             * @description Score de relevância máximo (0.0–1.0).
+             */
+            relevance_max?: number;
+            /**
+             * Format: uuid
+             * @description UUID do IngestionJob de proveniência.
+             */
+            ingestion_job?: string;
+            /**
+             * @description Presença de grupo controle (yes/no/unknown).
+             *
+             *     * `yes` - Sim
+             *     * `no` - Não
+             *     * `unknown` - Desconhecido
+             */
+            has_control_group?: components["schemas"]["HasControlGroupEnum"];
+            /**
+             * @description Eixo de doença (monogenic/multifactorial/indeterminate).
+             *
+             *     * `monogenic` - Monogênica
+             *     * `multifactorial` - Multifatorial
+             *     * `indeterminate` - Indeterminado
+             */
+            disease_axis?: components["schemas"]["DiseaseAxisEnum"];
+            /**
+             * @description Tipo de sequenciamento (single_cell/bulk/unknown).
+             *
+             *     * `single_cell` - Single-cell
+             *     * `bulk` - Bulk
+             *     * `unknown` - Desconhecido
+             */
+            is_single_cell?: components["schemas"]["IsSingleCellEnum"];
+            /**
+             * @description Formato dos dados (raw/processed/unknown).
+             *
+             *     * `raw` - Bruto (raw)
+             *     * `processed` - Processado
+             *     * `unknown` - Desconhecido
+             */
+            data_format?: components["schemas"]["DataFormatEnum"];
+            /**
+             * @description Tipo de acesso (public/controlled/unknown).
+             *
+             *     * `public` - Público
+             *     * `controlled` - Controlado
+             *     * `unknown` - Desconhecido
+             */
+            access_type?: components["schemas"]["AccessTypeEnum"];
+            /** @description Número mínimo de camadas ômicas. */
+            omics_count_min?: number;
+            /** @description Número máximo de camadas ômicas. */
+            omics_count_max?: number;
+            /** @description Camada ômica a filtrar por containment (ex: 'transcriptomic'). */
+            omics_layer?: string;
+            /** @description True para retornar apenas datasets com sample_join_key preenchido. */
+            has_sample_join_key?: boolean;
         };
         /**
          * @description * `pending` - Pendente
@@ -1279,6 +1391,13 @@ export interface components {
          * @enum {string}
          */
         DatasetFileDownloadStatusEnum: "pending" | "queued" | "downloading" | "downloaded" | "failed";
+        /**
+         * @description * `monogenic` - Monogênica
+         *     * `multifactorial` - Multifatorial
+         *     * `indeterminate` - Indeterminado
+         * @enum {string}
+         */
+        DiseaseAxisEnum: "monogenic" | "multifactorial" | "indeterminate";
         /**
          * @description Body do POST .../download/.
          *
@@ -1423,6 +1542,13 @@ export interface components {
             /** @description Índice 0-based da sentença no abstract. */
             sentence_position: number;
         };
+        /**
+         * @description * `yes` - Sim
+         *     * `no` - Não
+         *     * `unknown` - Desconhecido
+         * @enum {string}
+         */
+        HasControlGroupEnum: "yes" | "no" | "unknown";
         IngestionJob: {
             /** Format: uuid */
             readonly id: string;
@@ -1450,6 +1576,13 @@ export interface components {
          * @enum {string}
          */
         IngestionJobStatusEnum: "pending" | "running" | "completed" | "failed" | "cancelled";
+        /**
+         * @description * `single_cell` - Single-cell
+         *     * `bulk` - Bulk
+         *     * `unknown` - Desconhecido
+         * @enum {string}
+         */
+        IsSingleCellEnum: "single_cell" | "bulk" | "unknown";
         /** @description Resposta de erro quando o job já está em estado terminal. */
         JobCancelError: {
             detail: string;
@@ -1619,6 +1752,30 @@ export interface components {
             is_active?: boolean;
             /** Format: date-time */
             readonly ingested_at: string;
+            /**
+             * Nº de Camadas Ômicas
+             * @description Nº de camadas ômicas distintas. NULL = não avaliado
+             */
+            omics_count?: number | null;
+            /** @description Camadas ômicas normalizadas (genomic, transcriptomic, ...) */
+            omics_layers?: string[];
+            /** Single-cell? */
+            is_single_cell?: components["schemas"]["IsSingleCellEnum"];
+            /** Tem grupo controle? */
+            has_control_group?: components["schemas"]["HasControlGroupEnum"];
+            /** Eixo da Doença */
+            disease_axis?: components["schemas"]["DiseaseAxisEnum"];
+            /** Formato dos Dados */
+            data_format?: components["schemas"]["DataFormatEnum"];
+            /** Tipo de Acesso */
+            access_type?: components["schemas"]["AccessTypeEnum"];
+            /** @description Chaves de junção entre datasets (N chaves). [] = ausente */
+            sample_join_key?: string[];
+            /**
+             * Confiança do Contrato
+             * @description {eixo: score 0..1}, populado nas Fases 2/3
+             */
+            contract_confidence?: unknown;
         };
         /** @description Serializer read-only do dado compartilhado OmicSample. */
         OmicSample: {
@@ -1970,10 +2127,20 @@ export interface components {
              */
             country?: string;
         };
-        /** @description Body de bulk_curate: atualiza curation_status para múltiplos papers. */
+        /**
+         * @description Body de bulk_curate: atualiza curation_status para múltiplos papers.
+         *
+         *     Modos mutuamente exclusivos:
+         *       - paper_ids: lista explícita de IDs de ProjectPaper
+         *       - filters: objeto de filtros (mesmos params da listagem + relevance_min/max + ingestion_job)
+         *
+         *     Exatamente um dos dois deve estar presente.
+         */
         PaperBulkCurateRequest: {
             /** @description Lista de IDs de ProjectPaper a atualizar. */
-            paper_ids: number[];
+            paper_ids?: number[];
+            /** @description Filtros para selecionar papers (alternativa a paper_ids). */
+            filters?: components["schemas"]["PaperBulkFilters"];
             /**
              * @description Status de curadoria a aplicar.
              *
@@ -1983,10 +2150,60 @@ export interface components {
              *     * `maybe` - Talvez
              */
             curation_status: components["schemas"]["CurationStatusEnum"];
+            /**
+             * @description Motivo de exclusão (recomendado quando curation_status=excluded).
+             * @default
+             */
+            exclusion_reason: string;
         };
         /** @description Resposta de bulk_curate: quantidade de registros atualizados. */
         PaperBulkCurateResponse: {
             updated: number;
+        };
+        /**
+         * @description Filtros opcionais para bulk_curate por filtro (em vez de lista de IDs).
+         *
+         *     Corresponde exatamente aos parâmetros aceitos por apply_paper_filters().
+         */
+        PaperBulkFilters: {
+            /**
+             * @description Filtrar por status de curadoria atual.
+             *
+             *     * `pending` - Pendente
+             *     * `included` - Incluído
+             *     * `excluded` - Excluído
+             *     * `maybe` - Talvez
+             */
+            curation_status?: components["schemas"]["CurationStatusEnum"];
+            /** @description Ano de publicação mínimo (inclusive). */
+            pub_year_min?: number;
+            /** @description Ano de publicação máximo (inclusive). */
+            pub_year_max?: number;
+            /** @description Filtro parcial (icontains) no nome do periódico. */
+            journal?: string;
+            /** @description Tipo de publicação exato (ex: 'Review', 'Clinical Trial'). */
+            pub_type?: string;
+            /** @description 'true' para incluir apenas papers com abstract. */
+            has_abstract?: string;
+            /** @description 'true' para incluir apenas papers com PMC ID (full text disponível). */
+            free_full_text?: string;
+            /** @description Slug de ClinicalCategory. */
+            clinical_category?: string;
+            /**
+             * Format: double
+             * @description Score de relevância mínimo (0.0–1.0).
+             */
+            relevance_min?: number;
+            /**
+             * Format: double
+             * @description Score de relevância máximo (0.0–1.0).
+             */
+            relevance_max?: number;
+            /**
+             * Format: uuid
+             * @description UUID do IngestionJob de proveniência.
+             */
+            ingestion_job?: string;
         };
         /** @description Body de categorize: adiciona/remove categorias clínicas e de usuário. */
         PaperCategorizeRequest: {
@@ -2217,6 +2434,13 @@ export interface components {
             readonly added_at: string;
             /** Format: date-time */
             curated_at?: string | null;
+            readonly has_control_group: string;
+            readonly disease_axis: string;
+            readonly omics_count: number | null;
+            readonly is_single_cell: string;
+            readonly access_type: string;
+            readonly data_format: string;
+            readonly omics_layers: string[];
         };
         /**
          * @description Detalhe de um medicamento no projeto: métricas agregadas + referências com snippets.

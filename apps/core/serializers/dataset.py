@@ -18,6 +18,10 @@ class OmicDatasetSerializer(serializers.ModelSerializer):
             'title', 'summary', 'omic_type', 'omic_subcategory',
             'organism', 'tax_id', 'n_samples', 'platform',
             'extra_metadata', 'is_active', 'ingested_at',
+            # Contrato de dados OmnisPathway (migrations 0017/0018)
+            'omics_count', 'omics_layers', 'is_single_cell', 'has_control_group',
+            'disease_axis', 'data_format', 'access_type', 'sample_join_key',
+            'contract_confidence',
         ]
 
 
@@ -40,6 +44,19 @@ class ProjectDatasetListSerializer(serializers.ModelSerializer):
 
     extra_metadata = serializers.SerializerMethodField()
 
+    # Eixos do contrato OmnisPathway — usados pela UI de curadoria
+    has_control_group = serializers.CharField(source='dataset.has_control_group', read_only=True)
+    disease_axis = serializers.CharField(source='dataset.disease_axis', read_only=True)
+    omics_count = serializers.IntegerField(source='dataset.omics_count', read_only=True, allow_null=True)
+    is_single_cell = serializers.CharField(source='dataset.is_single_cell', read_only=True)
+    access_type = serializers.CharField(source='dataset.access_type', read_only=True)
+    data_format = serializers.CharField(source='dataset.data_format', read_only=True)
+    omics_layers = serializers.ListField(
+        child=serializers.CharField(),
+        source='dataset.omics_layers',
+        read_only=True,
+    )
+
     class Meta:
         model = ProjectDataset
         fields = [
@@ -48,6 +65,9 @@ class ProjectDatasetListSerializer(serializers.ModelSerializer):
             'extra_metadata',
             'curation_status', 'exclusion_reason', 'notes',
             'relevance_score', 'added_at', 'curated_at',
+            # Eixos OmnisPathway para UI de curadoria
+            'has_control_group', 'disease_axis', 'omics_count',
+            'is_single_cell', 'access_type', 'data_format', 'omics_layers',
         ]
 
 
@@ -160,6 +180,48 @@ class DatasetBulkFiltersSerializer(serializers.Serializer):
     ingestion_job = serializers.UUIDField(
         required=False,
         help_text="UUID do IngestionJob de proveniência.",
+    )
+    # ── Filtros do contrato OmnisPathway ──────────────────────────────────────
+    has_control_group = serializers.ChoiceField(
+        choices=OmicDataset.ControlGroup.choices,
+        required=False,
+        help_text="Presença de grupo controle (yes/no/unknown).",
+    )
+    disease_axis = serializers.ChoiceField(
+        choices=OmicDataset.DiseaseAxis.choices,
+        required=False,
+        help_text="Eixo de doença (monogenic/multifactorial/indeterminate).",
+    )
+    is_single_cell = serializers.ChoiceField(
+        choices=OmicDataset.SingleCell.choices,
+        required=False,
+        help_text="Tipo de sequenciamento (single_cell/bulk/unknown).",
+    )
+    data_format = serializers.ChoiceField(
+        choices=OmicDataset.DataFormat.choices,
+        required=False,
+        help_text="Formato dos dados (raw/processed/unknown).",
+    )
+    access_type = serializers.ChoiceField(
+        choices=OmicDataset.AccessType.choices,
+        required=False,
+        help_text="Tipo de acesso (public/controlled/unknown).",
+    )
+    omics_count_min = serializers.IntegerField(
+        required=False,
+        help_text="Número mínimo de camadas ômicas.",
+    )
+    omics_count_max = serializers.IntegerField(
+        required=False,
+        help_text="Número máximo de camadas ômicas.",
+    )
+    omics_layer = serializers.CharField(
+        required=False,
+        help_text="Camada ômica a filtrar por containment (ex: 'transcriptomic').",
+    )
+    has_sample_join_key = serializers.BooleanField(
+        required=False,
+        help_text="True para retornar apenas datasets com sample_join_key preenchido.",
     )
 
 
