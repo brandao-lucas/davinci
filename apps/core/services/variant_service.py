@@ -28,6 +28,7 @@ from django.db.models import Count, Sum, Q
 from apps.core.models import (
     DaVinciProject, Paper, PaperVariant, ProjectPaper, EntityContext,
 )
+from apps.core.services.text_utils import split_sentences
 
 logger = logging.getLogger(__name__)
 
@@ -46,15 +47,10 @@ RS_NUMBER_MAX_LEN = 32
 _SENTINEL_POSITION = -1
 _SENTINEL_SENTENCE = ''
 
-# Regex de fronteira de sentença (MVP ingênuo — igual ao GeneService).
-_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
-
-
-def _split_sentences(text: str) -> list[str]:
-    """Divide abstract em sentenças. MVP: split em pontuação + espaço."""
-    if not text:
-        return []
-    return [s.strip() for s in _SENTENCE_SPLIT_RE.split(text.strip()) if s.strip()]
+# Segmentação de sentenças delegada ao util compartilhado (text_utils).
+# Cobre abreviações biomédicas, decimais, siglas e múltiplos terminadores.
+# Ver apps/core/services/text_utils.py para abordagem e limites documentados.
+_split_sentences = split_sentences
 
 
 def _variant_sentence_re(rs_number: str) -> re.Pattern:

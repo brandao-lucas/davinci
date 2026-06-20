@@ -25,6 +25,7 @@ from django.db.models import Count, Sum, Max, Q
 from apps.core.models import (
     DaVinciProject, Paper, PaperGene, ProjectPaper, EntityContext,
 )
+from apps.core.services.text_utils import split_sentences
 
 logger = logging.getLogger(__name__)
 
@@ -43,22 +44,10 @@ GENE_SYMBOL_MAX_LEN = 64
 _SENTINEL_POSITION = -1
 _SENTINEL_SENTENCE = ''
 
-# ---------------------------------------------------------------------------
-# Regex de fronteira de sentença (MVP ingênuo).
-#
-# LIMITAÇÃO CONHECIDA: o split em ". " falha em abreviações como "e.g.",
-# "i.e.", "vs.", "Fig.", siglas com pontos, etc. Isso é aceitável no MVP
-# (Passo 4 do plano 2026-06-19-pagina-genes-projeto.md). Para NLP robusto
-# usar handoff ferris com rust_src/ tokenizer.
-# ---------------------------------------------------------------------------
-_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
-
-
-def _split_sentences(text: str) -> list[str]:
-    """Divide abstract em sentenças. MVP: split em pontuação + espaço."""
-    if not text:
-        return []
-    return [s.strip() for s in _SENTENCE_SPLIT_RE.split(text.strip()) if s.strip()]
+# Segmentação de sentenças delegada ao util compartilhado (text_utils).
+# Cobre abreviações biomédicas, decimais, siglas e múltiplos terminadores.
+# Ver apps/core/services/text_utils.py para abordagem e limites documentados.
+_split_sentences = split_sentences
 
 
 def _gene_sentence_re(gene_symbol: str) -> re.Pattern:
