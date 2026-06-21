@@ -15,6 +15,7 @@ import {
   Download,
   Settings,
   Dna,
+  ClipboardCheck,
 } from 'lucide-react';
 
 interface NavItem {
@@ -36,6 +37,7 @@ const projectNavItems: NavItem[] = [
   { label: 'Links', href: '/links', icon: Link2, projectScoped: true },
   { label: 'Analysis', href: '/analysis', icon: BarChart2, projectScoped: true },
   { label: 'Variantes', href: '/variants', icon: Dna, projectScoped: true },
+  { label: 'Curadoria', href: '/curation-queue', icon: ClipboardCheck, projectScoped: true },
   { label: 'Jobs', href: '/jobs', icon: Briefcase, projectScoped: true },
   { label: 'Export', href: '/export', icon: Download, projectScoped: true },
 ];

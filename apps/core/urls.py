@@ -12,6 +12,7 @@ from .views.gene_views import ProjectGeneViewSet
 from .views.mesh_views import ProjectMeSHViewSet
 from .views.drug_views import ProjectDrugViewSet
 from .views.variant_views import ProjectVariantViewSet
+from .views.curation_queue_views import CurationQueueViewSet
 
 router = DefaultRouter()
 router.register(r'projects', DaVinciProjectViewSet, basename='project')
@@ -68,6 +69,9 @@ drug_detail = ProjectDrugViewSet.as_view({'get': 'drug_detail'})
 
 variant_list = ProjectVariantViewSet.as_view({'get': 'list'})
 variant_detail = ProjectVariantViewSet.as_view({'get': 'variant_detail'})
+
+curation_queue_list = CurationQueueViewSet.as_view({'get': 'list'})
+curation_queue_resolve = CurationQueueViewSet.as_view({'post': 'resolve'})
 
 PROJECT_PREFIX = r'projects/<uuid:project_pk>/'
 
@@ -139,4 +143,9 @@ urlpatterns = [
     # Variants — lista agregada e detalhe por rs_number
     path(f'{PROJECT_PREFIX}variants/', variant_list, name='project-variant-list'),
     path(f'{PROJECT_PREFIX}variants/<str:rs_number>/', variant_detail, name='project-variant-detail'),
+
+    # Fila de curadoria manual (Fase 2 — OmnisPathway)
+    # resolve/ deve vir antes de <int:pk>/ para não ser capturado como pk
+    path(f'{PROJECT_PREFIX}curation-queue/', curation_queue_list, name='project-curation-queue-list'),
+    path(f'{PROJECT_PREFIX}curation-queue/<int:pk>/resolve/', curation_queue_resolve, name='project-curation-queue-resolve'),
 ]
