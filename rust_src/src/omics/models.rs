@@ -23,6 +23,17 @@ pub struct OmicSampleData {
 /// Mirrors the core_omicdataset columns written via COPY.
 /// `id`, `search_vector`, `ingested_at`, `updated_at` are omitted —
 /// Postgres fills them via DEFAULT and the FTS trigger.
+///
+/// Campos do contrato OmnisPathway (Fase 1):
+/// - `omics_layers`: camadas ômicas normalizadas (ex: vec!["proteomic"]).
+///   Serializado no CSV como literal Postgres array: `{proteomic}`.
+/// - `omics_count`: número de camadas distintas (1 para conectores mono-ômicos).
+/// - `data_format`: 'raw' | 'processed' | 'unknown'.
+/// - `access_type`: 'public' | 'controlled' | 'unknown'.
+///
+/// Conectores existentes (geo, sra, bioproject, gwas) usam os defaults:
+/// `omics_layers = vec![]`, `omics_count = None`, `data_format = "unknown"`,
+/// `access_type = "unknown"` — que o COALESCE/NULLIF no ON CONFLICT preserva.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OmicDatasetData {
     pub accession: String,         // GSE…, SRP…, PRJNA…, GCST…
@@ -38,6 +49,15 @@ pub struct OmicDatasetData {
     pub platform: String,
     pub extra_metadata: JsonValue, // serialized to JSONB
     pub is_active: bool,           // always true on ingest
+    // --- Contrato OmnisPathway (adicionados na Fase 1) ---
+    /// Camadas ômicas (ex: vec!["proteomic"]). Vazio = não avaliado por este conector.
+    pub omics_layers: Vec<String>,
+    /// Nº de camadas. None = não avaliado por este conector.
+    pub omics_count: Option<i32>,
+    /// 'raw' | 'processed' | 'unknown'
+    pub data_format: String,
+    /// 'public' | 'controlled' | 'unknown'
+    pub access_type: String,
 }
 
 /// Mirrors core_datasetpaperlink.

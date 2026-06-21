@@ -1458,6 +1458,7 @@ class IngestionJob(models.Model):
         GEO_SEARCH = 'geo_search', 'Busca GEO'
         SRA_SEARCH = 'sra_search', 'Busca SRA'
         GWAS_SEARCH = 'gwas_search', 'Busca GWAS Catalog'
+        PRIDE_SEARCH = 'pride_search', 'Busca PRIDE'
         SAMPLE_FETCH = 'sample_fetch', 'Fetch de Amostras'
         VARIANT_ANNOTATION = 'variant_annotation', 'Anotação de Variantes'
         GENE_NER = 'gene_ner', 'Extração de Genes'

@@ -25,6 +25,7 @@ SEARCH_JOB_TYPES = (
     IngestionJob.JobType.GEO_SEARCH,
     IngestionJob.JobType.SRA_SEARCH,
     IngestionJob.JobType.GWAS_SEARCH,
+    IngestionJob.JobType.PRIDE_SEARCH,
 )
 
 

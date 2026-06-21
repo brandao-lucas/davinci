@@ -61,6 +61,33 @@ pub async fn copy_omic_datasets(
                         obj_e.insert(k.clone(), v.clone());
                     }
                 }
+
+                // Merge omics_layers (union, deduplicated)
+                let mut layers: HashSet<String> = existing.omics_layers.iter().cloned().collect();
+                for l in &d.omics_layers {
+                    layers.insert(l.clone());
+                }
+                let mut layers_vec: Vec<String> = layers.into_iter().collect();
+                layers_vec.sort();
+                existing.omics_layers = layers_vec;
+
+                // omics_count: prefer the larger value (or any non-None)
+                if d.omics_count.is_some()
+                    && (existing.omics_count.is_none()
+                        || d.omics_count > existing.omics_count)
+                {
+                    existing.omics_count = d.omics_count;
+                }
+
+                // data_format: prefer non-"unknown"
+                if existing.data_format == "unknown" && d.data_format != "unknown" {
+                    existing.data_format = d.data_format.clone();
+                }
+
+                // access_type: prefer non-"unknown"
+                if existing.access_type == "unknown" && d.access_type != "unknown" {
+                    existing.access_type = d.access_type.clone();
+                }
             })
             .or_insert(d.clone());
     }
@@ -87,7 +114,11 @@ pub async fn copy_omic_datasets(
                 extra_metadata   JSONB,
                 is_active        BOOLEAN,
                 ingested_at      TIMESTAMPTZ,
-                updated_at       TIMESTAMPTZ
+                updated_at       TIMESTAMPTZ,
+                omics_layers     TEXT[],
+                omics_count      INTEGER,
+                data_format      VARCHAR(15),
+                access_type      VARCHAR(20)
             )",
             &[],
         )
@@ -100,7 +131,8 @@ pub async fn copy_omic_datasets(
         "COPY _staging_omicdataset (
             accession, source_db, bioproject_id, title, summary,
             omic_type, omic_subcategory, organism, tax_id, n_samples,
-            platform, extra_metadata, is_active, ingested_at, updated_at
+            platform, extra_metadata, is_active, ingested_at, updated_at,
+            omics_layers, omics_count, data_format, access_type
         ) FROM STDIN WITH (FORMAT csv, NULL 'NULL')",
         &csv,
     )
@@ -112,37 +144,54 @@ pub async fn copy_omic_datasets(
             "INSERT INTO core_omicdataset (
                 accession, source_db, bioproject_id, title, summary,
                 omic_type, omic_subcategory, organism, tax_id, n_samples,
-                platform, extra_metadata, is_active, ingested_at, updated_at
+                platform, extra_metadata, is_active, ingested_at, updated_at,
+                omics_layers, omics_count, data_format, access_type
             )
             SELECT
                 accession, source_db, bioproject_id, title, summary,
                 omic_type, omic_subcategory, organism, tax_id, n_samples,
-                platform, extra_metadata, is_active, ingested_at, updated_at
+                platform, extra_metadata, is_active, ingested_at, updated_at,
+                omics_layers, omics_count, data_format, access_type
             FROM _staging_omicdataset
             ON CONFLICT (accession) DO UPDATE SET
                 -- Keep longest title/summary
                 title = CASE WHEN length(EXCLUDED.title) > length(core_omicdataset.title) THEN EXCLUDED.title ELSE core_omicdataset.title END,
                 summary = CASE WHEN length(EXCLUDED.summary) > length(core_omicdataset.summary) THEN EXCLUDED.summary ELSE core_omicdataset.summary END,
-                
+
                 -- Merge and de-duplicate omic types using arrays
                 omic_type = COALESCE((
-                    SELECT string_agg(distinct t, ',') 
-                    FROM unnest(string_to_array(COALESCE(core_omicdataset.omic_type, '') || ',' || COALESCE(EXCLUDED.omic_type, ''), ',')) t 
+                    SELECT string_agg(distinct t, ',')
+                    FROM unnest(string_to_array(COALESCE(core_omicdataset.omic_type, '') || ',' || COALESCE(EXCLUDED.omic_type, ''), ',')) t
                     WHERE t != ''
                 ), ''),
                 omic_subcategory = COALESCE((
-                    SELECT string_agg(distinct s, ',') 
-                    FROM unnest(string_to_array(COALESCE(core_omicdataset.omic_subcategory, '') || ',' || COALESCE(EXCLUDED.omic_subcategory, ''), ',')) s 
+                    SELECT string_agg(distinct s, ',')
+                    FROM unnest(string_to_array(COALESCE(core_omicdataset.omic_subcategory, '') || ',' || COALESCE(EXCLUDED.omic_subcategory, ''), ',')) s
                     WHERE s != ''
                 ), ''),
-                
+
                 organism         = COALESCE(NULLIF(EXCLUDED.organism, ''), core_omicdataset.organism),
                 tax_id           = COALESCE(EXCLUDED.tax_id, core_omicdataset.tax_id),
                 n_samples        = COALESCE(EXCLUDED.n_samples, core_omicdataset.n_samples),
                 platform         = CASE WHEN length(EXCLUDED.platform) > length(core_omicdataset.platform) THEN EXCLUDED.platform ELSE core_omicdataset.platform END,
-                
-                -- Merge metadata objects
+
+                -- Merge metadata objects (JSONB || merges keys, rhs wins on conflict)
                 extra_metadata   = core_omicdataset.extra_metadata || EXCLUDED.extra_metadata,
+
+                -- Contrato OmnisPathway — anti-clobber com COALESCE/NULLIF
+                -- omics_layers: substituir só se o incoming tem elementos
+                omics_layers     = CASE
+                    WHEN cardinality(EXCLUDED.omics_layers) > 0
+                    THEN EXCLUDED.omics_layers
+                    ELSE core_omicdataset.omics_layers
+                    END,
+                -- omics_count: substituir só se incoming é não-NULL
+                omics_count      = COALESCE(EXCLUDED.omics_count, core_omicdataset.omics_count),
+                -- data_format: substituir só se incoming não é 'unknown'
+                data_format      = COALESCE(NULLIF(EXCLUDED.data_format, 'unknown'), core_omicdataset.data_format),
+                -- access_type: substituir só se incoming não é 'unknown'
+                access_type      = COALESCE(NULLIF(EXCLUDED.access_type, 'unknown'), core_omicdataset.access_type),
+
                 updated_at       = NOW()",
             &[],
         )
@@ -303,8 +352,28 @@ fn build_dataset_csv(datasets: &[OmicDatasetData]) -> String {
     for d in datasets {
         let extra_str =
             serde_json::to_string(&d.extra_metadata).unwrap_or_else(|_| "{}".to_string());
+
+        // Serializar omics_layers como literal de array Postgres: {proteomic} ou {"a","b"}
+        // O formato CSV do COPY exige que o valor seja quoted (escape_csv_field garante isso).
+        // Dentro do valor CSV o literal Postgres usa aspas duplas para elementos com espaços.
+        // Para valores simples ASCII sem aspas internas, `{el1,el2}` é suficiente.
+        // Usamos aspas internas em todos os elementos para segurança: {"proteomic"}
+        let pg_array_literal = if d.omics_layers.is_empty() {
+            "{}".to_string()
+        } else {
+            let elements: Vec<String> = d
+                .omics_layers
+                .iter()
+                .map(|el| {
+                    // Escapar aspas duplas dentro do elemento para o literal Postgres
+                    format!("\"{}\"", el.replace('"', "\\\""))
+                })
+                .collect();
+            format!("{{{}}}", elements.join(","))
+        };
+
         let row = format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             escape_csv_field(&d.accession),
             escape_csv_field(&d.source_db),
             escape_csv_field(&d.bioproject_id),
@@ -320,6 +389,11 @@ fn build_dataset_csv(datasets: &[OmicDatasetData]) -> String {
             if d.is_active { "t" } else { "f" },
             &now,
             &now,
+            // Colunas OmnisPathway — sempre presentes no CSV; NULL/defaults tratados pelo ON CONFLICT
+            escape_csv_field(&pg_array_literal),
+            d.omics_count.map_or("NULL".to_string(), |v| v.to_string()),
+            escape_csv_field(&d.data_format),
+            escape_csv_field(&d.access_type),
         );
         csv.push_str(&row);
     }

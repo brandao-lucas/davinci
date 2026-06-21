@@ -466,6 +466,117 @@ def run_sample_ingestion(self, project_id: str, dataset_id: int):
         raise self.retry(exc=exc, countdown=60)
 
 
+@shared_task(bind=True, max_retries=3)
+def run_pride_ingestion(self, job_id: str):
+    """
+    Chama o Rust engine para ingerir datasets de proteômica do PRIDE/EBI via PyO3.
+
+    Job parameters esperados:
+        query      (str) — termo de busca PRIDE
+        max_results (int) — limite de datasets (default: 500)
+
+    Nota: PRIDE usa a API REST do EBI — não requer NCBI API key.
+    """
+    try:
+        import rust_engine
+
+        try:
+            job = IngestionJob.objects.select_related('project').get(id=job_id)
+        except IngestionJob.DoesNotExist:
+            logger.warning('IngestionJob %s not found — task aborted', job_id)
+            return {'datasets_processed': 0, 'datasets_inserted': 0, 'links_inserted': 0, 'errors': []}
+
+        db = settings.DATABASES['default']
+        db_url = f"postgresql://{db['USER']}:{db['PASSWORD']}@{db['HOST']}:{db['PORT']}/{db['NAME']}"
+
+        max_results = job.parameters.get('max_results', 500)
+
+        result = rust_engine.search_and_ingest_pride(
+            job_id=str(job.id),
+            query=job.parameters['query'],
+            db_url=db_url,
+            project_id=str(job.project_id),
+            max_results=max_results,
+        )
+
+        # Defense in depth: se o Rust não marcou o job, a task garante o estado final.
+        # O filter em status__in garante idempotência com o Rust real.
+        IngestionJob.objects.filter(
+            id=job_id,
+            status__in=[IngestionJob.JobStatus.PENDING, IngestionJob.JobStatus.RUNNING],
+        ).update(
+            status=IngestionJob.JobStatus.COMPLETED,
+            records_processed=result.datasets_processed,
+            records_inserted=result.datasets_inserted,
+        )
+
+        # Surface any non-fatal errors into the job record
+        if result.errors:
+            try:
+                job = IngestionJob.objects.get(id=job_id)
+                job.records_processed = result.datasets_processed
+                job.error_message = '; '.join(result.errors)
+                job.save(update_fields=['records_processed', 'error_message'])
+            except IngestionJob.DoesNotExist:
+                pass
+
+        # Materializa vínculos project-scoped (ProjectPaperDataset, Nível 1).
+        # Idempotente via ON CONFLICT DO NOTHING. Falha não derruba o job de PRIDE.
+        try:
+            from apps.core.services.link_service import materialize_project_links
+            _project_id = job.project_id
+            inserted = materialize_project_links(_project_id)
+            if inserted > 0:
+                logger.info(
+                    'PRIDE job %s: %d vínculos ProjectPaperDataset materializados para projeto %s',
+                    job_id, inserted, _project_id,
+                )
+        except Exception as e:
+            logger.error(
+                'materialize_project_links falhou após PRIDE job %s (projeto %s): %s',
+                job_id, job.project_id, e,
+            )
+
+        # Tenta avançar para curating se não há mais jobs de busca ativos.
+        try:
+            from apps.core.services.project_status import advance_to_curating_if_done
+            advance_to_curating_if_done(job.project)
+        except Exception as e:
+            logger.error(
+                'advance_to_curating_if_done falhou após PRIDE job %s (projeto %s): %s',
+                job_id, job.project_id, e,
+            )
+
+        return {
+            'datasets_processed': result.datasets_processed,
+            'datasets_inserted': result.datasets_inserted,
+            'links_inserted': result.links_inserted,
+            'errors': result.errors,
+        }
+    except ImportError:
+        # rust_engine não compilado: marca FAILED com mensagem clara.
+        try:
+            job = IngestionJob.objects.get(id=job_id)
+            job.status = IngestionJob.JobStatus.FAILED
+            job.error_message = (
+                'rust_engine not installed — compile with '
+                '`maturin develop --release`'
+            )
+            job.save(update_fields=['status', 'error_message'])
+        except IngestionJob.DoesNotExist:
+            pass
+        return {'datasets_processed': 0, 'datasets_inserted': 0, 'links_inserted': 0, 'errors': []}
+    except Exception as exc:
+        try:
+            job = IngestionJob.objects.get(id=job_id)
+            job.status = IngestionJob.JobStatus.FAILED
+            job.error_message = str(exc)
+            job.save(update_fields=['status', 'error_message'])
+        except IngestionJob.DoesNotExist:
+            logger.warning('IngestionJob %s not found — task aborted', job_id)
+        raise self.retry(exc=exc, countdown=60)
+
+
 @shared_task(
     bind=True,
     max_retries=3,

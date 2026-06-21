@@ -1,7 +1,7 @@
 from django.db import transaction
 
 from apps.core.models import DaVinciProject, IngestionJob
-from apps.core.tasks.ingestion_tasks import run_omics_ingestion, run_pubmed_ingestion
+from apps.core.tasks.ingestion_tasks import run_omics_ingestion, run_pride_ingestion, run_pubmed_ingestion
 from apps.core.services.query_builder import build_pubmed_query
 from apps.core.services.project_status import start_searching
 
@@ -107,3 +107,45 @@ class SearchService:
 
         return job
 
+    @staticmethod
+    def dispatch_pride_search(
+        project: DaVinciProject,
+        max_results: int = 500,
+    ) -> IngestionJob:
+        """
+        Cria um IngestionJob PRIDE_SEARCH e despacha para o Celery.
+        O Rust engine busca e ingere datasets de proteômica do PRIDE/EBI.
+
+        Nota: PRIDE usa a API REST do EBI — não requer NCBI API key.
+        max_results padrão: 500 (alinhado à assinatura do Rust).
+        """
+        # Reutiliza a mesma query centralizada dos outros dispatchers.
+        # PRIDE aceita busca por termo livre; build_pubmed_query retorna
+        # a string booleana que serve como query de texto para o EBI REST.
+        combined_query = build_pubmed_query(project)
+
+        with transaction.atomic():
+            job = IngestionJob.objects.create(
+                project=project,
+                job_type=IngestionJob.JobType.PRIDE_SEARCH,
+                parameters={
+                    'query': combined_query,
+                    'max_results': max_results,
+                },
+            )
+
+        # Fora da transação: se .delay() falhar, marcamos o Job como FAILED
+        # para não deixar órfãos em PENDING.
+        try:
+            run_pride_ingestion.delay(str(job.id))
+        except Exception as exc:
+            IngestionJob.objects.filter(id=job.id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=f'Failed to dispatch Celery task: {exc}',
+            )
+            raise
+
+        # Transição draft → searching (idempotente).
+        start_searching(project)
+
+        return job

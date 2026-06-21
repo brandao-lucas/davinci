@@ -189,6 +189,11 @@ pub async fn fetch_gwas_datasets(
             platform,
             extra_metadata,
             is_active: true,
+            // Campos OmnisPathway: não avaliados por este conector (backfill Fase 0)
+            omics_layers: vec![],
+            omics_count: None,
+            data_format: "unknown".to_string(),
+            access_type: "unknown".to_string(),
         });
     }
 

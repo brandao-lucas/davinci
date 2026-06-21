@@ -483,6 +483,143 @@ fn search_and_ingest_omics(
     }
 }
 
+// ─── PRIDE Archive ingestion ──────────────────────────────────────────────────
+
+/// Search PRIDE Archive proteomics datasets and ingest results into the database.
+///
+/// Pipeline:
+/// 1. GET /search/projects?keyword=<query> (paginado) → lista de accessions
+/// 2. Para cada accession: GET /projects/{accession} → metadado completo
+/// 3. Para cada accession: GET /projects/{accession}/files → matrix_pointer + modality
+/// 4. Derivação: omics_layers=["proteomic"], omics_count=1, access_type="public"
+///    data_format: COMPLETE→"processed", PARTIAL→"raw"
+/// 5. copy_omic_datasets (COPY bulk upsert com anti-clobber COALESCE/NULLIF)
+/// 6. link_project_datasets (core_projectdataset)
+/// 7. store_pending_links + resolve_pending_links (paper↔dataset)
+/// 8. update IngestionJob → completed
+///
+/// # Arguments
+///
+/// | Parameter      | Type          | Description |
+/// |----------------|---------------|-------------|
+/// | `job_id`       | `str`         | UUID do IngestionJob (pride_search). |
+/// | `query`        | `str`         | Termo de busca (ex: "hidradenitis suppurativa"). |
+/// | `db_url`       | `str`         | PostgreSQL connection string. |
+/// | `project_id`   | `str`         | UUID do DaVinciProject para vincular datasets. |
+/// | `max_results`  | `int`         | Máximo de datasets PRIDE a ingerir (default: 500). |
+///
+/// # Returns
+///
+/// `OmicsResult { datasets_processed, datasets_inserted, links_inserted, errors }`.
+/// Raises `PyRuntimeError` apenas em erro fatal (DB, COPY).
+#[pyfunction]
+#[pyo3(signature = (job_id, query, db_url, project_id, max_results=500))]
+fn search_and_ingest_pride(
+    job_id: String,
+    query: String,
+    db_url: String,
+    project_id: String,
+    max_results: usize,
+) -> PyResult<OmicsResult> {
+    let rt = Runtime::new().unwrap();
+
+    let result: Result<OmicsResult, String> = rt.block_on(async {
+        // 1. Conectar ao banco e marcar job como running
+        let db_client = match crate::db::connection::connect_db(&db_url).await {
+            Ok(c) => c,
+            Err(e) => return Err(format!("DB connection failed: {e}")),
+        };
+        let project_id_uuid = uuid::Uuid::parse_str(&project_id)
+            .map_err(|e| format!("Invalid project_id UUID '{}': {e}", project_id))?;
+
+        crate::db::job_tracker::update_job_status(&db_client, &job_id, "running", 0, 0, 0, None)
+            .await?;
+
+        let mut errors: Vec<String> = Vec::new();
+
+        // 2. Fetch PRIDE Archive
+        let (all_datasets, all_links) =
+            match crate::omics::pride_parser::fetch_pride_datasets(&query, max_results).await {
+                Ok((d, l)) => (d, l),
+                Err(e) => {
+                    let msg = format!("PRIDE fetch error: {e}");
+                    crate::db::job_tracker::update_job_status(
+                        &db_client, &job_id, "failed", 0, 0, 0, Some(&msg),
+                    )
+                    .await?;
+                    return Err(msg);
+                }
+            };
+
+        let datasets_processed = all_datasets.len() as u64;
+
+        // 3. Bulk COPY datasets (fatal em erro de DB)
+        let datasets_inserted =
+            match crate::db::copy_writer::copy_omic_datasets(&db_client, &all_datasets).await {
+                Ok(n) => n,
+                Err(e) => {
+                    let msg = format!("COPY datasets failed: {:?}", e);
+                    crate::db::job_tracker::update_job_status(
+                        &db_client, &job_id, "failed", 0, 0, 0, Some(&msg),
+                    )
+                    .await?;
+                    return Err(msg);
+                }
+            };
+
+        // 4. Vincular datasets ao projeto
+        let accessions: Vec<String> = all_datasets.iter().map(|d| d.accession.clone()).collect();
+        if let Err(e) = crate::db::copy_writer::link_project_datasets(
+            &db_client, project_id_uuid, &accessions, &job_id,
+        )
+        .await
+        {
+            errors.push(format!("link_project_datasets: {:?}", e));
+        }
+
+        // 5. Armazenar links pendentes + resolver imediatamente os que puderem
+        let mut links_inserted = 0u64;
+
+        if let Err(e) = crate::db::copy_writer::store_pending_links(&db_client, &all_links).await {
+            errors.push(format!("store_pending_links failed: {:?}", e));
+        }
+
+        match crate::db::copy_writer::resolve_pending_links(&db_client).await {
+            Ok(n) => links_inserted = n,
+            Err(e) => errors.push(format!("resolve_pending_links failed: {e}")),
+        }
+
+        // 6. Marcar job como completed
+        let err_summary = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        };
+        crate::db::job_tracker::update_job_status(
+            &db_client,
+            &job_id,
+            "completed",
+            datasets_processed as i32,
+            datasets_inserted as i32,
+            0,
+            err_summary.as_deref(),
+        )
+        .await?;
+
+        Ok(OmicsResult {
+            datasets_processed,
+            datasets_inserted,
+            links_inserted,
+            errors,
+        })
+    });
+
+    match result {
+        Ok(res) => Ok(res),
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
 // ─── Pending link resolution ──────────────────────────────────────────────────
 
 /// Resolve pending dataset-paper links that were stored during omics ingestion.
@@ -940,6 +1077,7 @@ fn rust_engine(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MeshSuggestion>()?;
     m.add_function(wrap_pyfunction!(search_and_ingest_pubmed, m)?)?;
     m.add_function(wrap_pyfunction!(search_and_ingest_omics, m)?)?;
+    m.add_function(wrap_pyfunction!(search_and_ingest_pride, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_pending_links, m)?)?;
     m.add_function(wrap_pyfunction!(ingest_samples_for_dataset, m)?)?;
     m.add_function(wrap_pyfunction!(download_dataset_files, m)?)?;
