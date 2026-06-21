@@ -27,7 +27,7 @@ from apps.core.serializers.project import (
     SearchPreviewRequestSerializer,
 )
 from apps.core.serializers.stats import ProjectStatsSerializer
-from apps.core.services.query_builder import build_pubmed_query, _build_mesh_block
+from apps.core.services.query_builder import build_free_text_query, build_pubmed_query, _build_mesh_block
 from apps.core.services.search_service import SearchService
 from apps.core.services.stats_service import StatsService
 
@@ -261,12 +261,15 @@ class DaVinciProjectViewSet(viewsets.ModelViewSet):
         flag_open_access = bool(flags.get('open_access', False))
         year_buckets = flags.get('year_buckets') or None
 
-        # Cache por hash(query + flags) para não re-chamar o Rust em loops de debounce
+        free_text_query = build_free_text_query(proxy)
+
+        # Cache por hash(query + flags) para não re-chamar o Rust em loops de debounce.
+        # Prefixo v2: invalida entradas anteriores ao fix de free_text vs. combinada.
         cache_key_raw = (
-            f'preview:{project.id}:{query}:'
+            f'preview:{project.id}:{query}:{free_text_query}:'
             f'{flag_by_year}:{flag_by_pub_type}:{flag_open_access}:{year_buckets}'
         )
-        cache_key = 'search_preview:' + hashlib.sha256(cache_key_raw.encode()).hexdigest()[:32]
+        cache_key = 'search_preview:v2:' + hashlib.sha256(cache_key_raw.encode()).hexdigest()[:32]
         cached = cache.get(cache_key)
         if cached is not None:
             return Response(cached)
@@ -291,7 +294,7 @@ class DaVinciProjectViewSet(viewsets.ModelViewSet):
         try:
             import rust_engine
             preview = rust_engine.pubmed_magnitude_preview(
-                free_text=query,
+                free_text=free_text_query,
                 mesh_terms=mesh_terms,
                 date_from=project.date_from,
                 date_to=project.date_to,
@@ -300,6 +303,7 @@ class DaVinciProjectViewSet(viewsets.ModelViewSet):
                 flag_by_pub_type=flag_by_pub_type,
                 flag_open_access=flag_open_access,
                 year_buckets=year_buckets,
+                combined=query,
             )
         except Exception as exc:
             logger.error('search_preview: erro no rust_engine: %s', exc)

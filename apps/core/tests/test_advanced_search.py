@@ -23,6 +23,7 @@ from apps.core.models import DaVinciProject, IngestionJob, Paper
 from apps.core.services.query_builder import (
     _escape_free_text_term,
     _escape_mesh_term,
+    build_free_text_query,
     build_pubmed_query,
 )
 
@@ -810,3 +811,277 @@ class TestMeshSuggestEndpoint(APITestCase):
         for campo in ('descriptor', 'ui', 'tree_numbers', 'scope_note',
                       'allowable_qualifiers', 'pubmed_count'):
             self.assertIn(campo, suggestion, f'Campo {campo!r} ausente na resposta')
+
+
+# ─── Grupo 7: build_free_text_query — testes unitários puros ─────────────────
+
+class TestBuildFreeTextQuery(APITestCase):
+    """
+    Testes unitários para build_free_text_query.
+
+    Garantem que:
+    - A função retorna apenas o bloco de texto livre (sem [mh] / [majr]).
+    - A string retornada é byte-idêntica ao trecho free-text embutido em
+      build_pubmed_query quando MeSH está ativo — sem divergência de parênteses
+      ou sanitização.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='u_ftq', password='pw')
+
+    def test_sem_sinonimos_retorna_so_free_text(self):
+        """query_term simples → bloco sem qualificadores MeSH."""
+        p = _make_project(self.user, query_term='cancer', advanced=False)
+        ft = build_free_text_query(p)
+        self.assertNotIn('[mh]', ft)
+        self.assertNotIn('[majr]', ft)
+        self.assertIn('cancer', ft)
+
+    def test_com_sinonimo_retorna_so_free_text(self):
+        """query_term + sinônimo → OR de termos livres, sem MeSH."""
+        p = _make_project(self.user, query_term='cancer', synonyms=['neoplasm'],
+                          advanced=False)
+        ft = build_free_text_query(p)
+        self.assertNotIn('[mh]', ft)
+        self.assertNotIn('[majr]', ft)
+        self.assertIn('cancer', ft)
+        self.assertIn('neoplasm', ft)
+        self.assertIn(' OR ', ft)
+
+    def test_free_text_query_identico_ao_prefixo_de_build_pubmed_query(self):
+        """
+        REGRESSÃO DE PARIDADE: build_free_text_query(p) deve ser byte-idêntico
+        ao trecho de texto livre embutido em build_pubmed_query(p) quando MeSH
+        está ativo.
+
+        Verifica que os dois helpers compartilham o mesmo _build_free_text_part
+        interno — sem duplicação de lógica que pudesse divergir.
+        """
+        mesh = [_mesh_entry('Neoplasms', mode='and')]
+        p = _make_project(self.user, query_term='cancer', synonyms=['neoplasm'],
+                          advanced=True, mesh=mesh)
+
+        ft = build_free_text_query(p)
+        combined = build_pubmed_query(p)
+
+        # O bloco free-text deve aparecer no início da query combinada.
+        self.assertTrue(
+            combined.startswith(ft),
+            f'build_pubmed_query não começa com build_free_text_query.\n'
+            f'free_text={ft!r}\ncombined ={combined!r}',
+        )
+
+    def test_free_text_query_com_mesh_ativo_ignora_mesh(self):
+        """
+        Mesmo com advanced_search_enabled=True e selected_mesh preenchido,
+        build_free_text_query retorna apenas o bloco livre — sem blocos MeSH.
+        """
+        mesh = [_mesh_entry('Diabetes Mellitus', mode='and')]
+        p = _make_project(self.user, query_term='diabetes', advanced=True, mesh=mesh)
+        ft = build_free_text_query(p)
+        self.assertNotIn('[mh]', ft)
+        self.assertNotIn('[majr]', ft)
+        self.assertIn('diabetes', ft)
+
+
+# ─── Grupo 8: Regressão — free_text enviado ao Rust não carrega MeSH ─────────
+
+class TestFreeTextEnviadoAoRust(APITestCase):
+    """
+    REGRESSÃO DIRETA DO BUG descrito no plano 2026-06-20-fix-contagem-texto-livre-vs-mesh.
+
+    Antes do fix, a view passava build_pubmed_query(proxy) — query COMBINADA — como
+    parâmetro free_text ao Rust. O Rust então acumulava os termos MeSH uma segunda vez
+    ao montar combined_count, fazendo free_text_count ≡ mesh_count ≡ combined_count.
+
+    Estes testes capturam os call_args reais de rust_engine.pubmed_magnitude_preview
+    e afirmam:
+    1. free_text NÃO contém [mh] nem [majr].
+    2. free_text == build_free_text_query(proxy) para aquele projeto/overrides.
+    3. combined == build_pubmed_query(proxy) (paridade preview↔ingestão).
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='u_reg', password='pw')
+        self.client.force_authenticate(user=self.user)
+
+    def _make_proxy(self, project, selected_mesh, mesh_default_mode='and'):
+        """Replica o SimpleNamespace equivalente ao _ProjectProxy da view."""
+        return SimpleNamespace(
+            query_term=project.query_term,
+            query_synonyms=project.query_synonyms,
+            advanced_search_enabled=bool(selected_mesh),
+            selected_mesh=selected_mesh,
+            mesh_default_mode=mesh_default_mode,
+            date_from=project.date_from,
+            date_to=project.date_to,
+        )
+
+    @patch('rust_engine.pubmed_magnitude_preview')
+    def test_free_text_nao_contem_mh_quando_mesh_selecionado(self, mock_preview):
+        """
+        Com selected_mesh não-vazio, free_text enviado ao Rust NÃO deve conter
+        [mh] nem [majr] — regressão do bug original.
+        """
+        mock_preview.return_value = _fake_magnitude_preview()
+        project = _make_project(self.user, query_term='cancer', advanced=False)
+        mesh_override = [_mesh_entry('Neoplasms', mode='and')]
+
+        resp = self.client.post(
+            f'/api/v1/projects/{project.id}/search/preview/',
+            {'selected_mesh': mesh_override, 'mesh_default_mode': 'and', 'panel_flags': {}},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertTrue(mock_preview.called, 'rust_engine.pubmed_magnitude_preview não foi chamado')
+
+        kwargs = mock_preview.call_args.kwargs
+        free_text_arg = kwargs.get('free_text', '')
+
+        self.assertNotIn('[mh]', free_text_arg,
+                         f'free_text contém [mh] — bug regressivo: {free_text_arg!r}')
+        self.assertNotIn('[majr]', free_text_arg,
+                         f'free_text contém [majr] — bug regressivo: {free_text_arg!r}')
+
+    @patch('rust_engine.pubmed_magnitude_preview')
+    def test_free_text_igual_a_build_free_text_query(self, mock_preview):
+        """
+        free_text passado ao Rust deve ser idêntico a build_free_text_query(proxy)
+        com os mesmos overrides que a view aplica.
+        """
+        mock_preview.return_value = _fake_magnitude_preview()
+        project = _make_project(self.user, query_term='cancer', synonyms=['neoplasm'],
+                                advanced=False)
+        mesh_override = [_mesh_entry('Neoplasms', mode='and')]
+
+        resp = self.client.post(
+            f'/api/v1/projects/{project.id}/search/preview/',
+            {'selected_mesh': mesh_override, 'mesh_default_mode': 'and', 'panel_flags': {}},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        proxy = self._make_proxy(project, mesh_override, 'and')
+        expected_free_text = build_free_text_query(proxy)
+
+        kwargs = mock_preview.call_args.kwargs
+        actual_free_text = kwargs.get('free_text', '')
+
+        self.assertEqual(
+            actual_free_text, expected_free_text,
+            f'free_text enviado ao Rust diverge de build_free_text_query.\n'
+            f'enviado  ={actual_free_text!r}\nesperado ={expected_free_text!r}',
+        )
+
+    @patch('rust_engine.pubmed_magnitude_preview')
+    def test_combined_igual_a_build_pubmed_query(self, mock_preview):
+        """
+        combined passado ao Rust deve ser idêntico a build_pubmed_query(proxy),
+        garantindo paridade preview↔ingestão (princípio inegociável do plano premium).
+        """
+        mock_preview.return_value = _fake_magnitude_preview()
+        project = _make_project(self.user, query_term='cancer', synonyms=['neoplasm'],
+                                advanced=False)
+        mesh_override = [_mesh_entry('Neoplasms', mode='and')]
+
+        resp = self.client.post(
+            f'/api/v1/projects/{project.id}/search/preview/',
+            {'selected_mesh': mesh_override, 'mesh_default_mode': 'and', 'panel_flags': {}},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        proxy = self._make_proxy(project, mesh_override, 'and')
+        expected_combined = build_pubmed_query(proxy)
+
+        kwargs = mock_preview.call_args.kwargs
+        actual_combined = kwargs.get('combined', '')
+
+        self.assertEqual(
+            actual_combined, expected_combined,
+            f'combined enviado ao Rust diverge de build_pubmed_query.\n'
+            f'enviado  ={actual_combined!r}\nesperado ={expected_combined!r}',
+        )
+        # Sanidade: a query combinada deve conter [mh] (bloco MeSH está lá, mas UMA vez)
+        self.assertIn('[mh]', actual_combined,
+                      'combined deveria conter [mh] com MeSH selecionado')
+
+    @patch('rust_engine.pubmed_magnitude_preview')
+    def test_free_text_e_combined_diferem_quando_mesh_selecionado(self, mock_preview):
+        """
+        Quando MeSH está selecionado, free_text e combined devem ser strings distintas:
+        free_text é apenas o bloco livre; combined inclui o bloco MeSH além do free-text.
+        """
+        mock_preview.return_value = _fake_magnitude_preview()
+        project = _make_project(self.user, query_term='cancer', advanced=False)
+        mesh_override = [_mesh_entry('Neoplasms', mode='and')]
+
+        resp = self.client.post(
+            f'/api/v1/projects/{project.id}/search/preview/',
+            {'selected_mesh': mesh_override, 'mesh_default_mode': 'and', 'panel_flags': {}},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        kwargs = mock_preview.call_args.kwargs
+        self.assertNotEqual(
+            kwargs.get('free_text'), kwargs.get('combined'),
+            'free_text e combined são iguais com MeSH selecionado — bug regressivo',
+        )
+
+    @patch('rust_engine.pubmed_magnitude_preview')
+    def test_sem_mesh_free_text_e_combined_sao_equivalentes(self, mock_preview):
+        """
+        Sem MeSH (selected_mesh=[]), free_text e combined devem expressar a mesma
+        busca — ambos são o bloco de texto livre puro.
+        """
+        mock_preview.return_value = _fake_magnitude_preview()
+        project = _make_project(self.user, query_term='cancer', advanced=False)
+
+        resp = self.client.post(
+            f'/api/v1/projects/{project.id}/search/preview/',
+            {'selected_mesh': [], 'panel_flags': {}},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        kwargs = mock_preview.call_args.kwargs
+        free_text_arg = kwargs.get('free_text', '')
+        combined_arg = kwargs.get('combined', '')
+
+        # Sem MeSH, a query combinada é igual ao texto livre puro.
+        # Nenhum dos dois deve conter qualificadores MeSH.
+        self.assertNotIn('[mh]', free_text_arg)
+        self.assertNotIn('[majr]', free_text_arg)
+        self.assertNotIn('[mh]', combined_arg)
+        self.assertNotIn('[majr]', combined_arg)
+
+    @patch('rust_engine.pubmed_magnitude_preview')
+    def test_query_used_continua_igual_a_build_pubmed_query(self, mock_preview):
+        """
+        PARIDADE: query_used na resposta deve ser idêntico a build_pubmed_query(proxy)
+        com os overrides aplicados — garante que o número mostrado ao usuário
+        corresponde à query que será ingerida.
+
+        Extensão do teste existente em TestParidadePreviewIngestao — cobre o caso
+        com MeSH não-vazio explicitamente.
+        """
+        mock_preview.return_value = _fake_magnitude_preview()
+        project = _make_project(self.user, query_term='cancer', advanced=False)
+        mesh_override = [_mesh_entry('Neoplasms', mode='and')]
+
+        resp = self.client.post(
+            f'/api/v1/projects/{project.id}/search/preview/',
+            {'selected_mesh': mesh_override, 'mesh_default_mode': 'and', 'panel_flags': {}},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        proxy = self._make_proxy(project, mesh_override, 'and')
+        expected_query = build_pubmed_query(proxy)
+
+        self.assertEqual(
+            resp.data['query_used'], expected_query,
+            f'query_used diverge de build_pubmed_query.\n'
+            f'resposta ={resp.data["query_used"]!r}\nesperado ={expected_query!r}',
+        )

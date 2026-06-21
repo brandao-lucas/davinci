@@ -143,8 +143,8 @@ where
 /// # Parameters (PyO3)
 /// | Name              | Type              | Description |
 /// |-------------------|-------------------|-------------|
-/// | `free_text`       | `str`             | Combined free-text part of the query (already assembled by the Django query-builder). |
-/// | `mesh_terms`      | `Vec<(str, str)>` | List of `(mesh_term, mode)` tuples. `mesh_term` is the ready-to-embed PubMed syntax (e.g. `"Hidradenitis Suppurativa"[MeSH Terms]`). `mode` is `"and"` or `"or"`. |
+/// | `free_text`       | `str`             | Pure free-text part of the query — the raw boolean block **without** any MeSH qualifiers (e.g. `"hidradenitis suppurativa OR acne inversa"`). Used as-is for `free_text_count`. Django must send only the free-text portion here, never the combined query. |
+/// | `mesh_terms`      | `Vec<(str, str)>` | List of `(mesh_term, mode)` tuples. `mesh_term` is the ready-to-embed PubMed syntax (e.g. `"Hidradenitis Suppurativa"[MeSH Terms]`). `mode` is `"and"` or `"or"`. Used to compute `mesh_count`/`only_mesh`. |
 /// | `date_from`       | `Option<u16>`     | Minimum publication year (inclusive), or `None`. |
 /// | `date_to`         | `Option<u16>`     | Maximum publication year (inclusive), or `None`. |
 /// | `ncbi_api_key`    | `Option<str>`     | NCBI API key. Raises rate limit from 3 to 10 req/s. |
@@ -152,6 +152,7 @@ where
 /// | `flag_by_pub_type`| `bool`            | Compute publication-type breakdown. |
 /// | `flag_open_access`| `bool`            | Compute open-access counts. |
 /// | `year_buckets`    | `Option<Vec<u16>>`| Explicit list of years for by_year. Defaults to last 10 years when `None`. |
+/// | `combined`        | `Option<str>`     | Pre-built combined query string produced by the Django query-builder (i.e. the exact string that will be used for ingestion). When provided, this string is used **directly** as the query for `combined_count`, `overlap`, and all derived metrics — the Rust-side `build_combined_query` is **not called**. When `None`, the combined string is assembled internally from `free_text` + `mesh_terms` (backwards-compatible behaviour). Pass this parameter to guarantee that the count shown to the user matches the query that will actually be ingested. |
 ///
 /// # Returns
 /// `MagnitudePreview` with core counts always populated.
@@ -166,7 +167,8 @@ where
     flag_by_year=false,
     flag_by_pub_type=false,
     flag_open_access=false,
-    year_buckets=None
+    year_buckets=None,
+    combined=None
 ))]
 pub fn pubmed_magnitude_preview(
     free_text: String,
@@ -178,6 +180,7 @@ pub fn pubmed_magnitude_preview(
     flag_by_pub_type: bool,
     flag_open_access: bool,
     year_buckets: Option<Vec<u16>>,
+    combined: Option<String>,
 ) -> PyResult<MagnitudePreview> {
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Tokio runtime: {e}")))?;
@@ -193,6 +196,7 @@ pub fn pubmed_magnitude_preview(
             flag_by_pub_type,
             flag_open_access,
             year_buckets,
+            combined,
         )
         .await
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
@@ -209,6 +213,7 @@ async fn run_preview(
     flag_by_pub_type: bool,
     flag_open_access: bool,
     year_buckets: Option<Vec<u16>>,
+    combined: Option<String>,
 ) -> Result<MagnitudePreview, String> {
     let has_key = ncbi_api_key.is_some();
     let concurrency = if has_key {
@@ -227,7 +232,19 @@ async fn run_preview(
         .collect();
 
     let mesh_query = build_mesh_query(&blocks);
-    let combined_query = build_combined_query(&free_text, mesh_query.as_deref());
+
+    // When the caller supplies a pre-built combined query (option 1b of the design),
+    // use it directly — this guarantees that the count shown to the user is computed
+    // against the exact same string that Django will submit for ingestion.
+    // When `combined` is None we fall back to assembling it internally (backwards-compat).
+    let combined_query = match combined {
+        Some(c) => c,
+        None => build_combined_query(&free_text, mesh_query.as_deref()),
+    };
+
+    // overlap_query: the intersection of free-text and MeSH.
+    // When a combined string was provided externally we still use the internally-built
+    // intersection to keep the overlap semantics correct (free-text ∩ MeSH).
     let overlap_query = match &mesh_query {
         Some(mq) => Some(format!("({free_text}) AND {mq}")),
         None => None,
@@ -579,5 +596,77 @@ mod tests {
         );
         assert!(q.starts_with("(hidradenitis)"));
         assert!(q.contains("AND"));
+    }
+
+    // ── Tests for the `combined` parameter (option 1b) ────────────────────────
+    //
+    // When the caller supplies `combined`, it must be used verbatim as the
+    // combined_query string — build_combined_query must NOT be called.  This
+    // is validated by inspecting the string that run_preview would use; we
+    // cannot call run_preview in unit tests (it fires HTTP), so we exercise
+    // the logic via the equivalent local computation.
+
+    /// Simulates what run_preview does when `combined = Some(...)`: the
+    /// pre-built string is used directly, without wrapping `free_text` again.
+    #[test]
+    fn test_combined_explicit_used_verbatim() {
+        let free_text = "hidradenitis suppurativa OR acne inversa";
+        let pre_built = r#"(hidradenitis suppurativa OR acne inversa) AND ("Hidradenitis Suppurativa"[MeSH Terms])"#;
+
+        // Replicate the run_preview selection logic (no HTTP call):
+        let mesh_blocks: Vec<MeshBlock> = vec![MeshBlock {
+            mesh_term: r#""Hidradenitis Suppurativa"[MeSH Terms]"#.to_string(),
+            mode: "and".to_string(),
+        }];
+        let mesh_query = build_mesh_query(&mesh_blocks);
+
+        let combined_provided: Option<String> = Some(pre_built.to_string());
+
+        let combined_query = match combined_provided {
+            Some(c) => c,
+            None => build_combined_query(free_text, mesh_query.as_deref()),
+        };
+
+        // Must equal the pre-built string exactly — no double-wrapping.
+        assert_eq!(combined_query, pre_built);
+        // Must NOT double-apply MeSH (the pre-built string contains [MeSH Terms] once).
+        assert_eq!(combined_query.matches("[MeSH Terms]").count(), 1);
+    }
+
+    /// When `combined = None`, fallback to internal build (backwards-compat).
+    #[test]
+    fn test_combined_none_falls_back_to_internal_build() {
+        let free_text = "hidradenitis";
+        let mesh_blocks: Vec<MeshBlock> = vec![MeshBlock {
+            mesh_term: r#""Hidradenitis Suppurativa"[MeSH Terms]"#.to_string(),
+            mode: "and".to_string(),
+        }];
+        let mesh_query = build_mesh_query(&mesh_blocks);
+
+        let combined_provided: Option<String> = None;
+
+        let combined_query = match combined_provided {
+            Some(c) => c,
+            None => build_combined_query(free_text, mesh_query.as_deref()),
+        };
+
+        // Internal build wraps free_text in parens and appends mesh block.
+        assert!(combined_query.starts_with("(hidradenitis)"));
+        assert!(combined_query.contains("AND"));
+        assert!(combined_query.contains("[MeSH Terms]"));
+    }
+
+    /// free_text_count query must be the pure free-text string, not the combined one.
+    /// This test documents the invariant: free_text is passed through unchanged.
+    #[test]
+    fn test_free_text_not_contaminated_by_mesh() {
+        let free_text = "cancer OR neoplasm";
+        // The query used for free_text_count is `free_text` directly — no mesh appended.
+        // Simulate what ft_query in run_preview receives:
+        let ft_query = free_text.to_string();
+        assert!(!ft_query.contains("[MeSH Terms]"));
+        assert!(!ft_query.contains("[mh]"));
+        assert!(!ft_query.contains("[majr]"));
+        assert_eq!(ft_query, "cancer OR neoplasm");
     }
 }

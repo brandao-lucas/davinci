@@ -197,6 +197,28 @@ def _build_free_text_part(project) -> str:
     return '(' + ' OR '.join(f'({p})' for p in safe_parts) + ')'
 
 
+def build_free_text_query(project) -> str:
+    """
+    Retorna APENAS o bloco de texto livre sanitizado da query PubMed — sem
+    nenhum bloco MeSH ([mh]/[majr]).
+
+    Delega diretamente para _build_free_text_part, que é o mesmo helper
+    interno usado por build_pubmed_query na linha que monta o bloco free-text
+    da query combinada. Isso garante que a string retornada aqui é
+    byte-idêntica ao trecho de free-text embutido em build_pubmed_query quando
+    advanced_search_enabled=True — sem duplicação de lógica de sanitização.
+
+    Exemplo:
+        project.query_term = 'cancer', project.query_synonyms = ['neoplasm']
+        → '((cancer) OR (neoplasm))'
+
+    Esse valor é adequado para ser passado como parâmetro `free_text` ao
+    rust_engine.pubmed_magnitude_preview, conforme o contrato documentado em
+    rust_src/src/ncbi/preview.rs (parâmetro "Combined free-text part").
+    """
+    return _build_free_text_part(project)
+
+
 def build_pubmed_query(project) -> str:
     """
     Monta a string booleana PubMed completa para um DaVinciProject.
