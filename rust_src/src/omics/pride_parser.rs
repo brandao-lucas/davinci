@@ -44,7 +44,22 @@ struct PrideReference {
     doi: Option<String>,
 }
 
-/// Arquivo de `/projects/{accession}/files`
+/// Arquivo de `/projects/{accession}/files`.
+///
+/// A resposta do endpoint é um **array JSON puro** (confirmado empiricamente com
+/// PXD040275, PXD068006, PXD074024). Cada elemento tem a forma:
+/// ```json
+/// {
+///   "fileName": "sample.raw",
+///   "fileCategory": {"value": "RAW", "accession": "PRIDE:0000404", ...},
+///   "publicFileLocations": [
+///     {"accession": "PRIDE:0000469", "value": "ftp://ftp.pride.ebi.ac.uk/..."},
+///     {"accession": "PRIDE:0000468", "value": "prd_ascp@fasp.ebi.ac.uk:..."}
+///   ]
+/// }
+/// ```
+/// PRIDE:0000469 = FTP Protocol (preferido para matrix_pointer)
+/// PRIDE:0000468 = Aspera Protocol (fallback)
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct PrideFile {
@@ -62,20 +77,10 @@ struct PrideCvParam {
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct PrideFileLocation {
-    value: Option<String>, // URL FTP ou Aspera
-}
-
-/// Resposta de `/projects/{accession}/files`
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct PrideFilesResponse {
-    #[serde(rename = "_embedded", default)]
-    embedded: Option<PrideFilesEmbedded>,
-}
-
-#[derive(Deserialize, Default)]
-struct PrideFilesEmbedded {
-    files: Option<Vec<PrideFile>>,
+    /// PRIDE:0000469 = FTP | PRIDE:0000468 = Aspera
+    accession: Option<String>,
+    /// URL efetiva (ftp://... ou prd_ascp@...)
+    value: Option<String>,
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -428,7 +433,10 @@ async fn fetch_project_detail(client: &Client, accession: &str) -> Result<PrideP
 }
 
 /// Fetch lista de arquivos de `/projects/{accession}/files`.
-/// Retorna vetor vazio em caso de erro (não-fatal).
+///
+/// A API retorna um **array JSON puro** no topo (confirmado empiricamente).
+/// Deserializa diretamente como `Vec<PrideFile>`; retorna vetor vazio em caso
+/// de erro HTTP ou de parse (não-fatal — caller usa `.unwrap_or_default()`).
 async fn fetch_project_files(client: &Client, accession: &str) -> Result<Vec<PrideFile>, String> {
     let url = format!(
         "{}/projects/{}/files?pageSize=300",
@@ -455,68 +463,129 @@ async fn fetch_project_files(client: &Client, accession: &str) -> Result<Vec<Pri
         .await
         .map_err(|e| format!("PRIDE files response read error for {accession}: {e}"))?;
 
-    let files_resp: PrideFilesResponse = serde_json::from_str(&body)
-        .map_err(|e| format!("PRIDE files parse error for {accession}: {e}"))?;
-
-    Ok(files_resp
-        .embedded
-        .and_then(|e| e.files)
-        .unwrap_or_default())
+    // A resposta é um array JSON puro: [{...}, {...}, ...]
+    serde_json::from_str::<Vec<PrideFile>>(&body)
+        .map_err(|e| format!("PRIDE files parse error for {accession}: {e}"))
 }
 
 // ─── Helpers de derivação ─────────────────────────────────────────────────────
 
-/// Seleciona o melhor URL de arquivo para `matrix_pointer`.
-/// Para COMPLETE: prefere RESULT (mzTab > mzIdentML > qualquer RESULT).
-/// Para PARTIAL: prefere RAW (qualquer arquivo RAW).
+/// Seleciona o melhor URL acionável de arquivo para `matrix_pointer`.
+///
+/// Regras de seleção:
+///
+/// **COMPLETE** — procura por arquivo RESULT, com preferência de formato:
+///   1. mzTab (.mztab / .mztab.gz)           — score 3
+///   2. mzIdentML (.mzidentml / .mzid / .gz) — score 2
+///   3. Qualquer outro RESULT                 — score 1
+///
+/// **PARTIAL** — procura por arquivo RAW, ordenado pelo fileName para
+///   estabilidade entre re-ingestões (sem critério de formato preferido;
+///   o primeiro RAW por ordem lexicográfica de fileName é suficiente).
+///
+/// Em ambos os casos, entre as localizações públicas do arquivo escolhido,
+/// prefere a URL FTP (PRIDE:0000469) sobre Aspera (PRIDE:0000468).
+///
+/// Retorna `None` apenas se não houver nenhum arquivo público acionável
+/// na categoria alvo — nunca usa o vazio para codificar semântica de formato.
 fn derive_matrix_pointer(files: &[PrideFile], submission_type: &str) -> Option<String> {
-    let target_category = if submission_type == "COMPLETE" { "RESULT" } else { "RAW" };
+    if files.is_empty() {
+        return None;
+    }
 
-    let mut best_url: Option<String> = None;
-    let mut best_score = -1i32;
+    if submission_type == "COMPLETE" {
+        // Busca o arquivo RESULT com score mais alto
+        let mut best_url: Option<String> = None;
+        let mut best_score = -1i32;
 
-    for file in files {
-        let category = file
-            .file_category
-            .as_ref()
-            .and_then(|c| c.value.as_deref())
-            .unwrap_or("");
+        for file in files {
+            let category = file
+                .file_category
+                .as_ref()
+                .and_then(|c| c.value.as_deref())
+                .unwrap_or("");
 
-        if category != target_category {
-            continue;
+            if category != "RESULT" {
+                continue;
+            }
+
+            let file_name = file.file_name.as_deref().unwrap_or("").to_lowercase();
+            let score: i32 = if file_name.ends_with(".mztab") || file_name.ends_with(".mztab.gz") {
+                3
+            } else if file_name.ends_with(".mzidentml")
+                || file_name.ends_with(".mzid")
+                || file_name.ends_with(".mzid.gz")
+            {
+                2
+            } else {
+                1
+            };
+
+            if score > best_score {
+                if let Some(url) = pick_ftp_url(file) {
+                    best_score = score;
+                    best_url = Some(url);
+                }
+            }
         }
 
-        let file_name = file.file_name.as_deref().unwrap_or("").to_lowercase();
+        best_url
+    } else {
+        // PARTIAL: coleta todos os arquivos RAW, ordena por fileName (determinismo),
+        // devolve a URL FTP do primeiro.
+        let mut raw_files: Vec<&PrideFile> = files
+            .iter()
+            .filter(|f| {
+                f.file_category
+                    .as_ref()
+                    .and_then(|c| c.value.as_deref())
+                    .unwrap_or("")
+                    == "RAW"
+            })
+            .collect();
 
-        // Score de preferência para RESULT
-        let score: i32 = if file_name.ends_with(".mztab")
-            || file_name.ends_with(".mztab.gz")
-        {
-            3
-        } else if file_name.ends_with(".mzidentml")
-            || file_name.ends_with(".mzid")
-            || file_name.ends_with(".mzid.gz")
-        {
-            2
-        } else {
-            1
-        };
+        // Ordenação lexicográfica por fileName — garante estabilidade entre re-ingestões
+        raw_files.sort_by_key(|f| f.file_name.as_deref().unwrap_or(""));
 
-        if score > best_score {
-            // Pegar a primeira URL FTP/HTTPS disponível
-            if let Some(url) = file
-                .public_file_locations
-                .as_ref()
-                .and_then(|locs| locs.first())
-                .and_then(|loc| loc.value.clone())
-            {
-                best_score = score;
-                best_url = Some(url);
-            }
+        raw_files.into_iter().find_map(pick_ftp_url)
+    }
+}
+
+/// Extrai a URL preferida das localizações públicas de um arquivo.
+///
+/// Ordem de preferência:
+/// 1. FTP (PRIDE:0000469) — URL diretamente acionável por qualquer cliente
+/// 2. Aspera (PRIDE:0000468) — fallback se FTP ausente
+/// 3. Qualquer outra localização presente
+///
+/// Retorna `None` se `publicFileLocations` estiver ausente ou vazio.
+fn pick_ftp_url(file: &PrideFile) -> Option<String> {
+    let locs = file.public_file_locations.as_ref()?;
+    if locs.is_empty() {
+        return None;
+    }
+
+    // Preferência 1: FTP
+    if let Some(ftp) = locs.iter().find(|loc| {
+        loc.accession.as_deref() == Some("PRIDE:0000469")
+    }) {
+        if let Some(url) = ftp.value.clone().filter(|u| !u.is_empty()) {
+            return Some(url);
         }
     }
 
-    best_url
+    // Preferência 2: Aspera
+    if let Some(asp) = locs.iter().find(|loc| {
+        loc.accession.as_deref() == Some("PRIDE:0000468")
+    }) {
+        if let Some(url) = asp.value.clone().filter(|u| !u.is_empty()) {
+            return Some(url);
+        }
+    }
+
+    // Fallback: qualquer localização com URL preenchida
+    locs.iter()
+        .find_map(|loc| loc.value.clone().filter(|u| !u.is_empty()))
 }
 
 /// Detecta fosforilação: verifica accession UNIMOD:21 ou nome contendo "phospho"
