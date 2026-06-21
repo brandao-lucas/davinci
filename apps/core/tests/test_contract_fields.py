@@ -1014,3 +1014,310 @@ class ContractFieldsUserIsolationTests(APITestCase):
         self.assertEqual(response.data['updated'], 1)
         self.pd.refresh_from_db()
         self.assertEqual(self.pd.curation_status, 'excluded')
+
+
+# ─── 8. Regressão: DB defaults do COPY writer (migration 0020) ───────────────
+
+
+class OmicDatasetCopyPathDefaultsTests(APITestCase):
+    """
+    Teste de REGRESSÃO para o bug fixado pela migration 0020.
+
+    CONTEXTO DO BUG
+    ---------------
+    As colunas de contrato OmnisPathway (contract_confidence, has_control_group,
+    disease_axis, is_single_cell, sample_join_key) eram NOT NULL mas possuíam
+    DEFAULT apenas no nível Django (app-level). O AddField do Django NÃO emite
+    DEFAULT no Postgres, portanto o COPY writer do Rust — que faz:
+
+        INSERT INTO core_omicdataset (accession, source_db, ..., omics_layers,
+            omics_count, data_format, access_type)
+        SELECT ... FROM _staging_omicdataset
+
+    omitindo os 5 campos acima — recebia NULL nessas colunas, violando o NOT NULL
+    constraint (SqlState 23502) e quebrando TODOS os connectors (GEO/SRA/PRIDE).
+
+    FIX
+    ---
+    Migration 0020 adicionou SET DEFAULT no nível Postgres para as 8 colunas de
+    contrato (as 5 acima + omics_layers, data_format, access_type que já tinham
+    defaults implícitos mas estavam corretos por outro motivo).
+
+    POR QUE ESTE TESTE É NECESSÁRIO
+    --------------------------------
+    Os testes de ingestão existentes mockam o rust_engine via unittest.mock e
+    nunca exercitam o INSERT real contra o schema Postgres. Este teste vai direto
+    ao banco via connection.cursor(), simulando o subset exato de colunas que o
+    copy_writer.rs envia, e verifica que o INSERT SUCEDE com os defaults corretos.
+
+    PROVA DE REGRESSÃO
+    ------------------
+    Se a migration 0020 for revertida (ALTER COLUMN ... DROP DEFAULT), esses testes
+    falharão com IntegrityError/NOT NULL violation — exatamente o bug original.
+    """
+
+    # Subset de colunas que o copy_writer.rs lista no INSERT INTO core_omicdataset.
+    # Retirado de rust_src/src/db/copy_writer.rs, função copy_omic_datasets(),
+    # bloco "INSERT INTO core_omicdataset (...) SELECT ... FROM _staging_omicdataset".
+    # As 5 colunas de contrato OMITIDAS (que devem ser preenchidas por DB DEFAULT):
+    #   contract_confidence, has_control_group, disease_axis, is_single_cell, sample_join_key
+    _COPY_WRITER_BASE_COLS = (
+        'accession', 'source_db', 'bioproject_id', 'title', 'summary',
+        'omic_type', 'omic_subcategory', 'organism', 'tax_id', 'n_samples',
+        'platform', 'extra_metadata', 'is_active', 'ingested_at', 'updated_at',
+        'omics_layers', 'omics_count', 'data_format', 'access_type',
+    )
+
+    def _raw_insert(self, accession, extra_cols=None, extra_vals=None):
+        """
+        Executa INSERT em core_omicdataset listando APENAS as colunas do
+        copy_writer (mais eventuais colunas extras passadas em extra_cols/vals).
+
+        Retorna o id do registro inserido.
+        Usa a transação de teste do Django (rollback automático no tearDown).
+        """
+        from django.db import connection
+        from django.utils import timezone
+
+        now = timezone.now()
+
+        cols = list(self._COPY_WRITER_BASE_COLS)
+        vals = [
+            accession,          # accession
+            'geo',              # source_db
+            '',                 # bioproject_id
+            'Regression title', # title
+            '',                 # summary
+            'transcriptomic',   # omic_type
+            '',                 # omic_subcategory
+            'Homo sapiens',     # organism
+            None,               # tax_id  (NULL — permitido)
+            None,               # n_samples (NULL — permitido)
+            '',                 # platform
+            '{}',               # extra_metadata (JSONB como string)
+            True,               # is_active
+            now,                # ingested_at
+            now,                # updated_at
+            '{}',               # omics_layers (array literal vazio)
+            None,               # omics_count (nullable)
+            'unknown',          # data_format
+            'unknown',          # access_type
+        ]
+
+        if extra_cols:
+            cols.extend(extra_cols)
+            vals.extend(extra_vals)
+
+        placeholders = ', '.join('%s' for _ in cols)
+        col_list = ', '.join(cols)
+        sql = (
+            f'INSERT INTO core_omicdataset ({col_list}) '
+            f'VALUES ({placeholders}) RETURNING id'
+        )
+
+        with connection.cursor() as cursor:
+            cursor.execute(sql, vals)
+            row = cursor.fetchone()
+        return row[0]
+
+    # ── Caso 1: GEO/SRA — subset base do copy_writer (sem nenhum campo de contrato) ──
+
+    def test_partial_insert_geo_sra_subset_succeeds(self):
+        """
+        INSERT com o subset exato de colunas do copy_writer.rs (GEO/SRA) SUCEDE.
+
+        Espelha o INSERT que o COPY writer faz em produção, omitindo:
+          - contract_confidence
+          - has_control_group
+          - disease_axis
+          - is_single_cell
+          - sample_join_key
+
+        Se a migration 0020 for revertida, este teste falha com IntegrityError
+        (null value in column ... violates not-null constraint) — prova da regressão.
+        """
+        row_id = self._raw_insert('GSE_REGR_COPY_GEO')
+        self.assertIsNotNone(row_id, 'INSERT deve retornar o id da linha inserida')
+
+    def test_partial_insert_geo_sra_contract_confidence_default(self):
+        """
+        Após INSERT parcial (GEO/SRA), contract_confidence deve ser {} (DB default).
+        """
+        row_id = self._raw_insert('GSE_REGR_CONF_GEO')
+        ds = OmicDataset.objects.get(pk=row_id)
+        self.assertEqual(
+            ds.contract_confidence,
+            {},
+            'contract_confidence deve ser {} quando omitido no INSERT (DB default migration 0020)',
+        )
+
+    def test_partial_insert_geo_sra_has_control_group_default(self):
+        """
+        Após INSERT parcial (GEO/SRA), has_control_group deve ser 'unknown' (DB default).
+        """
+        row_id = self._raw_insert('GSE_REGR_CTRL_GEO')
+        ds = OmicDataset.objects.get(pk=row_id)
+        self.assertEqual(
+            ds.has_control_group,
+            'unknown',
+            "has_control_group deve ser 'unknown' quando omitido no INSERT (DB default migration 0020)",
+        )
+
+    def test_partial_insert_geo_sra_disease_axis_default(self):
+        """
+        Após INSERT parcial (GEO/SRA), disease_axis deve ser 'indeterminate' (DB default).
+        """
+        row_id = self._raw_insert('GSE_REGR_AXIS_GEO')
+        ds = OmicDataset.objects.get(pk=row_id)
+        self.assertEqual(
+            ds.disease_axis,
+            'indeterminate',
+            "disease_axis deve ser 'indeterminate' quando omitido no INSERT (DB default migration 0020)",
+        )
+
+    def test_partial_insert_geo_sra_is_single_cell_default(self):
+        """
+        Após INSERT parcial (GEO/SRA), is_single_cell deve ser 'unknown' (DB default).
+        """
+        row_id = self._raw_insert('GSE_REGR_SC_GEO')
+        ds = OmicDataset.objects.get(pk=row_id)
+        self.assertEqual(
+            ds.is_single_cell,
+            'unknown',
+            "is_single_cell deve ser 'unknown' quando omitido no INSERT (DB default migration 0020)",
+        )
+
+    def test_partial_insert_geo_sra_sample_join_key_default(self):
+        """
+        Após INSERT parcial (GEO/SRA), sample_join_key deve ser [] (DB default).
+        """
+        row_id = self._raw_insert('GSE_REGR_JK_GEO')
+        ds = OmicDataset.objects.get(pk=row_id)
+        self.assertEqual(
+            ds.sample_join_key,
+            [],
+            'sample_join_key deve ser [] quando omitido no INSERT (DB default migration 0020)',
+        )
+
+    def test_partial_insert_geo_sra_all_omitted_contract_fields(self):
+        """
+        Caso completo: INSERT parcial GEO/SRA → todos os 5 campos omitidos
+        chegam aos DB defaults corretos ao mesmo tempo.
+
+        Este é o caso cerne do bug 23502: se qualquer um desses defaults
+        faltar no banco, o INSERT levanta IntegrityError.
+        """
+        row_id = self._raw_insert('GSE_REGR_ALL_GEO')
+        ds = OmicDataset.objects.get(pk=row_id)
+
+        self.assertEqual(ds.contract_confidence, {})
+        self.assertEqual(ds.has_control_group, 'unknown')
+        self.assertEqual(ds.disease_axis, 'indeterminate')
+        self.assertEqual(ds.is_single_cell, 'unknown')
+        self.assertEqual(ds.sample_join_key, [])
+
+    # ── Caso 2: PRIDE-style — inclui omics_layers/omics_count/data_format/access_type ──
+
+    def test_partial_insert_pride_subset_succeeds(self):
+        """
+        INSERT com subset PRIDE (inclui omics_layers, omics_count, data_format,
+        access_type explicitamente, omite os 5 campos de contrato puros) SUCEDE.
+
+        Espelha o PRIDE connector que preenche os campos estruturais mas não
+        classifica os eixos de contrato.
+        """
+        row_id = self._raw_insert(
+            'PXD_REGR_PRIDE',
+            extra_cols=[],
+            extra_vals=[],
+        )
+        self.assertIsNotNone(row_id)
+
+    def test_partial_insert_pride_with_explicit_omics_layers(self):
+        """
+        INSERT PRIDE com omics_layers={'proteomic'} explícito:
+          - omics_layers deve ser ['proteomic'] (valor passado)
+          - os 5 campos de contrato omitidos devem ter DB defaults corretos.
+        """
+        from django.db import connection
+        from django.utils import timezone
+
+        now = timezone.now()
+
+        # Subset PRIDE: inclui omics_layers com valor real e data_format/access_type
+        # mas omite contract_confidence, has_control_group, disease_axis,
+        # is_single_cell, sample_join_key — exatamente como o PRIDE connector.
+        pride_cols = (
+            'accession', 'source_db', 'bioproject_id', 'title', 'summary',
+            'omic_type', 'omic_subcategory', 'organism', 'tax_id', 'n_samples',
+            'platform', 'extra_metadata', 'is_active', 'ingested_at', 'updated_at',
+            'omics_layers', 'omics_count', 'data_format', 'access_type',
+        )
+        pride_vals = [
+            'PXD_REGR_LAYERS',  # accession
+            'geo',              # source_db (usando geo como proxy de teste)
+            '',                 # bioproject_id
+            'PRIDE Regression', # title
+            '',                 # summary
+            'proteomic',        # omic_type
+            '',                 # omic_subcategory
+            'Homo sapiens',     # organism
+            None,               # tax_id
+            10,                 # n_samples
+            '',                 # platform
+            '{}',               # extra_metadata
+            True,               # is_active
+            now,                # ingested_at
+            now,                # updated_at
+            '{proteomic}',      # omics_layers — literal array Postgres
+            1,                  # omics_count
+            'raw',              # data_format — valor explícito (não 'unknown')
+            'public',           # access_type — valor explícito (não 'unknown')
+        ]
+
+        col_list = ', '.join(pride_cols)
+        placeholders = ', '.join('%s' for _ in pride_cols)
+        sql = (
+            f'INSERT INTO core_omicdataset ({col_list}) '
+            f'VALUES ({placeholders}) RETURNING id'
+        )
+
+        with connection.cursor() as cursor:
+            cursor.execute(sql, pride_vals)
+            row_id = cursor.fetchone()[0]
+
+        ds = OmicDataset.objects.get(pk=row_id)
+
+        # Valores explicitamente enviados pelo PRIDE connector
+        self.assertEqual(ds.omics_layers, ['proteomic'])
+        self.assertEqual(ds.omics_count, 1)
+        self.assertEqual(ds.data_format, 'raw')
+        self.assertEqual(ds.access_type, 'public')
+
+        # Valores que DEVEM vir do DB DEFAULT (migration 0020) —
+        # se o default não existir no banco, o INSERT teria falhado antes
+        self.assertEqual(
+            ds.contract_confidence,
+            {},
+            'contract_confidence: DB default da migration 0020 deve ser {}',
+        )
+        self.assertEqual(
+            ds.has_control_group,
+            'unknown',
+            "has_control_group: DB default da migration 0020 deve ser 'unknown'",
+        )
+        self.assertEqual(
+            ds.disease_axis,
+            'indeterminate',
+            "disease_axis: DB default da migration 0020 deve ser 'indeterminate'",
+        )
+        self.assertEqual(
+            ds.is_single_cell,
+            'unknown',
+            "is_single_cell: DB default da migration 0020 deve ser 'unknown'",
+        )
+        self.assertEqual(
+            ds.sample_join_key,
+            [],
+            'sample_join_key: DB default da migration 0020 deve ser []',
+        )

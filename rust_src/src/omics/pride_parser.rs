@@ -15,41 +15,9 @@ const PHOSPHO_UNIMOD_ACC: &str = "UNIMOD:21";
 
 // ─── JSON deserialization structs (PRIDE Archive REST v3) ─────────────────────
 
-/// Resposta paginada de `/projects`
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PrideProjectsPage {
-    #[serde(rename = "_embedded", default)]
-    embedded: Option<PrideProjectsEmbedded>,
-}
-
-#[derive(Deserialize, Default)]
-struct PrideProjectsEmbedded {
-    #[serde(rename = "compactprojects", default)]
-    compact_projects: Vec<PrideCompactProject>,
-}
-
-/// Resultado de busca — projeção TRIMADA; só usamos o accession para buscar detalhe.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PrideSearchResult {
-    accession: Option<String>,
-}
-
-/// Resposta de `/search/projects`
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PrideSearchPage {
-    #[serde(default)]
-    projects: Vec<PrideSearchResult>,
-}
-
-/// Projeto compacto da listagem `/projects`
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PrideCompactProject {
-    accession: Option<String>,
-}
+// Nota: a resposta de /search/projects é parseada via serde_json::Value (genérico)
+// porque o formato do array muda entre versões da API PRIDE v3.
+// Não há structs tipadas para a busca — ver parse_search_page().
 
 /// Detalhe completo de `/projects/{accession}`
 #[derive(Deserialize, Default)]
@@ -328,57 +296,103 @@ async fn search_pride_accessions(
             .await
             .map_err(|e| format!("PRIDE search response read error: {e}"))?;
 
-        // A resposta de /search/projects tem formato variável entre versões.
-        // Tentamos o formato com "projects" array direto; se falhar, tentamos
-        // o formato com "_embedded.compactprojects".
         let page_accessions = parse_search_page(&body);
 
+        // Página vazia = fim dos resultados
         if page_accessions.is_empty() {
             break;
         }
+
+        let page_count = page_accessions.len();
 
         for acc in page_accessions {
             if accessions.len() >= max_results {
                 break;
             }
-            if !acc.is_empty() {
-                accessions.push(acc);
-            }
+            accessions.push(acc);
         }
 
-        // Verificar se há mais páginas
-        // Se recebemos menos que page_size, terminamos.
+        // Parar se esta página veio incompleta (última página) ou se já atingimos o limite
+        if page_count < page_size || accessions.len() >= max_results {
+            break;
+        }
+
         page += 1;
     }
 
     Ok(accessions)
 }
 
-/// Tenta parsear a resposta JSON de /search/projects em lista de accessions.
-/// Suporta dois formatos observados na API v3.
+/// Extrai accessions da string de resposta JSON de `/search/projects`.
+///
+/// A PRIDE API v3 mudou o formato da resposta entre versões sem versionamento
+/// explícito. São tratados três formatos, em ordem de prioridade:
+///
+/// Formato A (atual, confirmado empiricamente):
+///   Array puro no topo: `[{"accession":"PXD…", …}, …]`
+///
+/// Formato B (HAL-like):
+///   Objeto com campo "projects": `{"projects":[{"accession":"PXD…"},...], …}`
+///
+/// Formato C (HAL _embedded):
+///   `{"_embedded":{"compactprojects":[{"accession":"PXD…"},...]}}`
+///
+/// Qualquer elemento sem "accession" ou com valor vazio é silenciosamente ignorado.
 fn parse_search_page(body: &str) -> Vec<String> {
-    // Formato 1: {"projects": [{"accession": "PXDxxxxxx", ...}, ...], ...}
-    if let Ok(parsed) = serde_json::from_str::<PrideSearchPage>(body) {
-        let accs: Vec<String> = parsed
-            .projects
-            .into_iter()
-            .filter_map(|p| p.accession)
-            .filter(|a| !a.is_empty())
+    let value: JsonValue = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    // Formato A — array puro no topo
+    if let Some(arr) = value.as_array() {
+        let accs: Vec<String> = arr
+            .iter()
+            .filter_map(|item| {
+                item.get("accession")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty())
+            })
             .collect();
         if !accs.is_empty() {
             return accs;
         }
     }
 
-    // Formato 2: {"_embedded": {"compactprojects": [{"accession": ...}]}, ...}
-    if let Ok(parsed) = serde_json::from_str::<PrideProjectsPage>(body) {
-        if let Some(emb) = parsed.embedded {
-            return emb
-                .compact_projects
-                .into_iter()
-                .filter_map(|p| p.accession)
-                .filter(|a| !a.is_empty())
-                .collect();
+    // Formato B — objeto com campo "projects"
+    if let Some(arr) = value.get("projects").and_then(|v| v.as_array()) {
+        let accs: Vec<String> = arr
+            .iter()
+            .filter_map(|item| {
+                item.get("accession")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .collect();
+        if !accs.is_empty() {
+            return accs;
+        }
+    }
+
+    // Formato C — _embedded.compactprojects
+    if let Some(arr) = value
+        .get("_embedded")
+        .and_then(|e| e.get("compactprojects"))
+        .and_then(|v| v.as_array())
+    {
+        let accs: Vec<String> = arr
+            .iter()
+            .filter_map(|item| {
+                item.get("accession")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .collect();
+        if !accs.is_empty() {
+            return accs;
         }
     }
 
