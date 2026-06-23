@@ -256,6 +256,22 @@ def run_omics_ingestion(self, job_id: str):
                 job_id, job.project_id, e,
             )
 
+        # Recompute pós-ingestão: reconstrói disease_axis + monogenic_gene_hit para
+        # os datasets tocados por este job (fecha gap R4 — COPY writer apaga o campo).
+        # Assíncrono e tolerante a falha: se a task de classificação falhar, o job
+        # de ingestão já está COMPLETED e o erro fica apenas no log.
+        try:
+            from apps.core.tasks.disease_axis_tasks import recompute_disease_axis_for_job
+            recompute_disease_axis_for_job.delay(str(job_id))
+            logger.info(
+                'recompute_disease_axis_for_job enfileirado para omics job %s', job_id
+            )
+        except Exception as e:
+            logger.error(
+                'Falha ao enfileirar recompute_disease_axis_for_job após omics job %s: %s',
+                job_id, e,
+            )
+
         return {
             'datasets_processed': result.datasets_processed,
             'datasets_inserted': result.datasets_inserted,
@@ -545,6 +561,23 @@ def run_pride_ingestion(self, job_id: str):
             logger.error(
                 'advance_to_curating_if_done falhou após PRIDE job %s (projeto %s): %s',
                 job_id, job.project_id, e,
+            )
+
+        # Recompute pós-ingestão: reconstrói disease_axis + monogenic_gene_hit para
+        # os datasets PRIDE tocados por este job (fecha gap R4 — COPY writer apaga
+        # extra_metadata['contract']['monogenic_gene_hit'] ao re-ingerir o dataset).
+        # Assíncrono e tolerante a falha: se a task de classificação falhar, o job
+        # de ingestão já está COMPLETED e o erro fica apenas no log.
+        try:
+            from apps.core.tasks.disease_axis_tasks import recompute_disease_axis_for_job
+            recompute_disease_axis_for_job.delay(str(job_id))
+            logger.info(
+                'recompute_disease_axis_for_job enfileirado para PRIDE job %s', job_id
+            )
+        except Exception as e:
+            logger.error(
+                'Falha ao enfileirar recompute_disease_axis_for_job após PRIDE job %s: %s',
+                job_id, e,
             )
 
         return {

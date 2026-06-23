@@ -6,7 +6,8 @@ import uuid
 
 from django.core.cache import cache
 from django.db import IntegrityError
-from django.db.models import Count
+from django.db.models import Count, IntegerField, OuterRef, Subquery
+from django.db.models.functions import Coalesce
 from django.http import JsonResponse, StreamingHttpResponse
 from django.utils.text import slugify
 from drf_spectacular.utils import extend_schema, OpenApiResponse
@@ -15,7 +16,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 
-from apps.core.models import DaVinciProject, ProjectPaper
+from apps.core.models import DaVinciProject, ProjectDataset, ProjectPaper
 from apps.core.services.project_status import revert_to_draft
 from apps.core.serializers.project import (
     DaVinciProjectSerializer,
@@ -56,9 +57,32 @@ class DaVinciProjectViewSet(viewsets.ModelViewSet):
         return super().get_throttles()
 
     def get_queryset(self):
+        # Contagens via subquery correlacionada — NÃO via duas annotate(Count(distinct))
+        # no mesmo queryset. Anotar Count sobre duas relações multivaloradas distintas
+        # gera um JOIN cartesiano (papers × datasets) antes do DISTINCT: para um projeto
+        # com ~5k papers e ~1,8k datasets isso são ~9M linhas e a query levava ~260s,
+        # estourando o timeout do gateway (502). Cada subquery é um agregado isolado.
+        papers_count = (
+            ProjectPaper.objects.filter(project=OuterRef('pk'))
+            .order_by()
+            .values('project')
+            .annotate(c=Count('*'))
+            .values('c')
+        )
+        datasets_count = (
+            ProjectDataset.objects.filter(project=OuterRef('pk'))
+            .order_by()
+            .values('project')
+            .annotate(c=Count('*'))
+            .values('c')
+        )
         return DaVinciProject.objects.filter(user=self.request.user).annotate(
-            total_papers=Count('project_papers', distinct=True),
-            total_datasets=Count('project_datasets', distinct=True),
+            total_papers=Coalesce(
+                Subquery(papers_count, output_field=IntegerField()), 0
+            ),
+            total_datasets=Coalesce(
+                Subquery(datasets_count, output_field=IntegerField()), 0
+            ),
         )
 
     # Campos de busca que disparam revert_to_draft quando alterados em searching.

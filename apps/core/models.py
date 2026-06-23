@@ -474,6 +474,7 @@ class OmicDataset(models.Model):
     class DiseaseAxis(models.TextChoices):
         MONOGENIC = 'monogenic', 'Monogênica'
         MULTIFACTORIAL = 'multifactorial', 'Multifatorial'
+        MIXED = 'mixed', 'Mista'
         INDETERMINATE = 'indeterminate', 'Indeterminado'
 
     class DataFormat(models.TextChoices):
@@ -657,7 +658,7 @@ class OmicDataset(models.Model):
             ),
             models.CheckConstraint(
                 name='omicdataset_disease_axis_valid',
-                condition=models.Q(disease_axis__in=['monogenic', 'multifactorial', 'indeterminate']),
+                condition=models.Q(disease_axis__in=['monogenic', 'multifactorial', 'mixed', 'indeterminate']),
             ),
             models.CheckConstraint(
                 name='omicdataset_data_format_valid',
@@ -897,6 +898,57 @@ class DatasetFile(models.Model):
         return f"{self.accession} ({self.file_type}/{self.download_status})"
 
 
+class DatasetGene(models.Model):
+    """
+    Genes materializados no NÍVEL DO DATASET (não do paper).
+
+    Duas fontes de procedência (campo `source`):
+      - `paper_link`: genes herdados dos papers ligados ao dataset
+        (DatasetPaperLink -> Paper -> PaperGene).
+      - `dataset_metadata`: genes extraídos por NER sobre os campos próprios
+        do OmicDataset (title, summary, extra_metadata, ex.: contract/disease_raw).
+
+    Alimenta o sinal `monogenic_gene_hit` da Fase 3 do OmnisPathway
+    (cruzamento gene-do-dataset x lista mendeliana): um gene visto pelas DUAS
+    fontes tem confiança maior que um visto por apenas uma, por isso a
+    unicidade inclui `source` — a mesma menção pode coexistir vinda de cada
+    lado sem colidir, preservando a contagem por procedência.
+    """
+
+    class Source(models.TextChoices):
+        PAPER_LINK = 'paper_link', 'Paper Vinculado'
+        DATASET_METADATA = 'dataset_metadata', 'Metadados do Dataset'
+
+    dataset = models.ForeignKey(
+        OmicDataset,
+        on_delete=models.CASCADE,
+        related_name='genes'
+    )
+    gene_symbol = models.CharField('Símbolo do Gene', max_length=50, db_index=True)
+    entrez_id = models.BigIntegerField('Entrez Gene ID', blank=True, null=True)
+    mention_count = models.PositiveIntegerField('Menções', default=1)
+    source = models.CharField(
+        'Procedência',
+        max_length=20,
+        choices=Source.choices,
+        db_index=True
+    )
+
+    class Meta:
+        # source na unicidade: mesma menção pode vir de paper_link E
+        # dataset_metadata sem colidir — é justamente o que dá força ao
+        # monogenic_gene_hit (gene nos dois lados).
+        unique_together = ['dataset', 'gene_symbol', 'source']
+        indexes = [
+            models.Index(fields=['entrez_id']),
+            # composto p/ o cruzamento com a lista mendeliana por dataset
+            models.Index(fields=['dataset', 'gene_symbol']),
+        ]
+
+    def __str__(self):
+        return f"{self.gene_symbol} (x{self.mention_count}) — {self.dataset.accession} [{self.source}]"
+
+
 class DatasetPaperLink(models.Model):
     """
     Relação entre um dataset ômico e papers que o referenciam.
@@ -1004,6 +1056,276 @@ class ClinicalCategory(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class DiseaseAxisReference(models.Model):
+    """
+    Store de REFERÊNCIA versionado que ancora a classificação de
+    `disease_axis` (OmnisPathway, Fase 3).
+
+    Guarda nomes de trait/doença vindos de fontes externas curadas, cada um
+    pré-atribuído a um eixo (`monogenic` | `multifactorial`). A normalização
+    da Fase 3 é fuzzy name-matching leve de `disease_raw`/MeSH do dataset
+    contra estes nomes; por isso guardamos o nome cru (`name`, como veio da
+    fonte) E uma forma normalizada (`name_normalized`, lowercase/limpa) para
+    o match.
+
+    Âncoras e suas fontes:
+      - GWAS Catalog (`gwas-efo-trait-mappings.tsv`)  -> multifactorial  [P4, esta etapa]
+      - Orphanet / Gene2Phenotype (G2P)               -> monogenic       [etapa seguinte]
+      - OMIM está FORA por restrição de licença.
+
+    Apenas os dois eixos-ÂNCORA entram aqui: `monogenic` e `multifactorial`.
+    Os valores `mixed`/`indeterminate` são RESULTADO da classificação, não
+    âncora, e portanto não têm lugar neste store. Reaproveitamos os labels de
+    `OmicDataset.DiseaseAxis` para os dois que valem.
+
+    Carga (responsabilidade do vitruvio, NÃO deste model):
+      - download/parse/UPSERT são feitos fora daqui.
+      - É idempotente e versionada: `unique_together = ('source', 'name')`
+        permite re-rodar a mesma release fazendo UPSERT em vez de duplicar,
+        e `source_version` registra de qual release cada nome veio.
+
+    NOTA — âncora monogênica de GENES:
+        O sinal `monogenic_gene_hit` da Fase 3 cruza genes do dataset
+        (ver `DatasetGene`) contra a lista de genes mendelianos de
+        Orphanet/G2P. Isso é GENE, não nome de doença, e não pertence a
+        este model: vive no model próprio `MendelianGene` (logo abaixo).
+    """
+
+    class Source(models.TextChoices):
+        GWAS_CATALOG = 'gwas_catalog', 'GWAS Catalog'
+        ORPHANET = 'orphanet', 'Orphanet'
+        G2P = 'g2p', 'Gene2Phenotype'
+
+    # Eixos-âncora válidos = subconjunto de OmicDataset.DiseaseAxis.
+    # Não referenciamos o enum completo porque indeterminate/mixed não
+    # são âncoras; espelhamos só os dois valores canônicos.
+    AXIS_CHOICES = [
+        (OmicDataset.DiseaseAxis.MONOGENIC.value,
+         OmicDataset.DiseaseAxis.MONOGENIC.label),
+        (OmicDataset.DiseaseAxis.MULTIFACTORIAL.value,
+         OmicDataset.DiseaseAxis.MULTIFACTORIAL.label),
+    ]
+
+    name = models.CharField(
+        'Nome da Doença/Trait',
+        max_length=512,
+        db_index=True,
+        help_text='Nome cru, exatamente como veio da fonte.'
+    )
+    name_normalized = models.CharField(
+        'Nome Normalizado',
+        max_length=512,
+        db_index=True,
+        help_text='Lowercase/limpo, usado como alvo do fuzzy name-matching.'
+    )
+    axis = models.CharField(
+        'Eixo Ancorado',
+        max_length=20,
+        choices=AXIS_CHOICES,
+        db_index=True,
+        help_text='monogenic ou multifactorial — qual eixo esta entrada ancora.'
+    )
+    source = models.CharField(
+        'Fonte',
+        max_length=20,
+        choices=Source.choices,
+        db_index=True
+    )
+    source_version = models.CharField(
+        'Versão/Release da Fonte',
+        max_length=100,
+        blank=True,
+        default='',
+        help_text='Identificador do release (ex.: data do FTP do GWAS Catalog).'
+    )
+    loaded_at = models.DateTimeField('Carregado em', auto_now=True)
+
+    class Meta:
+        # Idempotência da carga: a MESMA (fonte, nome) é uma linha só.
+        # Escolhemos `name` (não `name_normalized`) na chave porque o nome
+        # cru é o dado autoritativo da fonte — duas grafias distintas que
+        # colapsam na mesma forma normalizada (ex.: "Type 2 diabetes" e
+        # "type-2 diabetes") devem coexistir como entradas próprias e ambas
+        # virar candidatas do fuzzy; usar name_normalized na unicidade
+        # descartaria silenciosamente sinônimos da fonte. `source` entra na
+        # chave porque a mesma doença pode ser ancorada por fontes diferentes
+        # (e até em eixos diferentes) sem colidir.
+        unique_together = ['source', 'name']
+        indexes = [
+            # Cobre o caminho quente do fuzzy: filtrar candidatos por eixo
+            # e bater por nome normalizado.
+            models.Index(
+                fields=['axis', 'name_normalized'],
+                name='diseaseaxisref_axis_norm_idx',
+            ),
+        ]
+        verbose_name = 'Disease axis reference'
+        verbose_name_plural = 'Disease axis references'
+
+    def __str__(self):
+        return f"{self.name} [{self.axis}] ({self.source})"
+
+
+class MendelianGene(models.Model):
+    """
+    Store de REFERÊNCIA versionado de GENES mendelianos (monogênicos).
+
+    É a contraparte de GENE do `DiseaseAxisReference` (que ancora NOMES de
+    doença). Aqui mora a lista contra a qual o sinal `monogenic_gene_hit` da
+    Fase 3 do OmnisPathway cruza os genes do dataset: dado um
+    `DatasetGene.gene_symbol`, este store responde "é mendeliano? de qual
+    fonte? com que confiança? associado a qual doença?".
+
+    O cross é IGUALDADE EXATA de símbolo uppercase — não fuzzy. Por isso,
+    diferente do `DiseaseAxisReference`, não há `pg_trgm`/forma normalizada
+    fuzzy: `gene_symbol` é guardado já em UPPERCASE (alinhado ao NER e ao
+    `DatasetGene`, que materializam símbolos em uppercase), e o lookup do
+    cross é um índice B-tree simples.
+
+    Fontes (estrutura já validada nos dumps):
+      - Orphanet / Orphadata product6 (XML, CC-BY-4.0): `<Gene><Symbol>`,
+        xref Ensembl (ENSG...), e a associação carrega tipo + `SourceOfValidation`
+        (PMID) — mapeado para `confidence` como assessed/not_assessed.
+      - Gene2Phenotype / G2P (CSV, EBI): `gene symbol`, `hgnc id`,
+        `disease name`, `confidence` (definitive/strong/moderate/limited).
+
+    Reaproveita o enum `Source` do `DiseaseAxisReference` (orphanet, g2p) —
+    a mesma família de fontes monogênicas.
+
+    Carga (responsabilidade do vitruvio, NÃO deste model):
+      - download/parse/UPSERT são feitos fora daqui.
+      - É idempotente e versionada: `unique_together` por
+        (source, gene_symbol, disease_name) permite re-rodar a mesma release
+        com UPSERT em vez de duplicar; `source_version`/`loaded_at` registram
+        de qual release veio cada associação.
+    """
+
+    # Mesma família de fontes monogênicas do DiseaseAxisReference.
+    # Espelhamos apenas o subconjunto que produz GENES (orphanet, g2p);
+    # GWAS Catalog não entra aqui (é multifatorial / nomes de trait).
+    class Source(models.TextChoices):
+        ORPHANET = DiseaseAxisReference.Source.ORPHANET.value, \
+            DiseaseAxisReference.Source.ORPHANET.label
+        G2P = DiseaseAxisReference.Source.G2P.value, \
+            DiseaseAxisReference.Source.G2P.label
+
+    class Confidence(models.TextChoices):
+        """
+        Escala ORDINAL normalizada que alimenta o peso do `monogenic_gene_hit`.
+
+        G2P traz a escada nativa (definitive>strong>moderate>limited). Orphanet
+        não tem essa escada: traz tipo de associação + presença/ausência de
+        `SourceOfValidation` (PMID). Mapeamos a validação do Orphanet para
+        dois degraus próprios (assessed/not_assessed) em vez de forçá-la na
+        escada do G2P, porque são escalas semanticamente distintas — colapsá-las
+        falsearia a confiança. A string crua da fonte fica em `confidence_raw`
+        para rastreabilidade/curadoria; este campo é o eixo comparável.
+        """
+        DEFINITIVE = 'definitive', 'Definitive'        # G2P
+        STRONG = 'strong', 'Strong'                    # G2P
+        MODERATE = 'moderate', 'Moderate'              # G2P
+        LIMITED = 'limited', 'Limited'                 # G2P
+        ASSESSED = 'assessed', 'Assessed'              # Orphanet c/ SourceOfValidation
+        NOT_ASSESSED = 'not_assessed', 'Not assessed'  # Orphanet s/ validação
+        UNKNOWN = 'unknown', 'Unknown'                 # fallback
+
+    gene_symbol = models.CharField(
+        'Símbolo do Gene',
+        max_length=50,
+        db_index=True,
+        help_text='UPPERCASE normalizado — casa por igualdade exata com '
+                  'DatasetGene.gene_symbol no cross do monogenic_gene_hit.'
+    )
+    entrez_id = models.BigIntegerField(
+        'Entrez Gene ID',
+        blank=True,
+        null=True,
+        help_text='Xref estável quando disponível.'
+    )
+    hgnc_id = models.CharField(
+        'HGNC ID',
+        max_length=32,
+        blank=True,
+        default='',
+        help_text='Ex.: "HGNC:6614". G2P fornece direto; Orphanet via xref.'
+    )
+    ensembl_id = models.CharField(
+        'Ensembl Gene ID',
+        max_length=32,
+        blank=True,
+        default='',
+        help_text='Ex.: "ENSG00000166813". Orphanet fornece via ExternalReference.'
+    )
+    disease_name = models.CharField(
+        'Doença Monogênica Associada',
+        max_length=512,
+        blank=True,
+        default='',
+        help_text='Doença associada ao gene na fonte — rastreabilidade da '
+                  'fila de curadoria de alto valor.'
+    )
+    source = models.CharField(
+        'Fonte',
+        max_length=20,
+        choices=Source.choices,
+        db_index=True
+    )
+    confidence = models.CharField(
+        'Confiança (normalizada)',
+        max_length=20,
+        choices=Confidence.choices,
+        default=Confidence.UNKNOWN,
+        db_index=True,
+        help_text='Escala ordinal comparável que pondera o monogenic_gene_hit.'
+    )
+    confidence_raw = models.CharField(
+        'Confiança (crua da fonte)',
+        max_length=128,
+        blank=True,
+        default='',
+        help_text='Valor original (G2P confidence ou tipo de associação '
+                  'Orphanet) antes da normalização — auditoria.'
+    )
+    source_version = models.CharField(
+        'Versão/Release da Fonte',
+        max_length=100,
+        blank=True,
+        default='',
+        help_text='Release: Orphanet date/version do <JDBOR>; G2P Last-Modified.'
+    )
+    loaded_at = models.DateTimeField('Carregado em', auto_now=True)
+
+    class Meta:
+        # Idempotência da carga: uma associação (fonte, gene, doença) é uma
+        # linha só, fazendo UPSERT no re-load. Mantemos disease_name na chave
+        # — e NÃO um esquema gene-distinto-com-doenças-em-JSON — porque a fila
+        # de curadoria de alto valor precisa de cada par gene×doença×confiança
+        # como linha própria (filtrável/joinable), e o custo do JSON-aggregate
+        # não compra nada para o cross (que é só igualdade de gene_symbol).
+        # `source` na chave: o mesmo gene/doença pode vir de Orphanet E G2P
+        # sem colidir (e um gene nas duas fontes dá força ao sinal).
+        unique_together = ['source', 'gene_symbol', 'disease_name']
+        indexes = [
+            # Caminho QUENTE do cross: lookup por símbolo (igualdade exata).
+            models.Index(
+                fields=['gene_symbol'],
+                name='mendgene_symbol_idx',
+            ),
+            # Composto p/ "este gene é mendeliano POR esta fonte?" e p/ ordenar
+            # candidatos por fonte sem tocar a heap.
+            models.Index(
+                fields=['gene_symbol', 'source'],
+                name='mendgene_symbol_source_idx',
+            ),
+        ]
+        verbose_name = 'Mendelian gene'
+        verbose_name_plural = 'Mendelian genes'
+
+    def __str__(self):
+        disease = f" → {self.disease_name}" if self.disease_name else ''
+        return f"{self.gene_symbol} [{self.confidence}] ({self.source}){disease}"
 
 
 class UserCategory(models.Model):

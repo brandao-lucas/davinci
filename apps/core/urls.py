@@ -13,6 +13,7 @@ from .views.mesh_views import ProjectMeSHViewSet
 from .views.drug_views import ProjectDrugViewSet
 from .views.variant_views import ProjectVariantViewSet
 from .views.curation_queue_views import CurationQueueViewSet
+from .views.disease_axis_queue_views import DiseaseAxisCurationQueueView
 
 router = DefaultRouter()
 router.register(r'projects', DaVinciProjectViewSet, basename='project')
@@ -72,6 +73,8 @@ variant_detail = ProjectVariantViewSet.as_view({'get': 'variant_detail'})
 
 curation_queue_list = CurationQueueViewSet.as_view({'get': 'list'})
 curation_queue_resolve = CurationQueueViewSet.as_view({'post': 'resolve'})
+
+disease_axis_queue_list = DiseaseAxisCurationQueueView.as_view({'get': 'list'})
 
 PROJECT_PREFIX = r'projects/<uuid:project_pk>/'
 
@@ -148,4 +151,7 @@ urlpatterns = [
     # resolve/ deve vir antes de <int:pk>/ para não ser capturado como pk
     path(f'{PROJECT_PREFIX}curation-queue/', curation_queue_list, name='project-curation-queue-list'),
     path(f'{PROJECT_PREFIX}curation-queue/<int:pk>/resolve/', curation_queue_resolve, name='project-curation-queue-resolve'),
+
+    # Fila de curadoria de alto valor — disease_axis (Fase 3 — OmnisPathway)
+    path(f'{PROJECT_PREFIX}disease-axis-queue/', disease_axis_queue_list, name='project-disease-axis-queue-list'),
 ]
