@@ -17,6 +17,7 @@ from apps.core.models import (
     OmicSample,
     ProjectDataset,
     ProjectSample,
+    SampleSraRun,
 )
 
 
@@ -130,10 +131,16 @@ from apps.core.serializers.dataset import (
     BulkCurateResponseSerializer,
 )
 from apps.core.serializers.download import (
+    BatchDownloadQuotaPreviewSerializer,
+    BatchDownloadRequestSerializer,
+    BatchDownloadResponseSerializer,
+    BatchFastqUrlListResponseSerializer,
     DatasetFileSerializer,
     DownloadDispatchRequestSerializer,
     DownloadDispatchResponseSerializer,
     DownloadQuotaPreviewSerializer,
+    FastqUrlItemSerializer,
+    FastqUrlListResponseSerializer,
     SraResolutionResponseSerializer,
 )
 from apps.core.serializers.link import AddDatasetToProjectRequestSerializer
@@ -194,6 +201,123 @@ def _maybe_dispatch_sample_ingestion(project_dataset: ProjectDataset) -> None:
         )
 
 
+def _resolve_fastq_urls_client(request, dataset, resolved_sample_ids):
+    """
+    Branch destination='client' — resolução síncrona de URLs públicas ENA (Inc-1).
+
+    Chama rust_engine.resolve_fastq_urls, aplica o teto CLIENT_DOWNLOAD_MAX_RUNS
+    e retorna HTTP 200 com FastqUrlListResponseSerializer.
+
+    Contrato (sensitive-data-handling):
+      - db_url e ncbi_api_key obtidos via build_db_url_and_api_key — NUNCA logados.
+      - Resposta expõe apenas URLs públicas ENA e checksums — sem storage_key,
+        sem credenciais, sem dados de outros projetos.
+
+    Args:
+        request: DRF Request com request.user autenticado.
+        dataset: OmicDataset alvo (já validado como pertencente ao projeto do user).
+        resolved_sample_ids: lista de OmicSample.id (ou None para todas as runs).
+
+    Returns:
+        DRF Response (200 ou 400).
+    """
+    import rust_engine
+    from apps.core.services.download_service import (
+        CLIENT_DOWNLOAD_MAX_RUNS,
+        build_db_url_and_api_key,
+    )
+
+    # Teto de runs por resposta (D5) — evita resposta síncrona de centenas de MB.
+    # Se scope='all' e resolved_sample_ids=None, o Rust vai buscar todas; a contagem
+    # exata só é conhecida após a chamada. Preferimos deixar o Rust executar e depois
+    # truncar, ou pré-verificar via contagem de OmicSample. Optamos por pré-verificar:
+    # se a contagem de samples na seleção exceder o teto, rejeitamos antes de chamar.
+    # Para scope='all' (None), contamos todos os samples do dataset.
+    if resolved_sample_ids is None:
+        sample_count = OmicSample.objects.filter(dataset=dataset).count()
+    else:
+        sample_count = len(resolved_sample_ids)
+
+    if sample_count > CLIENT_DOWNLOAD_MAX_RUNS:
+        return Response(
+            {
+                'detail': (
+                    f"A seleção contém {sample_count} amostras, acima do teto de "
+                    f"{CLIENT_DOWNLOAD_MAX_RUNS} runs por chamada destination='client'. "
+                    "Refine o escopo (scope='included', 'manual' ou 'filter') ou use "
+                    "destination='server' para seleções grandes."
+                )
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # Obtém credenciais — NUNCA logar (sensitive-data-handling)
+    db_url, ncbi_api_key = build_db_url_and_api_key(request.user)
+
+    try:
+        raw_entries = rust_engine.resolve_fastq_urls(
+            dataset_id=dataset.id,
+            source_db=dataset.source_db,
+            db_url=db_url,
+            sample_ids=resolved_sample_ids,
+            ncbi_api_key=ncbi_api_key,
+        )
+    except ImportError:
+        return Response(
+            {'detail': "rust_engine não instalado — compile com `maturin develop --release`."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    except Exception:
+        logger.exception(
+            'resolve_fastq_urls falhou para dataset %s',
+            dataset.accession,
+        )
+        return Response(
+            {'detail': 'Falha ao resolver URLs de download. Tente novamente.'},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    # Mapeia os objetos FastqUrlEntry retornados pelo Rust para dicts serializáveis.
+    # FastqUrlEntry expõe: run_accession, fastq_url, file_name, size_bytes, checksum_md5
+    runs = []
+    bytes_total: int | None = 0
+    bam_only_count = 0
+
+    for entry in raw_entries:
+        fastq_url: str = entry.fastq_url or ''
+        has_public_fastq = bool(fastq_url)
+        sz = entry.size_bytes  # int | None
+
+        if sz is None:
+            bytes_total = None  # sinal de "total indisponível"
+        elif bytes_total is not None:
+            bytes_total += sz
+
+        if not has_public_fastq:
+            bam_only_count += 1
+
+        runs.append({
+            'run_accession': entry.run_accession,
+            'fastq_url': fastq_url,
+            'file_name': entry.file_name or '',
+            'size_bytes': sz,
+            'checksum_md5': entry.checksum_md5,
+            'has_public_fastq': has_public_fastq,
+        })
+
+    response_data = {
+        'dataset_id': dataset.id,
+        'dataset_accession': dataset.accession,
+        'runs': runs,
+        'total_runs': len(runs),
+        'bytes_total': bytes_total,
+        'bam_only_count': bam_only_count,
+    }
+
+    serializer = FastqUrlListResponseSerializer(response_data)
+    return Response(serializer.data, status=status.HTTP_200_OK)
+
+
 class ProjectDatasetViewSet(
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
@@ -231,13 +355,12 @@ class ProjectDatasetViewSet(
                 'projectpaperdataset_set__project_paper__paper',
             )
 
-        # Anota sra_resolved: True quando ao menos um OmicSample do dataset tem
-        # extra_metadata com a chave 'sra_runs' (MVP-B — ligação GEO→SRA resolvida).
+        # Anota sra_resolved: True quando ao menos um SampleSraRun existe para
+        # o dataset (MVP-B — ligação GEO→SRA resolvida via tabela estruturada).
         # Subquery Exists evita N+1 na listagem; o serializer lê a anotação diretamente.
         sra_resolved_subquery = Exists(
-            OmicSample.objects.filter(
-                dataset_id=OuterRef('dataset_id'),
-                extra_metadata__has_key='sra_runs',
+            SampleSraRun.objects.filter(
+                sample__dataset_id=OuterRef('dataset_id'),
             )
         )
         qs = qs.annotate(sra_resolved=sra_resolved_subquery)
@@ -365,6 +488,7 @@ class ProjectDatasetViewSet(
     @extend_schema(
         request=DownloadDispatchRequestSerializer,
         responses={
+            200: FastqUrlListResponseSerializer,
             202: DownloadDispatchResponseSerializer,
             400: DownloadQuotaPreviewSerializer,
             409: DownloadQuotaPreviewSerializer,
@@ -372,26 +496,38 @@ class ProjectDatasetViewSet(
         },
         summary="Iniciar download de arquivos do dataset",
         description=(
-            "Enfileira o download dos arquivos ômicos do dataset.\n\n"
+            "Enfileira o download (destination='server') ou resolve URLs diretas "
+            "(destination='client') para os arquivos ômicos do dataset.\n\n"
             "**Derivação de file_kind por source_db:**\n"
             "- `source_db='geo'` → `file_kind='geo_supplementary'` (padrão F1, MB).\n"
             "  Body pode ser vazio ou omitir `file_kind`.\n"
-            "- `source_db='sra'` ou `source_db='geo'` com `sra_runs` resolvidos → "
-            "  `file_kind='fastq'` (F2, GB–TB). Exige `confirm=true`.\n\n"
-            "**Seleção de amostras (MVP-A):**\n"
+            "- `source_db='sra'` ou `source_db='geo'` com runs SRA resolvidos → "
+            "  `file_kind='fastq'` (F2, GB–TB).\n\n"
+            "**Destino:**\n"
+            "- `destination='server'` (padrão): enfileira Celery job → object storage → "
+            "HTTP 202. Exige `confirm=true` para FASTQ. Sujeito a quota.\n"
+            "- `destination='client'` (Inc-1): resolve URLs públicas ENA de forma "
+            "síncrona → HTTP 200. Sem job, sem quota, sem DatasetFile. "
+            "Apenas `file_kind='fastq'`. Teto: `CLIENT_DOWNLOAD_MAX_RUNS` runs "
+            "(padrão 200) — se exceder retorna HTTP 400 orientativo.\n\n"
+            "**Seleção de amostras:**\n"
             "- `scope='all'` (padrão): todas as runs do dataset.\n"
             "- `scope='included'`: só amostras com `curation_status='included'` no projeto.\n"
             "- `scope='manual'`: exatamente os `sample_ids` fornecidos (validados contra "
-            "  o projeto do usuário — ids de outro projeto → 403/404).\n\n"
+            "  o projeto do usuário — ids de outro projeto → 403/404).\n"
+            "- `scope='filter'` (Inc-2): amostras que casam o objeto `filters`. "
+            "  Filtros suportados: `curation_status` (list, IN), `organism` (icontains), "
+            "`platform` (icontains). Requer campo `filters` preenchido.\n\n"
             "**GEO → FASTQ (MVP-B):** requer resolução SRA prévia via "
             "`POST .../resolve-sra/`. Sem resolução retorna HTTP 400 orientativo.\n\n"
-            "**Quota (apenas FASTQ):**\n"
+            "**Quota (apenas FASTQ + destination='server'):**\n"
             "- Soma `DatasetFile.size_bytes` já baixados (`status='downloaded'`) do "
             "  projeto e compara com `DOWNLOAD_QUOTA_BYTES` (padrão: 200 GB).\n"
             "- Se excedida: HTTP 409 com `used_bytes` / `quota_bytes`.\n"
             "- Se `confirm=false`/ausente: HTTP 400 com prévia de quota.\n\n"
             "**GEO supplementary (F1):** sem gate de confirm ou quota — fluxo simples.\n\n"
-            "Idempotente: job ativo para o mesmo dataset+scope+sample_ids retorna o existente (202).\n"
+            "Idempotente (server): job ativo para o mesmo dataset+scope+sample_ids "
+            "retorna o existente (202).\n"
             "Progresso monitorável via GET /projects/{project_pk}/jobs/ com filtro "
             "?job_type=geo_supplementary_download ou ?job_type=fastq_download."
         ),
@@ -404,28 +540,28 @@ class ProjectDatasetViewSet(
         Body:
           {
             "file_kind": "fastq",       // opcional — derivado de source_db se omitido
-            "confirm": true,            // obrigatório para FASTQ (arquivo GB–TB)
-            "scope": "included",        // "all" (default) | "included" | "manual"
+            "confirm": true,            // obrigatório para FASTQ + destination='server'
+            "scope": "included",        // "all" (default) | "included" | "manual" | "filter"
             "sample_ids": [12, 34],     // obrigatório se scope="manual"
-            "destination": "server"     // apenas "server" neste MVP
+            "filters": {"curation_status": ["included"], "organism": "homo"},  // obrigatório se scope="filter"
+            "destination": "server"     // "server" (default) | "client"
           }
 
-        Resolve scope→lista de OmicSample.id:
-          - "all"      → None (Rust usa WHERE dataset_id)
-          - "included" → ids de OmicSample cujas ProjectSample têm status='included'
-                         no projeto do usuário (firebase-auth-guard / Regra #3)
-          - "manual"   → sample_ids validados contra ProjectSample do projeto;
-                         id de outro projeto → 403/404
+        destination='server':
+          Seta ProjectDataset.curation_status='queued' e despacha Celery.
+          Retorna HTTP 202 com o IngestionJob criado/ativo.
 
-        Seta ProjectDataset.curation_status='queued' e despacha
-        DownloadService.dispatch para enfileirar o job Celery.
-        Retorna HTTP 202 com o IngestionJob criado/ativo.
+        destination='client':
+          Chama rust_engine.resolve_fastq_urls de forma síncrona.
+          Retorna HTTP 200 com lista de URLs públicas ENA por run.
+          Não cria job, não consome quota, não grava DatasetFile.
 
         Erros:
-          HTTP 400 — FASTQ sem confirm=true (retorna prévia de quota)
+          HTTP 400 — FASTQ (server) sem confirm=true
           HTTP 400 — GEO FASTQ sem sra_runs resolvidos
-          HTTP 400 — destination='client' (Inc-1, não implementado)
-          HTTP 409 — quota de download excedida
+          HTTP 400 — destination='client' com geo_supplementary
+          HTTP 400 — seleção excede CLIENT_DOWNLOAD_MAX_RUNS (client)
+          HTTP 409 — quota de download excedida (server)
           HTTP 404 — projeto ou dataset não pertence ao usuário
         """
         from apps.core.services.download_service import (
@@ -456,7 +592,9 @@ class ProjectDatasetViewSet(
         file_kind = body_data.get('file_kind') or _SOURCE_FILE_KIND.get(dataset.source_db)
         confirm = body_data.get('confirm', False)
         scope = body_data.get('scope', 'all')
+        destination = body_data.get('destination', 'server')
         requested_sample_ids = body_data.get('sample_ids')  # None ou lista de int
+        requested_filters = body_data.get('filters')  # dict ou None; usado em scope='filter'
 
         if file_kind is None:
             return Response(
@@ -469,18 +607,14 @@ class ProjectDatasetViewSet(
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # ── Validação de file_kind='fastq' para dataset GEO (MVP-B) ──────────
-        # GEO nativo sem sra_runs → 400 orientativo.
-        # GEO com sra_runs resolvidos → permitido (caminho MVP-B).
+        # ── Validação de file_kind='fastq' para dataset GEO (MVP-B / Inc-3) ────
+        # GEO nativo sem SampleSraRun → 400 orientativo.
+        # GEO com SampleSraRun resolvidos → permitido (caminho MVP-B).
         # SRA/ENA → sempre permitido.
         if file_kind == 'fastq':
             if dataset.source_db == 'geo':
-                has_resolved_runs = OmicSample.objects.filter(
-                    dataset=dataset,
-                ).exclude(
-                    extra_metadata__sra_runs=[]
-                ).filter(
-                    extra_metadata__has_key='sra_runs'
+                has_resolved_runs = SampleSraRun.objects.filter(
+                    sample__dataset=dataset,
                 ).exists()
                 if not has_resolved_runs:
                     return Response(
@@ -569,6 +703,56 @@ class ProjectDatasetViewSet(
             # OmicSample.id para repassar ao Rust (consistente com scope='included')
             resolved_sample_ids = sorted({omic_id for _, omic_id in matched})
 
+        elif scope == 'filter':
+            # Resolve filtros → lista de OmicSample.id das amostras do dataset
+            # que casam os critérios (curation_status in, organism icontains, platform icontains).
+            # Isolamento Regra #3: base sempre filtrada por projeto+dataset do usuário autenticado.
+            from apps.core.services.download_service import apply_sample_filters
+
+            base_qs = ProjectSample.objects.filter(
+                project=project,
+                sample__dataset=dataset,
+            )
+            filtered_qs = apply_sample_filters(base_qs, requested_filters or {})
+            resolved_sample_ids = list(
+                filtered_qs.values_list('sample_id', flat=True)
+            )
+            if not resolved_sample_ids:
+                return Response(
+                    {
+                        'detail': (
+                            "Nenhuma amostra encontrada com os filtros fornecidos "
+                            "no projeto para este dataset. Ajuste os filtros e tente novamente."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # ── Branch: destination='client' (Inc-1) ────────────────────────────
+        # Resolução síncrona de URLs públicas ENA — sem job, sem quota, sem DatasetFile.
+        # Isolamento garantido: project já validado via _get_project(); sample_ids
+        # resolvidos acima contra ProjectSample do projeto (Regra #3).
+        if destination == 'client':
+            # geo_supplementary não tem URLs públicas por run na ENA — use server.
+            if file_kind != 'fastq':
+                return Response(
+                    {
+                        'detail': (
+                            "destination='client' é suportado apenas para file_kind='fastq'. "
+                            f"Este dataset usa file_kind={file_kind!r}. "
+                            "Use destination='server' para GEO supplementary."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            return _resolve_fastq_urls_client(
+                request=request,
+                dataset=dataset,
+                resolved_sample_ids=resolved_sample_ids,
+            )
+
+        # ── Branch: destination='server' (comportamento original) ────────────
         # Seta status agregado do ProjectDataset como 'queued'
         # (curation-audit-trail: não toca curated_at/exclusion_reason/notes)
         ProjectDataset.objects.filter(pk=project_dataset.pk).update(
@@ -838,3 +1022,335 @@ class ProjectDatasetViewSet(
         )
         http_status = status.HTTP_201_CREATED if created else status.HTTP_200_OK
         return Response(response_serializer.data, status=http_status)
+
+    @extend_schema(
+        request=BatchDownloadRequestSerializer,
+        responses={
+            200: BatchFastqUrlListResponseSerializer,
+            202: BatchDownloadResponseSerializer,
+            400: BatchDownloadQuotaPreviewSerializer,
+            409: BatchDownloadQuotaPreviewSerializer,
+            404: None,
+        },
+        summary="Download em lote: FASTQ de múltiplos datasets do projeto",
+        description=(
+            "Enfileira o download (destination='server') ou resolve URLs diretas "
+            "(destination='client') para múltiplos datasets do projeto de uma vez.\n\n"
+            "**Seleção de datasets:**\n"
+            "- `dataset_ids` ausente/null → todos os datasets do projeto com ao menos "
+            "  uma amostra resolvível no `scope` escolhido.\n"
+            "- `dataset_ids` fornecido → apenas os datasets listados (validados contra "
+            "  o projeto do usuário — ids de outro projeto → ignorados conforme Regra #3; "
+            "404 se *nenhum* é válido).\n\n"
+            "**Escopo de amostras por dataset:**\n"
+            "- `scope='included'` (padrão): amostras com `curation_status='included'`.\n"
+            "- `scope='all'`: todas as amostras do dataset.\n\n"
+            "**Destino:**\n"
+            "- `destination='server'` (padrão): despacha um IngestionJob por dataset → "
+            "HTTP 202. Gate de quota FASTQ calculado sobre a soma estimada do lote ANTES "
+            "de despachar qualquer job.\n"
+            "- `destination='client'` (Inc-1): resolve URLs públicas ENA de forma síncrona "
+            "por dataset e retorna HTTP 200 com lista agrupada. Teto agregado: "
+            "`CLIENT_DOWNLOAD_MAX_RUNS` runs total (padrão 200). Sem job, sem quota.\n\n"
+            "**Estratégia de jobs (server): um por dataset.**\n"
+            "Idempotência, monitorabilidade e gate de quota por projeto mantidos.\n\n"
+            "GEO supplementary (F1): sem gate de confirm/quota — despacha direto.\n\n"
+            "Progresso monitorável via GET /projects/{project_pk}/jobs/ com filtro "
+            "?job_type=fastq_download ou ?job_type=geo_supplementary_download."
+        ),
+    )
+    @action(detail=False, methods=['post'], url_path='download-batch', throttle_scope='download')
+    def download_batch(self, request, project_pk=None):
+        """
+        POST /projects/{project_pk}/datasets/download-batch/
+
+        destination='server': despacha um IngestionJob por dataset alvo.
+          Gate de quota FASTQ sobre a soma estimada do lote — se falhar, nenhum job criado.
+          Retorna HTTP 202 com lista de jobs.
+
+        destination='client': resolve URLs públicas ENA por dataset de forma síncrona.
+          Retorna HTTP 200 com lista agrupada. Teto agregado CLIENT_DOWNLOAD_MAX_RUNS.
+
+        Erros:
+          HTTP 400 — FASTQ (server) sem confirm=true — body com prévia agregada.
+          HTTP 400 — lote excede CLIENT_DOWNLOAD_MAX_RUNS (client).
+          HTTP 409 — quota excedida (server) — body com prévia agregada.
+          HTTP 404 — projeto não pertence ao usuário ou nenhum dataset válido.
+        """
+        from django.conf import settings
+        from apps.core.models import SampleSraRun as _SampleSraRun
+        from apps.core.services.download_service import (
+            CLIENT_DOWNLOAD_MAX_RUNS,
+            DownloadService,
+            FastqConfirmRequiredError,
+            QuotaExceededError,
+            _project_used_bytes,
+        )
+
+        project = self._get_project()  # 404 se projeto não pertence ao user
+
+        body_serializer = BatchDownloadRequestSerializer(data=request.data)
+        body_serializer.is_valid(raise_exception=True)
+        body_data = body_serializer.validated_data
+
+        requested_dataset_ids = body_data.get('dataset_ids')  # None ou lista de int
+        scope = body_data.get('scope', 'included')
+        confirm = body_data.get('confirm', False)
+        destination = body_data.get('destination', 'server')
+
+        # ── Resolve conjunto de datasets alvo ────────────────────────────────
+        # Sempre filtrado por projeto do usuário (Regra #3).
+        base_pd_qs = ProjectDataset.objects.filter(project=project).select_related('dataset')
+        if requested_dataset_ids:
+            base_pd_qs = base_pd_qs.filter(dataset_id__in=requested_dataset_ids)
+
+        target_project_datasets = list(base_pd_qs)
+
+        if not target_project_datasets:
+            return Response(
+                {'detail': "Nenhum dataset encontrado no projeto com os critérios fornecidos."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # ── Mapeamento source_db → file_kind (mesmo padrão do single download) ─
+        _SOURCE_FILE_KIND = {
+            'geo': 'geo_supplementary',
+            'sra': 'fastq',
+            'ena': 'fastq',
+        }
+
+        # ── Resolve sample_ids por dataset e separa FASTQ dos GEO supp ────────
+        # Para cada dataset: resolve as amostras conforme scope e decide file_kind.
+        # Datasets sem amostras resolvíveis são listados em skipped_datasets.
+        batch_items = []   # [(project_dataset, dataset, file_kind, sample_ids)]
+        skipped_accessions = []
+
+        for pd in target_project_datasets:
+            dataset = pd.dataset
+            file_kind = _SOURCE_FILE_KIND.get(dataset.source_db)
+            if file_kind is None:
+                skipped_accessions.append(dataset.accession)
+                continue
+
+            # Para GEO FASTQ, verifica resolução SRA (mesmo gate do single)
+            if file_kind == 'fastq' and dataset.source_db == 'geo':
+                has_runs = _SampleSraRun.objects.filter(
+                    sample__dataset=dataset,
+                ).exists()
+                if not has_runs:
+                    # GEO sem resolução: usa geo_supplementary como fallback
+                    file_kind = 'geo_supplementary'
+
+            if scope == 'included':
+                sample_ids = list(
+                    ProjectSample.objects.filter(
+                        project=project,
+                        sample__dataset=dataset,
+                        curation_status=ProjectSample.CurationStatus.INCLUDED,
+                    ).values_list('sample_id', flat=True)
+                )
+            else:  # 'all'
+                sample_ids = list(
+                    ProjectSample.objects.filter(
+                        project=project,
+                        sample__dataset=dataset,
+                    ).values_list('sample_id', flat=True)
+                )
+
+            if not sample_ids:
+                skipped_accessions.append(dataset.accession)
+                continue
+
+            batch_items.append((pd, dataset, file_kind, sample_ids))
+
+        if not batch_items:
+            return Response(
+                {
+                    'detail': (
+                        "Nenhum dataset com amostras resolvíveis encontrado no escopo "
+                        f"scope={scope!r}. Datasets ignorados: {skipped_accessions}."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ── Branch: destination='client' ─────────────────────────────────────
+        # Resolve URLs por dataset de forma síncrona e agrega. Mesmo teto
+        # CLIENT_DOWNLOAD_MAX_RUNS mas aplicado à soma de todos os datasets.
+        if destination == 'client':
+            total_sample_count = sum(len(sids) for _, _, _, sids in batch_items)
+            if total_sample_count > CLIENT_DOWNLOAD_MAX_RUNS:
+                return Response(
+                    {
+                        'detail': (
+                            f"O lote contém {total_sample_count} amostras no total, "
+                            f"acima do teto de {CLIENT_DOWNLOAD_MAX_RUNS} runs por chamada "
+                            "destination='client'. Reduza dataset_ids, refine scope ou use "
+                            "destination='server'."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Resolve por dataset, agrega resultados
+            per_dataset_results = []
+            batch_skipped = list(skipped_accessions)
+            batch_bytes_total: int | None = 0
+            batch_total_runs = 0
+
+            for pd, ds, file_kind, sample_ids in batch_items:
+                if file_kind != 'fastq':
+                    # GEO supp sem URLs por run — pula com nota
+                    batch_skipped.append(ds.accession)
+                    continue
+
+                resp = _resolve_fastq_urls_client(
+                    request=request,
+                    dataset=ds,
+                    resolved_sample_ids=sample_ids if sample_ids else None,
+                )
+                if resp.status_code != status.HTTP_200_OK:
+                    # Erro na resolução deste dataset — pula, não derruba o lote
+                    logger.warning(
+                        'BatchDownload client: falha na resolução de %s (status=%s) — ignorando.',
+                        ds.accession,
+                        resp.status_code,
+                    )
+                    batch_skipped.append(ds.accession)
+                    continue
+
+                ds_data = resp.data
+                per_dataset_results.append(ds_data)
+                batch_total_runs += ds_data.get('total_runs', 0)
+
+                ds_bytes = ds_data.get('bytes_total')
+                if ds_bytes is None:
+                    batch_bytes_total = None
+                elif batch_bytes_total is not None:
+                    batch_bytes_total += ds_bytes
+
+            batch_response = {
+                'datasets': per_dataset_results,
+                'total_datasets': len(per_dataset_results),
+                'total_runs': batch_total_runs,
+                'bytes_total': batch_bytes_total,
+                'skipped_datasets': batch_skipped,
+            }
+            return Response(
+                BatchFastqUrlListResponseSerializer(batch_response).data,
+                status=status.HTTP_200_OK,
+            )
+
+        # ── Branch: destination='server' ─────────────────────────────────────
+        # Gate de quota FASTQ — soma estimada do lote ANTES de despachar.
+        # Apenas itens FASTQ entram no cálculo. GEO supp é isento (F1).
+        fastq_items = [(pd, ds, fk, sids) for pd, ds, fk, sids in batch_items if fk == 'fastq']
+
+        if fastq_items:
+            quota_bytes = getattr(settings, 'DOWNLOAD_QUOTA_BYTES', 200 * 1024 ** 3)
+            used_bytes = _project_used_bytes(project)
+
+            # Estimativa: soma SampleSraRun.size_bytes das amostras selecionadas.
+            # size_bytes pode ser None se o cache ENA não foi populado — tratamos como 0.
+            fastq_sample_ids = []
+            for _, _, _, sids in fastq_items:
+                fastq_sample_ids.extend(sids)
+
+            from django.db.models import Sum as _Sum
+            estimated_bytes = (
+                _SampleSraRun.objects.filter(sample_id__in=fastq_sample_ids)
+                .aggregate(total=_Sum('size_bytes'))
+            )['total'] or 0
+
+            # Prévia por dataset para UX
+            datasets_preview = [
+                {
+                    'dataset_accession': ds.accession,
+                    'sample_count': len(sids),
+                }
+                for _, ds, fk, sids in batch_items
+            ]
+
+            if not confirm:
+                preview_data = {
+                    'detail': (
+                        "Download FASTQ em lote requer confirmação explícita. "
+                        "Reenvie com confirm=true para confirmar o download."
+                    ),
+                    'used_bytes': used_bytes,
+                    'quota_bytes': quota_bytes,
+                    'estimated_bytes': estimated_bytes,
+                    'confirm_required': True,
+                    'datasets_preview': datasets_preview,
+                }
+                return Response(
+                    BatchDownloadQuotaPreviewSerializer(preview_data).data,
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if used_bytes + estimated_bytes > quota_bytes:
+                logger.warning(
+                    'BatchDownload: QuotaExceededError para projeto %s '
+                    '(used=%s, estimated=%s, quota=%s)',
+                    project.id, used_bytes, estimated_bytes, quota_bytes,
+                )
+                preview_data = {
+                    'detail': (
+                        "Quota de download do projeto excedida pelo lote estimado. "
+                        "Remova arquivos existentes ou contate o suporte."
+                    ),
+                    'used_bytes': used_bytes,
+                    'quota_bytes': quota_bytes,
+                    'estimated_bytes': estimated_bytes,
+                    'confirm_required': False,
+                    'datasets_preview': datasets_preview,
+                }
+                return Response(
+                    BatchDownloadQuotaPreviewSerializer(preview_data).data,
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+        # Gate passou: despacha um job por dataset.
+        # DownloadService.dispatch é idempotente — job ativo retornado sem duplicar.
+        created_jobs = []
+        for pd, dataset, file_kind, sample_ids in batch_items:
+            # Marca ProjectDataset como queued (curation-audit-trail)
+            ProjectDataset.objects.filter(pk=pd.pk).update(
+                curation_status=ProjectDataset.CurationStatus.QUEUED_DOWNLOAD,
+            )
+            try:
+                job = DownloadService.dispatch(
+                    project=project,
+                    dataset=dataset,
+                    file_kind=file_kind,
+                    user=request.user,
+                    confirm=confirm,
+                    scope=scope,
+                    sample_ids=sorted(sample_ids),
+                )
+                created_jobs.append(job)
+            except (FastqConfirmRequiredError, QuotaExceededError):
+                # Não deve acontecer: gate verificado acima — bug se chegar aqui.
+                logger.error(
+                    'BatchDownload: quota/confirm error inesperado em dataset %s '
+                    'após gate de lote — ignorando.',
+                    dataset.accession,
+                )
+                skipped_accessions.append(dataset.accession)
+            except Exception as exc:
+                logger.error(
+                    'BatchDownload: falha ao despachar job para dataset %s: %s',
+                    dataset.accession,
+                    exc,
+                )
+                skipped_accessions.append(dataset.accession)
+
+        response_data = {
+            'jobs': created_jobs,
+            'total_jobs': len(created_jobs),
+            'skipped_datasets': skipped_accessions,
+        }
+        return Response(
+            BatchDownloadResponseSerializer(response_data).data,
+            status=status.HTTP_202_ACCEPTED,
+        )

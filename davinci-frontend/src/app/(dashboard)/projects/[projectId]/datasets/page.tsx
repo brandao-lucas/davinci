@@ -6,6 +6,7 @@ import { PageHeader } from '@/components/layout/page-header';
 import { DatasetsTable } from '@/components/datasets/datasets-table';
 import { DatasetDetailPanel } from '@/components/datasets/dataset-detail-panel';
 import { DatasetBulkCurationBar } from '@/components/datasets/dataset-bulk-curation-bar';
+import { DatasetBatchDownloadDialog } from '@/components/datasets/dataset-batch-download-dialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -19,7 +20,7 @@ import { useDebounce } from '@/lib/hooks/use-debounce';
 import { descriptorsChangedSinceLastSearch } from '@/lib/utils/descriptor-diff';
 import { useFilterStore } from '@/lib/stores/filter-store';
 import type { OmicDataset } from '@/lib/types/dataset';
-import { Loader2, Search, Database } from 'lucide-react';
+import { Loader2, Search, Database, Download } from 'lucide-react';
 
 const OMIC_TYPES = ['genomic', 'transcriptomic', 'proteomic', 'metabolomic', 'epigenomic', 'metagenomic', 'multi_omic'];
 const SOURCE_DBS = [
@@ -35,6 +36,7 @@ function DatasetsPageContent({ projectId }: { projectId: string }) {
   const searchParams = useSearchParams();
   const [selectedDataset, setSelectedDataset] = useState<OmicDataset | null>(null);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const [batchDownloadOpen, setBatchDownloadOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const debouncedQuery = useDebounce(searchQuery, 300);
 
@@ -90,19 +92,28 @@ function DatasetsPageContent({ projectId }: { projectId: string }) {
         title="Datasets"
         description={`${data?.count ?? '…'} omics datasets`}
         actions={
-          <Button
-            onClick={() => dispatchOmics.mutate({})}
-            disabled={isSearchDisabled}
-            variant={dispatchOmics.isError ? 'destructive' : 'default'}
-            title={searchButtonTitle}
-          >
-            {isSearching
-              ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" />Searching datasets…</>
-              : dispatchOmics.isError
-                ? 'Failed — Retry'
-                : <><Database className="h-4 w-4 mr-2" />Search Datasets</>
-            }
-          </Button>
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setBatchDownloadOpen(true)}
+            >
+              <Download className="h-4 w-4 mr-2" />
+              Baixar incluidas (lote)
+            </Button>
+            <Button
+              onClick={() => dispatchOmics.mutate({})}
+              disabled={isSearchDisabled}
+              variant={dispatchOmics.isError ? 'destructive' : 'default'}
+              title={searchButtonTitle}
+            >
+              {isSearching
+                ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" />Searching datasets…</>
+                : dispatchOmics.isError
+                  ? 'Failed — Retry'
+                  : <><Database className="h-4 w-4 mr-2" />Search Datasets</>
+              }
+            </Button>
+          </div>
         }
       />
 
@@ -202,6 +213,13 @@ function DatasetsPageContent({ projectId }: { projectId: string }) {
         dataset={selectedDataset}
         projectId={projectId}
         onClose={() => setSelectedDataset(null)}
+      />
+
+      <DatasetBatchDownloadDialog
+        projectId={projectId}
+        open={batchDownloadOpen}
+        onOpenChange={setBatchDownloadOpen}
+        datasetIds={selectedIds.length > 0 ? selectedIds : undefined}
       />
 
       <DatasetBulkCurationBar

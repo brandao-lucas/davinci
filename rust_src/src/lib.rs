@@ -94,7 +94,10 @@ fn search_and_ingest_pubmed(
         // 1. Connect to DB and mark job running
         let client = match crate::db::connection::connect_db(&db_url).await {
             Ok(c) => c,
-            Err(e) => return Err(format!("DB connection failed: {e}")),
+            Err(e) => {
+                eprintln!("[db] connection error: {e}");
+                return Err("DB connection failed".to_string());
+            }
         };
         let project_id_uuid = uuid::Uuid::parse_str(&project_id)
             .map_err(|e| format!("Invalid project_id UUID '{}': {e}", project_id))?;
@@ -290,7 +293,10 @@ fn search_and_ingest_omics(
         // 1. Connect and mark job running
         let db_client = match crate::db::connection::connect_db(&db_url).await {
             Ok(c) => c,
-            Err(e) => return Err(format!("DB connection failed: {e}")),
+            Err(e) => {
+                eprintln!("[db] connection error: {e}");
+                return Err("DB connection failed".to_string());
+            }
         };
         let project_id_uuid = uuid::Uuid::parse_str(&project_id)
             .map_err(|e| format!("Invalid project_id UUID '{}': {e}", project_id))?;
@@ -527,7 +533,10 @@ fn search_and_ingest_pride(
         // 1. Conectar ao banco e marcar job como running
         let db_client = match crate::db::connection::connect_db(&db_url).await {
             Ok(c) => c,
-            Err(e) => return Err(format!("DB connection failed: {e}")),
+            Err(e) => {
+                eprintln!("[db] connection error: {e}");
+                return Err("DB connection failed".to_string());
+            }
         };
         let project_id_uuid = uuid::Uuid::parse_str(&project_id)
             .map_err(|e| format!("Invalid project_id UUID '{}': {e}", project_id))?;
@@ -633,7 +642,7 @@ fn resolve_pending_links(db_url: String) -> PyResult<u64> {
     let result: Result<u64, String> = rt.block_on(async {
         let client = crate::db::connection::connect_db(&db_url)
             .await
-            .map_err(|e| format!("DB connection failed: {e}"))?;
+            .map_err(|e| { eprintln!("[db] connection error: {e}"); "DB connection failed".to_string() })?;
 
         crate::db::copy_writer::resolve_pending_links(&client)
             .await
@@ -721,7 +730,10 @@ fn ingest_samples_for_dataset(
         // 1. Connect to DB
         let db_client = match crate::db::connection::connect_db(&db_url).await {
             Ok(c) => c,
-            Err(e) => return Err(format!("DB connection failed: {e}")),
+            Err(e) => {
+                eprintln!("[db] connection error: {e}");
+                return Err("DB connection failed".to_string());
+            }
         };
 
         let mut errors: Vec<String> = Vec::new();
@@ -857,7 +869,10 @@ fn download_dataset_files(
         // 1. Connect to DB and mark job running
         let db_client = match crate::db::connection::connect_db(&db_url).await {
             Ok(c) => c,
-            Err(e) => return Err(format!("DB connection failed: {e}")),
+            Err(e) => {
+                eprintln!("[db] connection error: {e}");
+                return Err("DB connection failed".to_string());
+            }
         };
 
         crate::db::job_tracker::update_job_status(&db_client, &job_id, "running", 0, 0, 0, None)
@@ -1223,7 +1238,10 @@ fn resolve_sra_runs_for_dataset(
     let result: Result<SraResolutionResult, String> = rt.block_on(async {
         let db_client = match crate::db::connection::connect_db(&db_url).await {
             Ok(c) => c,
-            Err(e) => return Err(format!("DB connection failed: {e}")),
+            Err(e) => {
+                eprintln!("[db] connection error: {e}");
+                return Err("DB connection failed".to_string());
+            }
         };
 
         // ncbi_api_key is intentionally NOT logged anywhere in this function
@@ -1245,6 +1263,138 @@ fn resolve_sra_runs_for_dataset(
 
     match result {
         Ok(res) => Ok(res),
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
+// ─── Inc-1: FASTQ URL resolution (destination='client') ──────────────────────
+
+/// One FASTQ URL entry returned by `resolve_fastq_urls`.
+///
+/// `fastq_url` contains one or two HTTPS URLs separated by `;` for paired-end
+/// runs.  An empty string signals a bam-only run (no public FASTQ on ENA).
+#[pyclass]
+#[derive(Clone)]
+pub struct FastqUrlEntry {
+    /// SRR / ERR / DRR accession.
+    #[pyo3(get)]
+    pub run_accession: String,
+    /// HTTPS FASTQ URL(s), `;`-joined.  Empty string = no public FASTQ (bam-only).
+    #[pyo3(get)]
+    pub fastq_url: String,
+    /// Basename(s) derived from `fastq_url`, `;`-joined.  Empty when URL is empty.
+    #[pyo3(get)]
+    pub file_name: String,
+    /// Declared total size in bytes (R1 + R2 for paired-end).  `None` when unknown.
+    #[pyo3(get)]
+    pub size_bytes: Option<i64>,
+    /// MD5 checksum(s), `;`-joined, lowercase.  `None` when unavailable.
+    #[pyo3(get)]
+    pub checksum_md5: Option<String>,
+}
+
+#[pymethods]
+impl FastqUrlEntry {
+    #[new]
+    fn new() -> Self {
+        FastqUrlEntry {
+            run_accession: String::new(),
+            fastq_url: String::new(),
+            file_name: String::new(),
+            size_bytes: None,
+            checksum_md5: None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FastqUrlEntry(run_accession={:?}, fastq_url={:?}, size_bytes={:?})",
+            self.run_accession, self.fastq_url, self.size_bytes
+        )
+    }
+}
+
+/// Resolve public ENA FASTQ URLs for a dataset without downloading anything.
+///
+/// Intended for `destination='client'` (Inc-1): the Django view calls this
+/// synchronously, receives the list, and returns it directly in the HTTP
+/// response.  The browser then fetches each URL directly from ENA — no quota
+/// consumed, no object-storage writes, no `DatasetFile` records created.
+///
+/// # Source routing
+///
+/// - `source_db="geo"`: reads cached URLs from `core_samplesrarun` (no HTTP).
+/// - `source_db="sra"|"ena"`: queries ENA Portal filereport per run (HTTP).
+///
+/// # Bam-only runs
+///
+/// Runs where ENA has no public FASTQ are included with `fastq_url=""` so
+/// the caller can surface a clear "no public FASTQ" status.
+///
+/// # Security
+///
+/// `ncbi_api_key` is forwarded to `NcbiClient` for rate-limited HTTP calls
+/// only.  It is **never** written to logs, return values, or error messages.
+///
+/// # Returns
+///
+/// `list[FastqUrlEntry]` — one entry per resolved run.
+/// Raises `PyRuntimeError` only on fatal errors (DB connection failure).
+/// Per-run HTTP errors are non-fatal and written to stderr.
+#[pyfunction]
+#[pyo3(signature = (dataset_id, source_db, db_url, sample_ids=None, ncbi_api_key=None))]
+fn resolve_fastq_urls(
+    dataset_id: i64,
+    source_db: String,
+    db_url: String,
+    sample_ids: Option<Vec<i64>>,
+    ncbi_api_key: Option<String>,
+) -> PyResult<Vec<FastqUrlEntry>> {
+    let rt = Runtime::new().unwrap();
+
+    let result: Result<Vec<FastqUrlEntry>, String> = rt.block_on(async {
+        let db_client = match crate::db::connection::connect_db(&db_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[db] connection error: {e}");
+                return Err("DB connection failed".to_string());
+            }
+        };
+
+        // ncbi_api_key forwarded to NcbiClient only — never logged
+        let ncbi = crate::ncbi::client::NcbiClient::new(ncbi_api_key);
+
+        let (records, errors) =
+            crate::omics::downloader::resolve_fastq_urls_for_dataset(
+                &ncbi,
+                &db_client,
+                dataset_id,
+                &source_db,
+                sample_ids.as_deref(),
+            )
+            .await;
+
+        // Log non-fatal errors to stderr (operator visibility)
+        for e in &errors {
+            eprintln!("[resolve_fastq_urls] non-fatal: {}", e);
+        }
+
+        let entries = records
+            .into_iter()
+            .map(|r| FastqUrlEntry {
+                run_accession: r.run_accession,
+                fastq_url: r.fastq_url,
+                file_name: r.file_name,
+                size_bytes: r.size_bytes,
+                checksum_md5: r.checksum_md5,
+            })
+            .collect();
+
+        Ok(entries)
+    });
+
+    match result {
+        Ok(entries) => Ok(entries),
         Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
     }
 }
@@ -1271,6 +1421,7 @@ fn rust_engine(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SampleIngestionResult>()?;
     m.add_class::<DownloadResult>()?;
     m.add_class::<SraResolutionResult>()?;
+    m.add_class::<FastqUrlEntry>()?;
     // MeSH / preview types and functions
     m.add_class::<MagnitudePreview>()?;
     m.add_class::<MeshSuggestion>()?;
@@ -1281,6 +1432,7 @@ fn rust_engine(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ingest_samples_for_dataset, m)?)?;
     m.add_function(wrap_pyfunction!(download_dataset_files, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_sra_runs_for_dataset, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_fastq_urls, m)?)?;
     m.add_function(wrap_pyfunction!(pubmed_magnitude_preview, m)?)?;
     m.add_function(wrap_pyfunction!(mesh_suggest, m)?)?;
     m.add_function(wrap_pyfunction!(extract_genes, m)?)?;

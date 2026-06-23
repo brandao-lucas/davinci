@@ -47,6 +47,40 @@ from apps.core.models import DatasetFile, DaVinciProject, IngestionJob, OmicData
 
 logger = logging.getLogger(__name__)
 
+# Teto de runs por chamada destination='client' (D5).
+# Acima deste limite a view retorna HTTP 400 orientativo pedindo refinamento de
+# scope ou uso de destination='server'. Evita respostas síncronas de centenas de MB.
+CLIENT_DOWNLOAD_MAX_RUNS: int = 200
+
+
+def build_db_url_and_api_key(user) -> tuple[str, str | None]:
+    """
+    Constrói db_url e obtém ncbi_api_key do profile do usuário ou de settings.
+
+    Padrão idêntico ao das tasks Celery (run_omics_download, run_sample_ingestion,
+    run_sra_resolution) — centralizado aqui para o branch síncrono
+    (destination='client') sem duplicar lógica sensível.
+
+    NUNCA logar os valores retornados (sensitive-data-handling).
+    NUNCA armazenar db_url ou ncbi_api_key em IngestionJob.parameters.
+
+    Returns:
+        (db_url, ncbi_api_key) — ncbi_api_key pode ser None.
+    """
+    db = settings.DATABASES['default']
+    db_url = (
+        f"postgresql://{db['USER']}:{db['PASSWORD']}"
+        f"@{db['HOST']}:{db['PORT']}/{db['NAME']}"
+    )
+
+    ncbi_api_key = getattr(settings, 'NCBI_API_KEY', None)
+    try:
+        ncbi_api_key = user.profile.ncbi_api_key or ncbi_api_key
+    except Exception:
+        pass
+
+    return db_url, ncbi_api_key
+
 
 class QuotaExceededError(Exception):
     """
@@ -335,6 +369,43 @@ class SraResolutionService:
             raise
 
         return job
+
+
+def apply_sample_filters(queryset, filters: dict):
+    """
+    Aplica filtros de seleção de amostra a um queryset de ProjectSample.
+
+    Todos os campos são opcionais e combinados com AND. O queryset de entrada
+    deve já estar filtrado por projeto (Regra #3 — isolamento por usuário).
+
+    Filtros suportados:
+      curation_status  — lista de valores (IN). Ex.: ['included', 'maybe']
+      organism         — OmicSample.organism icontains
+      platform         — OmicSample.platform icontains
+
+    Args:
+        queryset: QuerySet de ProjectSample já filtrado pelo projeto do usuário.
+        filters:  dict validado por SampleFilterSerializer (pode conter None).
+
+    Returns:
+        QuerySet filtrado.
+    """
+    if not filters:
+        return queryset
+
+    curation_status = filters.get('curation_status')
+    if curation_status:
+        queryset = queryset.filter(curation_status__in=curation_status)
+
+    organism = filters.get('organism')
+    if organism:
+        queryset = queryset.filter(sample__organism__icontains=organism)
+
+    platform = filters.get('platform')
+    if platform:
+        queryset = queryset.filter(sample__platform__icontains=platform)
+
+    return queryset
 
 
 def _project_used_bytes(project: DaVinciProject) -> int:

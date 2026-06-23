@@ -409,28 +409,33 @@ export interface paths {
         put?: never;
         /**
          * Iniciar download de arquivos do dataset
-         * @description Enfileira o download dos arquivos ômicos do dataset.
+         * @description Enfileira o download (destination='server') ou resolve URLs diretas (destination='client') para os arquivos ômicos do dataset.
          *
          *     **Derivação de file_kind por source_db:**
          *     - `source_db='geo'` → `file_kind='geo_supplementary'` (padrão F1, MB).
          *       Body pode ser vazio ou omitir `file_kind`.
-         *     - `source_db='sra'` ou `source_db='geo'` com `sra_runs` resolvidos →   `file_kind='fastq'` (F2, GB–TB). Exige `confirm=true`.
+         *     - `source_db='sra'` ou `source_db='geo'` com runs SRA resolvidos →   `file_kind='fastq'` (F2, GB–TB).
          *
-         *     **Seleção de amostras (MVP-A):**
+         *     **Destino:**
+         *     - `destination='server'` (padrão): enfileira Celery job → object storage → HTTP 202. Exige `confirm=true` para FASTQ. Sujeito a quota.
+         *     - `destination='client'` (Inc-1): resolve URLs públicas ENA de forma síncrona → HTTP 200. Sem job, sem quota, sem DatasetFile. Apenas `file_kind='fastq'`. Teto: `CLIENT_DOWNLOAD_MAX_RUNS` runs (padrão 200) — se exceder retorna HTTP 400 orientativo.
+         *
+         *     **Seleção de amostras:**
          *     - `scope='all'` (padrão): todas as runs do dataset.
          *     - `scope='included'`: só amostras com `curation_status='included'` no projeto.
          *     - `scope='manual'`: exatamente os `sample_ids` fornecidos (validados contra   o projeto do usuário — ids de outro projeto → 403/404).
+         *     - `scope='filter'` (Inc-2): amostras que casam o objeto `filters`.   Filtros suportados: `curation_status` (list, IN), `organism` (icontains), `platform` (icontains). Requer campo `filters` preenchido.
          *
          *     **GEO → FASTQ (MVP-B):** requer resolução SRA prévia via `POST .../resolve-sra/`. Sem resolução retorna HTTP 400 orientativo.
          *
-         *     **Quota (apenas FASTQ):**
+         *     **Quota (apenas FASTQ + destination='server'):**
          *     - Soma `DatasetFile.size_bytes` já baixados (`status='downloaded'`) do   projeto e compara com `DOWNLOAD_QUOTA_BYTES` (padrão: 200 GB).
          *     - Se excedida: HTTP 409 com `used_bytes` / `quota_bytes`.
          *     - Se `confirm=false`/ausente: HTTP 400 com prévia de quota.
          *
          *     **GEO supplementary (F1):** sem gate de confirm ou quota — fluxo simples.
          *
-         *     Idempotente: job ativo para o mesmo dataset+scope+sample_ids retorna o existente (202).
+         *     Idempotente (server): job ativo para o mesmo dataset+scope+sample_ids retorna o existente (202).
          *     Progresso monitorável via GET /projects/{project_pk}/jobs/ com filtro ?job_type=geo_supplementary_download ou ?job_type=fastq_download.
          */
         post: operations["projects_datasets_download_create"];
@@ -559,6 +564,45 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/projects/{project_pk}/datasets/download-batch/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Download em lote: FASTQ de múltiplos datasets do projeto
+         * @description Enfileira o download (destination='server') ou resolve URLs diretas (destination='client') para múltiplos datasets do projeto de uma vez.
+         *
+         *     **Seleção de datasets:**
+         *     - `dataset_ids` ausente/null → todos os datasets do projeto com ao menos   uma amostra resolvível no `scope` escolhido.
+         *     - `dataset_ids` fornecido → apenas os datasets listados (validados contra   o projeto do usuário — ids de outro projeto → ignorados conforme Regra #3; 404 se *nenhum* é válido).
+         *
+         *     **Escopo de amostras por dataset:**
+         *     - `scope='included'` (padrão): amostras com `curation_status='included'`.
+         *     - `scope='all'`: todas as amostras do dataset.
+         *
+         *     **Destino:**
+         *     - `destination='server'` (padrão): despacha um IngestionJob por dataset → HTTP 202. Gate de quota FASTQ calculado sobre a soma estimada do lote ANTES de despachar qualquer job.
+         *     - `destination='client'` (Inc-1): resolve URLs públicas ENA de forma síncrona por dataset e retorna HTTP 200 com lista agrupada. Teto agregado: `CLIENT_DOWNLOAD_MAX_RUNS` runs total (padrão 200). Sem job, sem quota.
+         *
+         *     **Estratégia de jobs (server): um por dataset.**
+         *     Idempotência, monitorabilidade e gate de quota por projeto mantidos.
+         *
+         *     GEO supplementary (F1): sem gate de confirm/quota — despacha direto.
+         *
+         *     Progresso monitorável via GET /projects/{project_pk}/jobs/ com filtro ?job_type=fastq_download ou ?job_type=geo_supplementary_download.
+         */
+        post: operations["projects_datasets_download_batch_create"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/projects/{project_pk}/datasets/search/": {
         parameters: {
             query?: never;
@@ -588,7 +632,7 @@ export interface paths {
         };
         /**
          * Listar fila de curadoria de alto valor (disease_axis)
-         * @description Lista ProjectDatasets do projeto com disease_axis classificado como "mixed" (âncora monogênica + multifatorial detectadas) ou com discordância (monogenic_gene_hit presente mas disease_axis fora de {monogenic, mixed}). "indeterminate" puro (sem gene hit) é terminal e NÃO aparece aqui. Cada item inclui o campo queue_reason ("mixed" ou "discordance") para a UI saber por que o dataset entrou na fila. Apenas datasets do projeto do usuário autenticado são expostos (sem vazamento cross-user). Retorna lista vazia se não houver itens pendentes de revisão.
+         * @description Lista paginada de ProjectDatasets do projeto com disease_axis classificado como "mixed" (âncora monogênica + multifatorial detectadas) ou com discordância (monogenic_gene_hit presente mas disease_axis fora de {monogenic, mixed}). "indeterminate" puro (sem gene hit) é terminal e NÃO aparece aqui. Cada item inclui o campo queue_reason ("mixed" ou "discordance") para a UI saber por que o dataset entrou na fila. Apenas datasets do projeto do usuário autenticado são expostos (sem vazamento cross-user). Retorna results=[] se não houver itens pendentes de revisão. Parâmetros de paginação: page (número), page_size (default 50, max 200).
          */
         get: operations["projects_disease_axis_queue_list"];
         put?: never;
@@ -1197,6 +1241,121 @@ export interface components {
             /** @description PMID do paper global (Paper.pmid) a adicionar ao projeto. */
             pmid: number;
         };
+        /** @description Resumo de um IngestionJob criado no lote — para o frontend monitorar. */
+        BatchDownloadJob: {
+            /** Format: uuid */
+            readonly id: string;
+            readonly job_type: components["schemas"]["JobTypeEnum"];
+            readonly status: components["schemas"]["IngestionJobStatusEnum"];
+            readonly dataset_id: number | null;
+            readonly dataset_accession: string | null;
+            /** Format: date-time */
+            readonly created_at: string;
+        };
+        /**
+         * @description Prévia de quota para o lote (HTTP 400 sem confirm; HTTP 409 quota excedida).
+         *
+         *     Campos:
+         *     - `detail`: mensagem legível.
+         *     - `used_bytes`: bytes já baixados no projeto.
+         *     - `quota_bytes`: limite configurado (DOWNLOAD_QUOTA_BYTES).
+         *     - `estimated_bytes`: soma estimada do lote (SampleSraRun.size_bytes disponíveis).
+         *     - `confirm_required`: true se bloqueio por falta de confirm (400).
+         *     - `datasets_preview`: lista de {dataset_accession, sample_count} para UX.
+         */
+        BatchDownloadQuotaPreview: {
+            readonly detail: string;
+            readonly used_bytes: number;
+            readonly quota_bytes: number;
+            readonly estimated_bytes: number;
+            readonly confirm_required: boolean;
+            /** @description [{dataset_accession, sample_count}] — prévia dos datasets afetados. */
+            readonly datasets_preview: {
+                [key: string]: unknown;
+            }[];
+        };
+        /**
+         * @description Body do POST .../datasets/download-batch/.
+         *
+         *     Campos:
+         *     - `dataset_ids`: lista de OmicDataset.id a incluir no lote. Opcional —
+         *       quando ausente/null, todos os datasets do projeto com amostras incluídas
+         *       são usados (conforme `scope`).
+         *     - `scope`: escopo de amostras por dataset:
+         *         - 'included' (padrão): amostras com ProjectSample.curation_status='included'.
+         *         - 'all': todas as amostras de cada dataset.
+         *     - `confirm`: obrigatório para downloads FASTQ (gate de quota, mesmo que single).
+         *     - `destination`: 'server' (padrão) enfileira jobs Celery; 'client' resolve URLs
+         *       FASTQ públicas de forma síncrona por dataset e retorna 200 com lista agrupada.
+         *
+         *     Campos NUNCA expostos: nenhum dado sensível — só intenção do usuário.
+         */
+        BatchDownloadRequest: {
+            /** @description Lista de OmicDataset.id a incluir no lote. Quando omitido, todos os datasets do projeto com amostras incluídas são usados. */
+            dataset_ids?: number[] | null;
+            /**
+             * @description 'included' (padrão) = só amostras com curation_status='included' em cada dataset; 'all' = todas as amostras de cada dataset.
+             *
+             *     * `included` - included
+             *     * `all` - all
+             * @default included
+             */
+            scope: components["schemas"]["BatchDownloadRequestScopeEnum"];
+            /**
+             * @description Confirmação explícita obrigatória para downloads FASTQ (F2, GB–TB). Sem confirm=true, retorna HTTP 400 com prévia agregada de quota. Ignorado para GEO supplementary.
+             * @default false
+             */
+            confirm: boolean;
+            /**
+             * @description 'server' (padrão) = enfileira jobs Celery, salva no object storage. 'client' = resolve URLs FASTQ de forma síncrona, retorna 200 com lista agrupada.
+             *
+             *     * `server` - server
+             *     * `client` - client
+             * @default server
+             */
+            destination: components["schemas"]["DestinationEnum"];
+        };
+        /**
+         * @description * `included` - included
+         *     * `all` - all
+         * @enum {string}
+         */
+        BatchDownloadRequestScopeEnum: "included" | "all";
+        /**
+         * @description Resposta 202 do POST .../datasets/download-batch/.
+         *
+         *     Campos:
+         *     - `jobs`: lista de jobs criados (um por dataset alvo).
+         *     - `total_jobs`: número total de jobs despachados.
+         *     - `skipped_datasets`: datasets ignorados (sem amostras resolvíveis no scope).
+         */
+        BatchDownloadResponse: {
+            readonly jobs: components["schemas"]["BatchDownloadJob"][];
+            readonly total_jobs: number;
+            /** @description Accessions de datasets ignorados (sem amostras no scope ou job já ativo). */
+            readonly skipped_datasets: string[];
+        };
+        /**
+         * @description Resposta HTTP 200 de destination='client' para download-batch.
+         *
+         *     Agrega FastqUrlListResponseSerializer por dataset.
+         *
+         *     Campos:
+         *     - `datasets`: lista de FastqUrlListResponse (um por dataset alvo).
+         *     - `total_datasets`: número de datasets na resposta.
+         *     - `total_runs`: soma dos total_runs de cada dataset.
+         *     - `bytes_total`: soma agregada de size_bytes (null se algum run não tem tamanho).
+         *     - `skipped_datasets`: accessions ignorados (source não suportada, sem amostras, etc.).
+         */
+        BatchFastqUrlListResponse: {
+            readonly datasets: components["schemas"]["FastqUrlListResponse"][];
+            readonly total_datasets: number;
+            readonly total_runs: number;
+            /** @description Soma agregada de size_bytes; null se algum run não tem tamanho declarado. */
+            readonly bytes_total: number | null;
+            /** @description Accessions ignorados (fonte não suportada, sem amostras, erro de resolução). */
+            readonly skipped_datasets: string[];
+        };
         /** @enum {unknown} */
         BlankEnum: "";
         /** @description Resposta genérica de operações bulk: quantidade de registros atualizados. */
@@ -1629,17 +1788,19 @@ export interface components {
          *     Campos obrigatórios/opcionais:
          *     - `file_kind`: se omitido, derivado de source_db do dataset.
          *     - `confirm`: obrigatório apenas para file_kind='fastq' (F2, GB–TB).
-         *     - `scope`: escopo de amostras a baixar (MVP-A):
+         *     - `scope`: escopo de amostras a baixar:
          *         - 'all' (padrão): todas as runs do dataset (comportamento original).
          *         - 'included': apenas amostras com ProjectSample.curation_status='included'
          *           no projeto do usuário autenticado.
          *         - 'manual': exatamente os OmicSample ids informados em sample_ids.
-         *         ('filter' é Inc-2 — não implementado neste MVP.)
-         *     - `sample_ids`: lista de OmicSample.id; obrigatório se scope='manual'.
+         *         - 'filter' (Inc-2): amostras que casam o objeto `filters` (curation_status,
+         *           organism, platform). Requer campo `filters` preenchido.
+         *     - `sample_ids`: lista de ProjectSample.id; obrigatório se scope='manual'.
          *       Cada id é validado contra ProjectSample do projeto do user
          *       (firebase-auth-guard / Regra #3 — ids de outro projeto → 403/404).
-         *     - `destination`: destino do download; 'server' (padrão) já implementado;
-         *       'client' será implementado no Inc-1 — retorna 400 neste MVP.
+         *     - `filters`: objeto SampleFilterSerializer; obrigatório se scope='filter'.
+         *     - `destination`: destino do download; 'server' (padrão) enfileira job Celery;
+         *       'client' resolve URLs FASTQ públicas de forma síncrona e retorna 200 com a lista.
          *
          *     Campos NUNCA expostos: nenhum dado sensível — só intenção do usuário.
          */
@@ -1657,18 +1818,21 @@ export interface components {
              */
             confirm: boolean;
             /**
-             * @description Escopo de amostras a baixar: 'all' (padrão) = todas as runs do dataset; 'included' = só amostras com curation_status='included' no projeto; 'manual' = exatamente os ids em sample_ids.
+             * @description Escopo de amostras a baixar: 'all' (padrão) = todas as runs do dataset; 'included' = só amostras com curation_status='included' no projeto; 'manual' = exatamente os ids em sample_ids; 'filter' = amostras que casam o objeto filters (curation_status, organism, platform).
              *
              *     * `all` - all
              *     * `included` - included
              *     * `manual` - manual
+             *     * `filter` - filter
              * @default all
              */
-            scope: components["schemas"]["ScopeEnum"];
+            scope: components["schemas"]["DownloadDispatchRequestScopeEnum"];
             /** @description Lista de ProjectSample.id para scope='manual' — mesmo padrão de id exposto por ProjectSampleListSerializer e usado em bulk_curate de samples. Obrigatório quando scope='manual'. A view valida pertencimento ao projeto/dataset do usuário autenticado e resolve internamente para OmicSample.id antes de repassar ao Rust — ids de outro projeto resultam em 404 (firebase-auth-guard, Regra #3). */
             sample_ids?: number[] | null;
+            /** @description Filtros de amostra para scope='filter'. Obrigatório quando scope='filter'. Campos: curation_status (list, in), organism (icontains), platform (icontains). Todos os campos são opcionais e combinados com AND. */
+            filters?: components["schemas"]["SampleFilter"] | null;
             /**
-             * @description Destino do download: 'server' (padrão) = enfileira job Celery, salva no object storage. 'client' = Inc-1, não implementado neste MVP (retorna HTTP 400).
+             * @description Destino do download: 'server' (padrão) = enfileira job Celery, salva no object storage (202). 'client' (Inc-1) = resolve URLs públicas ENA/NCBI e retorna a lista na resposta (200); sem criação de job, sem quota, sem DatasetFile.
              *
              *     * `server` - server
              *     * `client` - client
@@ -1676,6 +1840,14 @@ export interface components {
              */
             destination: components["schemas"]["DestinationEnum"];
         };
+        /**
+         * @description * `all` - all
+         *     * `included` - included
+         *     * `manual` - manual
+         *     * `filter` - filter
+         * @enum {string}
+         */
+        DownloadDispatchRequestScopeEnum: "all" | "included" | "manual" | "filter";
         /** @description Resposta do POST .../download/ — retorna o IngestionJob criado/ativo. */
         DownloadDispatchResponse: {
             /** Format: uuid */
@@ -1756,6 +1928,61 @@ export interface components {
          * @enum {string}
          */
         EntityTypeEnum: "gene" | "drug" | "variant" | "disease" | "pathway" | "mesh";
+        /**
+         * @description Um item da lista de URLs FASTQ retornada por destination='client'.
+         *
+         *     Campos:
+         *     - `run_accession`: accession SRA do run (SRR*\/ERR*\/DRR*).
+         *     - `fastq_url`: URL(s) públicas FASTQ na ENA (HTTPS, separadas por ';' se multi-arquivo,
+         *       ex. R1+R2). Vazio se o run é BAM-only na ENA (sem FASTQ publicado).
+         *     - `file_name`: nome(s) de arquivo correspondente(s), separados por ';'.
+         *     - `size_bytes`: tamanho total declarado pela ENA (soma de todos os arquivos do run);
+         *       null se não disponível.
+         *     - `checksum_md5`: MD5(s) declarados pela ENA, separados por ';'; null se não disponível.
+         *     - `has_public_fastq`: true se fastq_url não vazio — indica que o browser pode baixar
+         *       diretamente. false indica run BAM-only (sem FASTQ na ENA); use destination='server'
+         *       com sra-tools fallback para esses runs.
+         *
+         *     Campos NUNCA expostos: db_url, ncbi_api_key, storage_key (sensitive-data-handling).
+         */
+        FastqUrlItem: {
+            /** @description Accession SRA do run (SRR*\/ERR*\/DRR*). */
+            readonly run_accession: string;
+            /** @description URL(s) FASTQ públicas na ENA (HTTPS). Separadas por ';' para runs multi-arquivo (R1/R2). Vazio se o run não tem FASTQ publicado na ENA (BAM-only). */
+            readonly fastq_url: string;
+            /** @description Nome(s) de arquivo correspondente(s), separados por ';'. */
+            readonly file_name: string;
+            /** @description Tamanho total declarado pela ENA em bytes; null se não disponível. */
+            readonly size_bytes: number | null;
+            /** @description MD5(s) declarados pela ENA, separados por ';'; null se não disponível. */
+            readonly checksum_md5: string | null;
+            /** @description true se fastq_url não vazio (browser pode baixar diretamente). false indica run BAM-only sem FASTQ na ENA. */
+            readonly has_public_fastq: boolean;
+        };
+        /**
+         * @description Resposta HTTP 200 de destination='client' (single dataset).
+         *
+         *     Campos:
+         *     - `dataset_id`: OmicDataset.id.
+         *     - `dataset_accession`: accession do dataset (GSE*, SRP*, etc.).
+         *     - `runs`: lista de FastqUrlItem.
+         *     - `total_runs`: número total de runs na resposta.
+         *     - `bytes_total`: soma de size_bytes dos runs (null para runs sem tamanho declarado).
+         *     - `bam_only_count`: nº de runs sem FASTQ publicado na ENA (has_public_fastq=false).
+         *
+         *     Teto de runs por resposta: CLIENT_DOWNLOAD_MAX_RUNS (padrão: 200).
+         *     Se a seleção exceder o teto, retorna HTTP 400 com mensagem orientativa.
+         */
+        FastqUrlListResponse: {
+            readonly dataset_id: number;
+            readonly dataset_accession: string;
+            readonly runs: components["schemas"]["FastqUrlItem"][];
+            readonly total_runs: number;
+            /** @description Soma de size_bytes de todos os runs; null se algum run não tem tamanho. */
+            readonly bytes_total: number | null;
+            /** @description Número de runs sem FASTQ publicado na ENA (has_public_fastq=false). */
+            readonly bam_only_count: number;
+        };
         /**
          * @description * `geo_supplementary` - geo_supplementary
          *     * `fastq` - fastq
@@ -3147,12 +3374,26 @@ export interface components {
             exclusion_reason: string;
         };
         /**
-         * @description * `all` - all
-         *     * `included` - included
-         *     * `manual` - manual
-         * @enum {string}
+         * @description Filtros de amostra para scope='filter' em DownloadDispatchRequestSerializer.
+         *
+         *     Todos os campos são opcionais e combinados com AND. Pelo menos um campo
+         *     deve ser fornecido (validado na view / apply_sample_filters).
+         *
+         *     Filtros suportados:
+         *     - curation_status (list[str]): valores de ProjectSample.CurationStatus
+         *       (pending/included/excluded/maybe). Filtra amostras cujo ProjectSample
+         *       no projeto do usuário tem o status indicado (IN list).
+         *     - organism (str): icontains no campo OmicSample.organism.
+         *     - platform (str): icontains no campo OmicSample.platform.
          */
-        ScopeEnum: "all" | "included" | "manual";
+        SampleFilter: {
+            /** @description Lista de status de curadoria de amostra (in). Valores: 'pending', 'included', 'excluded', 'maybe'. Ex.: ["included", "maybe"]. */
+            curation_status?: string[] | null;
+            /** @description Filtro parcial (icontains) no campo OmicSample.organism. */
+            organism?: string | null;
+            /** @description Filtro parcial (icontains) no campo OmicSample.platform. */
+            platform?: string | null;
+        };
         /** @description Body de POST /projects/{id}/search/preview/ */
         SearchPreviewRequest: {
             /** @description Lista de descritores MeSH para calcular o preview. Se ausente, usa selected_mesh do projeto. */
@@ -3968,6 +4209,14 @@ export interface operations {
             };
         };
         responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FastqUrlListResponse"];
+                };
+            };
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -4150,6 +4399,64 @@ export interface operations {
             };
         };
     };
+    projects_datasets_download_batch_create: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_pk: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["BatchDownloadRequest"];
+                "application/x-www-form-urlencoded": components["schemas"]["BatchDownloadRequest"];
+                "multipart/form-data": components["schemas"]["BatchDownloadRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchFastqUrlListResponse"];
+                };
+            };
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchDownloadResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchDownloadQuotaPreview"];
+                };
+            };
+            /** @description No response body */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchDownloadQuotaPreview"];
+                };
+            };
+        };
+    };
     projects_datasets_search_list: {
         parameters: {
             query?: {
@@ -4185,6 +4492,8 @@ export interface operations {
                 ordering?: string;
                 /** @description A page number within the paginated result set. */
                 page?: number;
+                /** @description Number of results to return per page. */
+                page_size?: number;
                 /** @description A search term. */
                 search?: string;
             };
@@ -4196,6 +4505,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description Lista paginada (count/next/previous/results) de ProjectDatasets do projeto que entram na fila de alto valor. */
             200: {
                 headers: {
                     [name: string]: unknown;

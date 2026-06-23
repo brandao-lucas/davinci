@@ -1,6 +1,6 @@
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
-from apps.core.models import OmicDataset, OmicSample, ProjectDataset, ProjectPaperDataset
+from apps.core.models import OmicDataset, ProjectDataset, ProjectPaperDataset, SampleSraRun
 
 
 class OmicDatasetSerializer(serializers.ModelSerializer):
@@ -60,8 +60,8 @@ class ProjectDatasetListSerializer(serializers.ModelSerializer):
     @extend_schema_field({'type': 'boolean'})
     def get_sra_resolved(self, obj) -> bool:
         """
-        True quando o dataset GEO tem ao menos um OmicSample com sra_runs resolvidos
-        (extra_metadata['sra_runs'] existe — MVP-B, ligação GEO→SRA).
+        True quando o dataset GEO tem ao menos um SampleSraRun resolvido
+        (tabela estruturada core_samplesrarun — Inc-3, substitui extra_metadata['sra_runs']).
 
         Lê a anotação 'sra_resolved' injetada pelo get_queryset() da view (Exists subquery)
         para evitar N+1 em listas. Se a anotação estiver ausente (serializer instanciado
@@ -70,9 +70,8 @@ class ProjectDatasetListSerializer(serializers.ModelSerializer):
         annotated = getattr(obj, 'sra_resolved', None)
         if annotated is not None:
             return bool(annotated)
-        return OmicSample.objects.filter(
-            dataset_id=obj.dataset_id,
-            extra_metadata__has_key='sra_runs',
+        return SampleSraRun.objects.filter(
+            sample__dataset_id=obj.dataset_id,
         ).exists()
 
     sra_resolved = serializers.SerializerMethodField()
@@ -147,7 +146,8 @@ class ProjectDatasetDetailSerializer(serializers.ModelSerializer):
     @extend_schema_field({'type': 'boolean'})
     def get_sra_resolved(self, obj) -> bool:
         """
-        True quando o dataset GEO tem ao menos um OmicSample com sra_runs resolvidos.
+        True quando o dataset GEO tem ao menos um SampleSraRun resolvido
+        (tabela estruturada core_samplesrarun — Inc-3).
 
         Lê a anotação 'sra_resolved' injetada pelo get_queryset() da view (Exists subquery).
         Fallback para query direta quando instanciado fora da view (ex: testes).
@@ -155,9 +155,8 @@ class ProjectDatasetDetailSerializer(serializers.ModelSerializer):
         annotated = getattr(obj, 'sra_resolved', None)
         if annotated is not None:
             return bool(annotated)
-        return OmicSample.objects.filter(
-            dataset_id=obj.dataset_id,
-            extra_metadata__has_key='sra_runs',
+        return SampleSraRun.objects.filter(
+            sample__dataset_id=obj.dataset_id,
         ).exists()
 
     sra_resolved = serializers.SerializerMethodField()

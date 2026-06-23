@@ -764,6 +764,90 @@ class OmicSample(models.Model):
         return f"{self.accession} — {self.title[:60]}"
 
 
+class SampleSraRun(models.Model):
+    """
+    Aresta estruturada GEO→SRA: liga um GSM (OmicSample) aos runs SRA
+    (SRR*/ERR*/DRR*) resolvidos para ele — TABELA-PONTE.
+
+    Substitui a representação JSON `OmicSample.extra_metadata['sra_runs']`
+    (resolução GSM→SRR) por linhas indexáveis e joinable. O `sample` é o GSM
+    DONO da relação; cada run resolvido vira uma linha. A unicidade por
+    (sample, run_accession) garante idempotência da resolução/backfill: re-rodar
+    a resolução faz no-op (get_or_create / ON CONFLICT DO NOTHING) em vez de
+    duplicar.
+
+    Cache opcional de metadados ENA por run (`fastq_url`, `size_bytes`,
+    `checksum_md5`) barateia o destino "direto pro PC" (Inc-1 — devolve URL
+    pública sem novo HTTP à ENA) e a UX de quota (soma de `size_bytes` da
+    seleção antes de confirmar). São opcionais: ficam vazios quando a resolução
+    só capturou o run_accession; Inc-1 pode resolver múltiplos arquivos por run
+    na hora. `fastq_url` guarda a URL principal do run (TextField, pode conter
+    lista separada por `;` como a ENA devolve em `fastq_ftp`).
+
+    Gravação (responsabilidade do ferris/Rust, NÃO deste model): COPY/INSERT na
+    tabela `core_samplesrarun` durante a resolução GSM→SRR, em vez de gravar
+    `extra_metadata['sra_runs']`. Leitura (vitruvio/ferris): runs de um dataset
+    via `sample__dataset`; runs das ProjectSample incluídas via
+    `sample__in_projects` filtrando `curation_status='included'`.
+    """
+
+    sample = models.ForeignKey(
+        OmicSample,
+        on_delete=models.CASCADE,
+        related_name='sra_runs',
+        help_text='O GSM dono da relação (OmicSample com accession GSM*).'
+    )
+    run_accession = models.CharField(
+        'Run SRA',
+        max_length=50,
+        db_index=True,
+        help_text='SRR*/ERR*/DRR* resolvido para o sample.'
+    )
+
+    # Cache opcional de metadados ENA por run (barateia Inc-1 e UX de quota).
+    fastq_url = models.TextField(
+        'URL(s) FASTQ (ENA)',
+        blank=True,
+        default='',
+        help_text='URL pública do run na ENA (fastq_ftp). Pode conter mais de '
+                  'um arquivo separado por ";". Vazio até o cache ser populado.'
+    )
+    size_bytes = models.BigIntegerField(
+        'Tamanho (bytes)',
+        null=True,
+        blank=True,
+        help_text='Tamanho declarado pela ENA; soma da seleção alimenta a UX de quota.'
+    )
+    checksum_md5 = models.CharField(
+        'Checksum MD5 (ENA)',
+        max_length=128,
+        null=True,
+        blank=True,
+        help_text='MD5 declarado pela ENA por arquivo do run.'
+    )
+
+    # Auditoria
+    resolved_at = models.DateTimeField('Resolvido em', auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            # Idempotência da resolução/backfill: um par (GSM, run) é uma linha só.
+            # Cobre também a query quente "runs deste GSM" (prefixo sample) e o
+            # ON CONFLICT DO NOTHING do COPY/INSERT da resolução.
+            models.UniqueConstraint(
+                fields=['sample', 'run_accession'],
+                name='samplesrarun_sample_run_uniq',
+            ),
+        ]
+        # Sem Index extra: o FK `sample` já ganha B-tree automático (caminho
+        # "runs deste GSM" e o join `sample__dataset` / `sample__in_projects`);
+        # `run_accession` ganha B-tree via db_index=True (lookup direto por run).
+        # A UniqueConstraint (sample, run_accession) cobre o prefixo `sample`.
+
+    def __str__(self):
+        return f"{self.sample.accession} → {self.run_accession}"
+
+
 class DatasetFile(models.Model):
     """
     Arquivo físico (bytes reais) associado a um dataset ou amostra ômica.

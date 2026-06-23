@@ -30,7 +30,7 @@ Sem internet: rust_engine.download_dataset_files / resolve_sra_runs_for_dataset
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from django.contrib.auth.models import User
 from rest_framework import status
@@ -43,6 +43,7 @@ from apps.core.models import (
     OmicSample,
     ProjectDataset,
     ProjectSample,
+    SampleSraRun,
 )
 
 
@@ -93,6 +94,15 @@ def _project_sample(project: DaVinciProject, sample: OmicSample, curation_status
         project=project,
         sample=sample,
         curation_status=curation_status,
+    )
+
+
+def _sra_run(sample: OmicSample, run_accession: str, size_bytes: int | None = None) -> SampleSraRun:
+    """Cria uma linha SampleSraRun para o sample (aresta GSM→SRR estruturada, Inc-3)."""
+    return SampleSraRun.objects.create(
+        sample=sample,
+        run_accession=run_accession,
+        size_bytes=size_bytes,
     )
 
 
@@ -513,35 +523,25 @@ class ScopeManualWithoutIdsTests(_SraDownloadMixin, APITestCase):
 
 
 # =============================================================================
-# 7 — destination='client' → 400 (Inc-1 bloqueado)
+# 7 — destination='client' (Inc-1 implementado)
 # =============================================================================
 
-class DestinationClientBlockedTests(_SraDownloadMixin, APITestCase):
+class DestinationClientTests(_SraDownloadMixin, APITestCase):
     """
-    destination='client' não está implementado neste MVP (Inc-1).
-    O serializer rejeita com 400 antes de chegar à view.
+    destination='client' está implementado (Inc-1).
+    Retorna HTTP 200 com lista de URLs (sem criar IngestionJob, sem quota).
     """
-
-    def test_destination_client_retorna_400(self):
-        """destination='client' → 400 com mensagem orientativa (Inc-1)."""
-        with patch('apps.core.tasks.ingestion_tasks.run_omics_download.delay'):
-            response = self.client.post(
-                self.url,
-                data={
-                    'confirm': True,
-                    'scope': 'all',
-                    'destination': 'client',
-                },
-                format='json',
-            )
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_destination_client_nao_cria_job(self):
         """destination='client' não deve criar IngestionJob nem chamar .delay()."""
         job_count_before = IngestionJob.objects.count()
 
-        with patch('apps.core.tasks.ingestion_tasks.run_omics_download.delay') as mock_delay:
+        import sys
+        mock_rust = MagicMock()
+        mock_rust.resolve_fastq_urls.return_value = []
+
+        with patch('apps.core.tasks.ingestion_tasks.run_omics_download.delay') as mock_delay, \
+             patch.dict(sys.modules, {'rust_engine': mock_rust}):
             self.client.post(
                 self.url,
                 data={
@@ -629,15 +629,17 @@ class GeoFastqGuardTests(APITestCase):
 
     def test_8b_geo_com_sra_runs_resolvidos_aceita_fastq(self):
         """
-        Dataset GEO com ao menos um OmicSample contendo extra_metadata['sra_runs'].
+        Dataset GEO com ao menos um SampleSraRun resolvido (Inc-3: tabela estruturada).
         Pedido file_kind='fastq' → 202 (guard liberado).
+
+        A implementação (Inc-3) usa SampleSraRun, não extra_metadata['sra_runs'].
+        O guard na view executa:
+          SampleSraRun.objects.filter(sample__dataset=dataset).exists()
         """
-        # Cria OmicSample GSM com sra_runs resolvidos
-        _omic_sample(
-            self.geo_dataset,
-            'GSM_WITH_SRA_001',
-            extra_metadata={'sra_runs': ['SRR000001', 'SRR000002']},
-        )
+        # Cria OmicSample GSM e liga via SampleSraRun (estrutura Inc-3)
+        gsm = _omic_sample(self.geo_dataset, 'GSM_WITH_SRA_001')
+        _sra_run(gsm, 'SRR000001')
+        _sra_run(gsm, 'SRR000002')
 
         job = _pending_job(self.project, self.geo_dataset, scope='all')
 
@@ -653,18 +655,19 @@ class GeoFastqGuardTests(APITestCase):
 
         self.assertEqual(
             response.status_code, status.HTTP_202_ACCEPTED,
-            "Dataset GEO com sra_runs resolvidos deve aceitar file_kind='fastq'"
+            "Dataset GEO com SampleSraRun resolvidos deve aceitar file_kind='fastq'"
         )
 
-    def test_8a_geo_sra_runs_lista_vazia_ainda_bloqueia(self):
+    def test_8a_geo_sem_samplesrarun_bloqueia(self):
         """
-        OmicSample com extra_metadata={'sra_runs': []} (lista vazia).
-        A anotação Exists exclui listas vazias → guard bloqueia → 400.
+        Dataset GEO sem nenhuma linha SampleSraRun → guard bloqueia → 400.
+        (OmicSample com extra_metadata qualquer não libera o guard — Inc-3.)
         """
+        # OmicSample sem SampleSraRun vinculado — mesmo com extra_metadata preenchido
         _omic_sample(
             self.geo_dataset,
-            'GSM_EMPTY_SRA_001',
-            extra_metadata={'sra_runs': []},
+            'GSM_NO_SRA_RUN_001',
+            extra_metadata={'relation': 'SRA: https://www.ncbi.nlm.nih.gov/sra?term=SRX999'},
         )
 
         with patch('apps.core.tasks.ingestion_tasks.run_omics_download.delay'):
@@ -674,8 +677,6 @@ class GeoFastqGuardTests(APITestCase):
                 format='json',
             )
 
-        # A view filtra .exclude(extra_metadata__sra_runs=[]) então lista vazia
-        # ainda é bloqueada — 400 orientativo esperado.
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
@@ -831,17 +832,18 @@ class SraResolvedSerializerTests(APITestCase):
 
     def test_10a_sra_resolved_true_quando_ha_sra_runs(self):
         """
-        Dataset GEO com ao menos um OmicSample com extra_metadata['sra_runs']
+        Dataset GEO com ao menos um SampleSraRun resolvido (Inc-3: tabela estruturada)
         → sra_resolved=true na listagem.
+
+        A anotação na view usa Exists(SampleSraRun.filter(sample__dataset_id=...)),
+        não extra_metadata['sra_runs'].
         """
         geo_dataset = _dataset('GSE_RESOLVED_001', source_db='geo')
         _project_dataset(self.project, geo_dataset)
 
-        _omic_sample(
-            geo_dataset,
-            'GSM_RESOLVED_001',
-            extra_metadata={'sra_runs': ['SRR100001']},
-        )
+        # Cria OmicSample e materializa a aresta via SampleSraRun (Inc-3)
+        gsm = _omic_sample(geo_dataset, 'GSM_RESOLVED_001')
+        _sra_run(gsm, 'SRR100001')
 
         response = self.client.get(self._list_url())
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -858,13 +860,14 @@ class SraResolvedSerializerTests(APITestCase):
 
     def test_10b_sra_resolved_false_quando_sem_sra_runs(self):
         """
-        Dataset GEO sem nenhum OmicSample com 'sra_runs'
+        Dataset GEO com OmicSample mas sem nenhuma linha SampleSraRun
         → sra_resolved=false na listagem.
+        (extra_metadata['relation'] preenchido não é suficiente — Inc-3 usa SampleSraRun.)
         """
         geo_dataset = _dataset('GSE_NOT_RESOLVED_001', source_db='geo')
         _project_dataset(self.project, geo_dataset)
 
-        # OmicSample sem 'sra_runs'
+        # OmicSample sem SampleSraRun vinculado (relation presente mas não resolvido)
         _omic_sample(
             geo_dataset,
             'GSM_NOT_RESOLVED_001',
@@ -925,13 +928,16 @@ class SraResolvedSerializerTests(APITestCase):
         Listagem com múltiplos datasets GEO usa a anotação Exists (sem N+1).
         Verificação indireta: listagem de 5 datasets retorna 200 e todos têm
         o campo sra_resolved (garantindo que a anotação foi aplicada a todos).
+
+        Datasets pares têm SampleSraRun → sra_resolved=True.
+        Datasets ímpares não têm → sra_resolved=False.
         """
         for i in range(5):
             ds = _dataset(f'GSE_MULTI_{i:03d}', source_db='geo')
             _project_dataset(self.project, ds)
             if i % 2 == 0:
-                _omic_sample(ds, f'GSM_MULTI_{i:03d}',
-                             extra_metadata={'sra_runs': [f'SRR9{i:05d}']})
+                gsm = _omic_sample(ds, f'GSM_MULTI_{i:03d}')
+                _sra_run(gsm, f'SRR9{i:05d}')
 
         response = self.client.get(self._list_url())
         self.assertEqual(response.status_code, status.HTTP_200_OK)

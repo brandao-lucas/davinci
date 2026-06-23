@@ -40,11 +40,28 @@ export type PaginatedDatasetFileList = components['schemas']['PaginatedDatasetFi
 // SraResolutionResponse: resposta do POST .../resolve-sra/ (202 com IngestionJob criado)
 export type SraResolutionResponse = components['schemas']['SraResolutionResponse'];
 
-// ScopeEnum: escopo de amostras para download ('all' | 'included' | 'manual')
-export type ScopeEnum = components['schemas']['ScopeEnum'];
+// ScopeEnum: escopo de amostras para download single-dataset
+// ('all' | 'included' | 'manual' | 'filter' — Inc-2)
+// Anteriormente era um schema global 'ScopeEnum'; agora é inline por serializer.
+export type ScopeEnum = components['schemas']['DownloadDispatchRequestScopeEnum'];
 
 // DestinationEnum: destino do download ('server' | 'client')
 export type DestinationEnum = components['schemas']['DestinationEnum'];
+
+// SampleFilter: filtros de amostra para scope='filter' (Inc-2)
+export type SampleFilter = components['schemas']['SampleFilter'];
+
+// Inc-1: tipos de resposta de destination='client'
+export type FastqUrlItem = components['schemas']['FastqUrlItem'];
+export type FastqUrlListResponse = components['schemas']['FastqUrlListResponse'];
+
+// Inc-5: tipos do download em lote
+export type BatchDownloadRequest = components['schemas']['BatchDownloadRequest'];
+export type BatchDownloadResponse = components['schemas']['BatchDownloadResponse'];
+export type BatchDownloadJob = components['schemas']['BatchDownloadJob'];
+export type BatchDownloadQuotaPreview = components['schemas']['BatchDownloadQuotaPreview'];
+export type BatchDownloadScopeEnum = components['schemas']['BatchDownloadRequestScopeEnum'];
+export type BatchFastqUrlListResponse = components['schemas']['BatchFastqUrlListResponse'];
 
 // Filtros de listagem (parâmetros de query — não gerados pelo OpenAPI)
 export interface DatasetFilters {

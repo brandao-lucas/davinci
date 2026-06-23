@@ -10,6 +10,8 @@ import {
   Clock,
   HardDrive,
   RefreshCw,
+  Monitor,
+  Server,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -17,6 +19,8 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { Progress } from '@/components/ui/progress';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Label } from '@/components/ui/label';
+import { Input } from '@/components/ui/input';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -33,11 +37,19 @@ import {
   useTriggerDatasetDownload,
   useSraResolutionJob,
   useResolveSraRuns,
+  useClientFastqDownloader,
   isDownloadQuotaError,
 } from '@/lib/hooks/use-dataset-files';
 import { useSamplesByDataset } from '@/lib/hooks/use-samples';
-import type { DatasetFile, DatasetFileDownloadStatus, DownloadQuotaPreview } from '@/lib/types/dataset';
-import type { ScopeEnum } from '@/lib/types/dataset';
+import type {
+  DatasetFile,
+  DatasetFileDownloadStatus,
+  DownloadQuotaPreview,
+  ScopeEnum,
+  SampleFilter,
+  FastqUrlItem,
+  FastqUrlListResponse,
+} from '@/lib/types/dataset';
 
 interface DatasetDownloadSectionProps {
   projectId: string;
@@ -47,7 +59,10 @@ interface DatasetDownloadSectionProps {
   sraResolved?: boolean;
 }
 
-// Formata bytes em unidade legivel (B, KB, MB, GB, TB).
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 function formatBytes(bytes: number | null | undefined): string {
   if (bytes === null || bytes === undefined) return '—';
   if (bytes === 0) return '0 B';
@@ -58,13 +73,15 @@ function formatBytes(bytes: number | null | undefined): string {
   return `${value.toFixed(clamped === 0 ? 0 : 1)} ${units[clamped]}`;
 }
 
-// Trunca checksum para exibicao compacta.
 function truncateChecksum(checksum: string | null): string {
   if (!checksum) return '—';
   return checksum.length > 12 ? `${checksum.slice(0, 12)}…` : checksum;
 }
 
-// Configuracoes de badge por status de download.
+// ---------------------------------------------------------------------------
+// Badges de status de arquivo (download servidor)
+// ---------------------------------------------------------------------------
+
 const downloadStatusConfig: Record<
   DatasetFileDownloadStatus,
   { label: string; className: string }
@@ -85,15 +102,14 @@ function DownloadStatusBadge({ status }: { status: DatasetFileDownloadStatus }) 
   );
 }
 
+// ---------------------------------------------------------------------------
+// Linha de arquivo salvo no servidor
+// ---------------------------------------------------------------------------
+
 function FileRow({ file }: { file: DatasetFile }) {
-  const canDownload =
-    file.download_status === 'downloaded' && !!file.download_url;
-
+  const canDownload = file.download_status === 'downloaded' && !!file.download_url;
   const showProgress =
-    file.download_status === 'downloading' &&
-    file.bytes_downloaded > 0 &&
-    !!file.size_bytes;
-
+    file.download_status === 'downloading' && file.bytes_downloaded > 0 && !!file.size_bytes;
   const progressPercent =
     showProgress && file.size_bytes
       ? Math.min(100, Math.round((file.bytes_downloaded / file.size_bytes) * 100))
@@ -133,18 +149,11 @@ function FileRow({ file }: { file: DatasetFile }) {
             </span>
           )}
         </div>
-        {showProgress && (
-          <Progress value={progressPercent} className="h-1 mt-1" />
-        )}
+        {showProgress && <Progress value={progressPercent} className="h-1 mt-1" />}
       </div>
       <div className="shrink-0">
         {canDownload ? (
-          <a
-            href={file.download_url!}
-            target="_blank"
-            rel="noreferrer"
-            download
-          >
+          <a href={file.download_url!} target="_blank" rel="noreferrer" download>
             <Button size="sm" variant="outline" className="h-7 px-2 text-xs gap-1">
               <FileDown className="h-3.5 w-3.5" />
               Baixar
@@ -160,7 +169,126 @@ function FileRow({ file }: { file: DatasetFile }) {
   );
 }
 
-// Dialogo de confirmacao de quota para FASTQ/SRA (HTTP 400 com confirm_required=true).
+// ---------------------------------------------------------------------------
+// Inc-1: lista de URLs (destination='client')
+// ---------------------------------------------------------------------------
+
+function FastqUrlRow({
+  item,
+  onDownload,
+}: {
+  item: FastqUrlItem;
+  onDownload: (item: FastqUrlItem) => void;
+}) {
+  const urls = item.fastq_url ? item.fastq_url.split(';').map((u) => u.trim()).filter(Boolean) : [];
+  const fileCount = urls.length;
+
+  return (
+    <div className="flex items-start justify-between gap-2 py-2 text-xs border-b last:border-b-0">
+      <div className="min-w-0 flex-1 space-y-0.5">
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <span className="font-mono truncate max-w-[180px]" title={item.run_accession}>
+            {item.run_accession}
+          </span>
+          {fileCount > 1 && (
+            <Badge variant="secondary" className="text-xs shrink-0">
+              {fileCount} arquivos
+            </Badge>
+          )}
+          {!item.has_public_fastq && (
+            <Badge variant="outline" className="text-xs shrink-0 bg-amber-50 text-amber-700">
+              BAM-only
+            </Badge>
+          )}
+        </div>
+        <div className="flex gap-3 text-muted-foreground">
+          <span>{formatBytes(item.size_bytes)}</span>
+          {item.checksum_md5 && (
+            <span className="font-mono">MD5: {truncateChecksum(item.checksum_md5)}</span>
+          )}
+        </div>
+      </div>
+      <div className="shrink-0">
+        {item.has_public_fastq ? (
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 px-2 text-xs gap-1"
+            onClick={() => onDownload(item)}
+          >
+            <FileDown className="h-3.5 w-3.5" />
+            Baixar
+          </Button>
+        ) : (
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span>
+                  <Button size="sm" variant="outline" className="h-7 px-2 text-xs" disabled>
+                    <FileDown className="h-3.5 w-3.5" />
+                  </Button>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>
+                <p className="text-xs">
+                  Run BAM-only — sem FASTQ publicado na ENA. Use destino Servidor.
+                </p>
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function FastqUrlList({
+  urlResponse,
+  onDownloadAll,
+  onDownloadSingle,
+}: {
+  urlResponse: FastqUrlListResponse;
+  onDownloadAll: () => void;
+  onDownloadSingle: (item: FastqUrlItem) => void;
+}) {
+  const publicCount = urlResponse.runs.filter((r) => r.has_public_fastq).length;
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between text-xs text-muted-foreground">
+        <span>
+          {urlResponse.total_runs} run(s) · {formatBytes(urlResponse.bytes_total)}
+          {urlResponse.bam_only_count > 0 && (
+            <span className="ml-1.5 text-amber-600">
+              ({urlResponse.bam_only_count} BAM-only)
+            </span>
+          )}
+        </span>
+        {publicCount > 0 && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 px-2 text-xs gap-1"
+            onClick={onDownloadAll}
+          >
+            <Download className="h-3.5 w-3.5" />
+            Baixar todos ({publicCount})
+          </Button>
+        )}
+      </div>
+      <div>
+        {urlResponse.runs.map((item) => (
+          <FastqUrlRow key={item.run_accession} item={item} onDownload={onDownloadSingle} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Dialogo de confirmacao de quota
+// ---------------------------------------------------------------------------
+
 interface FastqConfirmDialogProps {
   open: boolean;
   preview: DownloadQuotaPreview;
@@ -218,11 +346,7 @@ function FastqConfirmDialog({
           <AlertDialogCancel onClick={onCancel} disabled={isPending}>
             Cancelar
           </AlertDialogCancel>
-          <AlertDialogAction
-            onClick={onConfirm}
-            disabled={isPending}
-            className="gap-1.5"
-          >
+          <AlertDialogAction onClick={onConfirm} disabled={isPending} className="gap-1.5">
             {isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
             Confirmar download
           </AlertDialogAction>
@@ -232,7 +356,48 @@ function FastqConfirmDialog({
   );
 }
 
-// Opcao do seletor de escopo de download.
+// ---------------------------------------------------------------------------
+// Seletor de destino: Servidor vs Meu computador (Inc-1)
+// Exibido apenas para FASTQ (SRA ou GEO resolvido).
+// ---------------------------------------------------------------------------
+
+type DestinationMode = 'server' | 'client';
+
+function DestinationSelector({
+  value,
+  onChange,
+}: {
+  value: DestinationMode;
+  onChange: (v: DestinationMode) => void;
+}) {
+  return (
+    <div className="flex gap-1 rounded-md border p-0.5 w-fit bg-muted/30">
+      {([
+        { key: 'server', icon: Server, label: 'Servidor' },
+        { key: 'client', icon: Monitor, label: 'Meu computador' },
+      ] as const).map(({ key, icon: Icon, label }) => (
+        <button
+          key={key}
+          type="button"
+          onClick={() => onChange(key)}
+          className={`flex items-center gap-1.5 px-2 py-1 text-xs rounded transition-colors ${
+            value === key
+              ? 'bg-background shadow-sm font-medium'
+              : 'text-muted-foreground hover:text-foreground'
+          }`}
+        >
+          <Icon className="h-3.5 w-3.5" />
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Seletor de escopo (MVP-A + Inc-2)
+// ---------------------------------------------------------------------------
+
 interface ScopeOption {
   value: ScopeEnum;
   label: string;
@@ -240,33 +405,25 @@ interface ScopeOption {
 }
 
 const SCOPE_OPTIONS: ScopeOption[] = [
-  {
-    value: 'all',
-    label: 'Todas as amostras',
-    description: 'Baixa todas as runs do dataset.',
-  },
-  {
-    value: 'included',
-    label: 'Apenas incluidas',
-    description: 'So amostras com status "incluida" no projeto.',
-  },
-  {
-    value: 'manual',
-    label: 'Selecionar manualmente',
-    description: 'Escolha quais amostras baixar.',
-  },
+  { value: 'all', label: 'Todas as amostras', description: 'Baixa todas as runs do dataset.' },
+  { value: 'included', label: 'Apenas incluidas', description: 'So amostras com status "incluida".' },
+  { value: 'manual', label: 'Selecionar manualmente', description: 'Escolha quais amostras baixar.' },
+  { value: 'filter', label: 'Filtrar', description: 'Filtra por status, organismo ou plataforma.' },
 ];
 
-// Seletor de escopo: radio buttons estilizados + lista de checkboxes para modo manual.
+const CURATION_STATUSES = ['pending', 'included', 'excluded', 'maybe'];
+
 interface ScopeSelectorProps {
   projectId: string;
   datasetId: number;
   scope: ScopeEnum;
   selectedSampleIds: number[];
+  sampleFilter: SampleFilter;
   onScopeChange: (scope: ScopeEnum) => void;
   onSampleToggle: (id: number, checked: boolean) => void;
   onSelectAll: (ids: number[]) => void;
   onClearAll: () => void;
+  onFilterChange: (f: SampleFilter) => void;
 }
 
 function ScopeSelector({
@@ -274,19 +431,16 @@ function ScopeSelector({
   datasetId,
   scope,
   selectedSampleIds,
+  sampleFilter,
   onScopeChange,
   onSampleToggle,
   onSelectAll,
   onClearAll,
+  onFilterChange,
 }: ScopeSelectorProps) {
-  const samplesQuery = useSamplesByDataset(
-    projectId,
-    datasetId,
-    scope === 'manual' ? undefined : undefined,
-  );
+  const samplesQuery = useSamplesByDataset(projectId, datasetId);
   const samples = samplesQuery.data?.results ?? [];
   const allIds = samples.map((s) => s.id);
-
   const isAllSelected = allIds.length > 0 && allIds.every((id) => selectedSampleIds.includes(id));
 
   return (
@@ -294,12 +448,10 @@ function ScopeSelector({
       <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
         Escopo do download
       </p>
+
       <div className="space-y-1.5">
         {SCOPE_OPTIONS.map((opt) => (
-          <label
-            key={opt.value}
-            className="flex items-start gap-2 cursor-pointer group"
-          >
+          <label key={opt.value} className="flex items-start gap-2 cursor-pointer">
             <input
               type="radio"
               name={`scope-${datasetId}`}
@@ -316,6 +468,7 @@ function ScopeSelector({
         ))}
       </div>
 
+      {/* Modo manual: lista de amostras com checkboxes */}
       {scope === 'manual' && (
         <div className="mt-2 space-y-1.5">
           <div className="flex items-center justify-between">
@@ -329,7 +482,7 @@ function ScopeSelector({
                 <button
                   type="button"
                   onClick={() => onSelectAll(allIds)}
-                  className="text-xs text-primary hover:underline"
+                  className="text-xs text-primary hover:underline disabled:opacity-50"
                   disabled={isAllSelected}
                 >
                   Todas
@@ -337,7 +490,7 @@ function ScopeSelector({
                 <button
                   type="button"
                   onClick={onClearAll}
-                  className="text-xs text-muted-foreground hover:underline"
+                  className="text-xs text-muted-foreground hover:underline disabled:opacity-50"
                   disabled={selectedSampleIds.length === 0}
                 >
                   Limpar
@@ -345,20 +498,15 @@ function ScopeSelector({
               </div>
             )}
           </div>
-
           {samplesQuery.isLoading && (
             <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <Loader2 className="h-3 w-3 animate-spin" />
               Carregando…
             </div>
           )}
-
           {!samplesQuery.isLoading && samples.length === 0 && (
-            <p className="text-xs text-muted-foreground">
-              Nenhuma amostra encontrada para este dataset.
-            </p>
+            <p className="text-xs text-muted-foreground">Nenhuma amostra encontrada.</p>
           )}
-
           {samples.length > 0 && (
             <div className="max-h-40 overflow-y-auto space-y-1 pr-1">
               {samples.map((sample) => (
@@ -366,9 +514,7 @@ function ScopeSelector({
                   <Checkbox
                     id={`sample-${sample.id}`}
                     checked={selectedSampleIds.includes(sample.id)}
-                    onCheckedChange={(checked) =>
-                      onSampleToggle(sample.id, checked === true)
-                    }
+                    onCheckedChange={(checked) => onSampleToggle(sample.id, checked === true)}
                     className="mt-0.5 shrink-0"
                   />
                   <Label
@@ -377,15 +523,10 @@ function ScopeSelector({
                   >
                     <span className="font-mono">{sample.accession}</span>
                     {sample.title && (
-                      <span className="text-muted-foreground ml-1.5 truncate">
-                        {sample.title}
-                      </span>
+                      <span className="text-muted-foreground ml-1.5">{sample.title}</span>
                     )}
                     {sample.curation_status && (
-                      <Badge
-                        variant="outline"
-                        className="ml-1 text-xs py-0 h-4"
-                      >
+                      <Badge variant="outline" className="ml-1 text-xs py-0 h-4">
                         {sample.curation_status}
                       </Badge>
                     )}
@@ -396,9 +537,72 @@ function ScopeSelector({
           )}
         </div>
       )}
+
+      {/* Modo filter (Inc-2): inputs para SampleFilter */}
+      {scope === 'filter' && (
+        <div className="mt-2 space-y-2">
+          <div className="space-y-1">
+            <p className="text-xs text-muted-foreground font-medium">Status de curadoria</p>
+            <div className="flex flex-wrap gap-2">
+              {CURATION_STATUSES.map((status) => {
+                const checked = sampleFilter.curation_status?.includes(status) ?? false;
+                return (
+                  <label key={status} className="flex items-center gap-1.5 cursor-pointer text-xs">
+                    <Checkbox
+                      checked={checked}
+                      onCheckedChange={(v) => {
+                        const current = sampleFilter.curation_status ?? [];
+                        const next = v
+                          ? [...current, status]
+                          : current.filter((s) => s !== status);
+                        onFilterChange({
+                          ...sampleFilter,
+                          curation_status: next.length > 0 ? next : null,
+                        });
+                      }}
+                    />
+                    {status}
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <div className="space-y-1">
+              <Label className="text-xs">Organismo</Label>
+              <Input
+                className="h-7 text-xs"
+                placeholder="Homo sapiens…"
+                value={sampleFilter.organism ?? ''}
+                onChange={(e) =>
+                  onFilterChange({ ...sampleFilter, organism: e.target.value || null })
+                }
+              />
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs">Plataforma</Label>
+              <Input
+                className="h-7 text-xs"
+                placeholder="GPL570…"
+                value={sampleFilter.platform ?? ''}
+                onChange={(e) =>
+                  onFilterChange({ ...sampleFilter, platform: e.target.value || null })
+                }
+              />
+            </div>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Ao menos um campo deve ser preenchido. Campos combinados com AND.
+          </p>
+        </div>
+      )}
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Componente principal
+// ---------------------------------------------------------------------------
 
 export function DatasetDownloadSection({
   projectId,
@@ -409,26 +613,32 @@ export function DatasetDownloadSection({
   const isGeo = sourceDb.toLowerCase() === 'geo';
   const isSra = sourceDb.toLowerCase() === 'sra';
 
-  // --- Escopo de download (MVP-A) ---
+  // --- Escopo de download (MVP-A + Inc-2) ---
   const [scope, setScope] = useState<ScopeEnum>('all');
   const [selectedSampleIds, setSelectedSampleIds] = useState<number[]>([]);
+  const [sampleFilter, setSampleFilter] = useState<SampleFilter>({});
 
-  // --- Dialogo de confirmacao de quota (apenas para SRA/FASTQ) ---
+  // --- Destino (Inc-1) ---
+  const [destination, setDestination] = useState<'server' | 'client'>('server');
+
+  // --- Resultado client mode (Inc-1) ---
+  const [clientUrls, setClientUrls] = useState<FastqUrlListResponse | null>(null);
+
+  // --- Dialogo de confirmacao de quota (apenas para server) ---
   const [quotaPreview, setQuotaPreview] = useState<DownloadQuotaPreview | null>(null);
-  // Mensagem de erro bloqueante (409 — quota esgotada).
   const [quotaBlockError, setQuotaBlockError] = useState<string | null>(null);
 
   const filesQuery = useDatasetFiles(projectId, isGeo || isSra ? datasetId : null);
   const jobQuery = useDatasetDownloadJob(projectId, isGeo || isSra ? datasetId : null);
   const triggerMutation = useTriggerDatasetDownload(projectId, datasetId);
+  const triggerBrowserDownloads = useClientFastqDownloader();
 
   // --- Resolucao SRA para datasets GEO (MVP-B) ---
   const sraResolutionJobQuery = useSraResolutionJob(projectId, isGeo ? datasetId : null);
   const resolveSraMutation = useResolveSraRuns(projectId, datasetId);
 
   const job = jobQuery.data;
-  const isJobActive =
-    job?.status === 'pending' || job?.status === 'running';
+  const isJobActive = job?.status === 'pending' || job?.status === 'running';
 
   const sraResolutionJob = sraResolutionJobQuery.data;
   const isSraResolutionActive =
@@ -436,29 +646,42 @@ export function DatasetDownloadSection({
 
   const files = filesQuery.data?.results ?? [];
   const hasFiles = files.length > 0;
-
-  // Calcula progresso agregado: % de arquivos no status downloaded.
   const downloadedCount = files.filter((f) => f.download_status === 'downloaded').length;
   const progressPercent = hasFiles ? Math.round((downloadedCount / files.length) * 100) : 0;
 
-  // Monta o payload de scope para o trigger.
-  function buildScopePayload(): { scope: ScopeEnum; sample_ids?: number[] } {
-    if (scope === 'manual') {
-      return { scope: 'manual', sample_ids: selectedSampleIds };
-    }
+  // Determina se o filtro de amostra tem ao menos um campo preenchido.
+  const filterHasValue =
+    (sampleFilter.curation_status ?? []).length > 0 ||
+    !!(sampleFilter.organism?.trim()) ||
+    !!(sampleFilter.platform?.trim());
+
+  // Monta o payload de escopo para o trigger.
+  function buildScopePayload() {
+    if (scope === 'manual') return { scope, sample_ids: selectedSampleIds };
+    if (scope === 'filter') return { scope, filters: sampleFilter };
     return { scope };
   }
 
   // GEO (F1): disparo direto sem dialogo de quota.
   function handleGeoDownload() {
+    setClientUrls(null);
     triggerMutation.mutate({ ...buildScopePayload() });
   }
 
-  // SRA/FASTQ (F2): primeira chamada sem confirm; em caso de 400 confirm_required abre dialogo.
+  // SRA/FASTQ: primeira chamada sem confirm; 400 abre dialogo; 409 mostra bloqueio.
+  // Para destination='client': nenhum confirm necessario — retorna 200 direto.
   async function handleSraDownload() {
     setQuotaBlockError(null);
+    setClientUrls(null);
     try {
-      await triggerMutation.mutateAsync({ confirm: false, ...buildScopePayload() });
+      const result = await triggerMutation.mutateAsync({
+        confirm: destination === 'server' ? false : undefined,
+        destination,
+        ...buildScopePayload(),
+      });
+      if (result.mode === 'client') {
+        setClientUrls(result.urls);
+      }
     } catch (err) {
       if (isDownloadQuotaError(err)) {
         if (err.httpStatus === 400 && err.preview.confirm_required) {
@@ -473,11 +696,17 @@ export function DatasetDownloadSection({
     }
   }
 
-  // Confirmacao no dialogo: re-dispara com confirm=true.
   async function handleConfirmDownload() {
     try {
-      await triggerMutation.mutateAsync({ confirm: true, ...buildScopePayload() });
+      const result = await triggerMutation.mutateAsync({
+        confirm: true,
+        destination,
+        ...buildScopePayload(),
+      });
       setQuotaPreview(null);
+      if (result.mode === 'client') {
+        setClientUrls(result.urls);
+      }
     } catch (err) {
       if (isDownloadQuotaError(err) && err.httpStatus === 409) {
         setQuotaPreview(null);
@@ -493,30 +722,27 @@ export function DatasetDownloadSection({
     setQuotaPreview(null);
   }
 
-  // Handlers de selecao de amostras (modo manual).
   function handleSampleToggle(id: number, checked: boolean) {
     setSelectedSampleIds((prev) =>
       checked ? [...prev, id] : prev.filter((x) => x !== id),
     );
   }
 
-  function handleSelectAll(ids: number[]) {
-    setSelectedSampleIds(ids);
-  }
-
-  function handleClearAll() {
-    setSelectedSampleIds([]);
-  }
-
-  // Reseta selecao ao trocar escopo.
   function handleScopeChange(newScope: ScopeEnum) {
     setScope(newScope);
-    if (newScope !== 'manual') {
-      setSelectedSampleIds([]);
-    }
+    if (newScope !== 'manual') setSelectedSampleIds([]);
+    if (newScope !== 'filter') setSampleFilter({});
+    setClientUrls(null);
   }
 
-  // Dataset nao suportado por download direto neste fluxo.
+  function handleDestinationChange(newDest: 'server' | 'client') {
+    setDestination(newDest);
+    setClientUrls(null);
+    setQuotaPreview(null);
+    setQuotaBlockError(null);
+  }
+
+  // Dataset nao suportado.
   if (!isGeo && !isSra) {
     return (
       <div className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">
@@ -525,37 +751,34 @@ export function DatasetDownloadSection({
     );
   }
 
-  // Para datasets GEO: fonte de verdade e o campo sra_resolved do backend.
-  // true  = runs SRA ja resolvidas → exibir "Baixar dados (FASTQ)" com seletor de escopo.
-  // false = precisa rodar resolve-sra primeiro → exibir "Resolver dados SRA".
-  // Durante a resolucao (job ativo), o botao fica desabilitado com spinner.
+  // Logica de estado GEO (MVP-B).
   const geoCanDownloadFastq = isGeo && sraResolved;
-
-  // Para datasets GEO sem sra_resolved: exibir botao de resolucao SRA em vez de FASTQ.
   const showGeoResolveSra = isGeo && !sraResolved;
 
   // Rotulos dinamicos.
   let sectionLabel = isGeo ? 'Dados suplementares' : 'Dados FASTQ (SRA)';
   let buttonLabel = isGeo ? 'Baixar dados' : 'Baixar dados (FASTQ)';
-
-  // Para GEO com FASTQ resolvido: usar rotulo de FASTQ.
   if (geoCanDownloadFastq) {
     sectionLabel = 'Dados FASTQ (GEO → SRA)';
     buttonLabel = 'Baixar dados (FASTQ)';
   }
 
-  // Para SRA ou GEO com FASTQ: mostrar seletor de escopo (MVP-A).
+  // Seletor de escopo: apenas para FASTQ (SRA ou GEO resolvido).
   const showScopeSelector = isSra || geoCanDownloadFastq;
 
-  // Validacao: modo manual requer ao menos uma amostra selecionada.
+  // Seletor de destino: apenas para FASTQ (sem GEO suplementar).
+  const showDestinationSelector = showScopeSelector;
+
+  // Validacao do trigger.
   const isTriggerDisabled =
     isJobActive ||
     triggerMutation.isPending ||
-    (scope === 'manual' && selectedSampleIds.length === 0);
+    (scope === 'manual' && selectedSampleIds.length === 0) ||
+    (scope === 'filter' && !filterHasValue);
 
   return (
     <div className="space-y-3">
-      {/* Dialogo de confirmacao de quota — apenas para SRA/FASTQ */}
+      {/* Dialogo de confirmacao de quota (server) */}
       {quotaPreview && (
         <FastqConfirmDialog
           open={!!quotaPreview}
@@ -570,7 +793,7 @@ export function DatasetDownloadSection({
       <div className="flex items-center justify-between gap-2">
         <p className="text-sm font-medium">{sectionLabel}</p>
 
-        {/* Botao de resolucao SRA (MVP-B) — exibido para datasets GEO sem sra_runs */}
+        {/* Botao de resolucao SRA (MVP-B) */}
         {showGeoResolveSra && (
           <TooltipProvider>
             <Tooltip>
@@ -602,7 +825,7 @@ export function DatasetDownloadSection({
           </TooltipProvider>
         )}
 
-        {/* Botao de download — exibido para SRA ou GEO com sra_runs resolvidos */}
+        {/* Botao de download (server ou client) */}
         {!showGeoResolveSra && (
           <TooltipProvider>
             <Tooltip>
@@ -634,12 +857,22 @@ export function DatasetDownloadSection({
                   <p className="text-xs">Selecione ao menos uma amostra para continuar.</p>
                 </TooltipContent>
               )}
+              {scope === 'filter' && !filterHasValue && !isJobActive && (
+                <TooltipContent>
+                  <p className="text-xs">Preencha ao menos um filtro para continuar.</p>
+                </TooltipContent>
+              )}
             </Tooltip>
           </TooltipProvider>
         )}
       </div>
 
-      {/* Status da resolucao SRA (MVP-B) — exibido enquanto o job existir */}
+      {/* Seletor de destino (Inc-1) */}
+      {showDestinationSelector && (
+        <DestinationSelector value={destination} onChange={handleDestinationChange} />
+      )}
+
+      {/* Status da resolucao SRA (MVP-B) */}
       {isGeo && sraResolutionJob && (
         <div className="rounded-md border p-2 text-xs space-y-1.5">
           <div className="flex items-center gap-1.5">
@@ -668,21 +901,23 @@ export function DatasetDownloadSection({
         </div>
       )}
 
-      {/* Seletor de escopo (MVP-A) — exibido para SRA e GEO com sra_runs resolvidos */}
+      {/* Seletor de escopo (MVP-A + Inc-2) */}
       {showScopeSelector && (
         <ScopeSelector
           projectId={projectId}
           datasetId={datasetId}
           scope={scope}
           selectedSampleIds={selectedSampleIds}
+          sampleFilter={sampleFilter}
           onScopeChange={handleScopeChange}
           onSampleToggle={handleSampleToggle}
-          onSelectAll={handleSelectAll}
-          onClearAll={handleClearAll}
+          onSelectAll={(ids) => setSelectedSampleIds(ids)}
+          onClearAll={() => setSelectedSampleIds([])}
+          onFilterChange={setSampleFilter}
         />
       )}
 
-      {/* Erro bloqueante de quota esgotada (409) */}
+      {/* Erro bloqueante de quota (409) */}
       {quotaBlockError && (
         <div className="flex items-start gap-2 rounded-md border border-red-200 bg-red-50 p-2 text-xs text-red-700">
           <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
@@ -690,8 +925,8 @@ export function DatasetDownloadSection({
         </div>
       )}
 
-      {/* Status do job de download ativo */}
-      {job && (
+      {/* Status do job de download (server) */}
+      {job && destination === 'server' && (
         <div className="rounded-md border p-2 text-xs space-y-1.5">
           <div className="flex items-center gap-1.5">
             {isJobActive ? (
@@ -727,8 +962,8 @@ export function DatasetDownloadSection({
         </div>
       )}
 
-      {/* Lista de arquivos */}
-      {hasFiles && (
+      {/* Lista de arquivos salvos no servidor */}
+      {hasFiles && destination === 'server' && (
         <div>
           {files.map((file) => (
             <FileRow key={file.id} file={file} />
@@ -736,17 +971,26 @@ export function DatasetDownloadSection({
         </div>
       )}
 
-      {!hasFiles && !isJobActive && !jobQuery.isLoading && !showGeoResolveSra && (
+      {!hasFiles && destination === 'server' && !isJobActive && !jobQuery.isLoading && !showGeoResolveSra && (
         <p className="text-xs text-muted-foreground">
           Nenhum arquivo baixado. Clique em &quot;{buttonLabel}&quot; para iniciar.
         </p>
       )}
 
-      {filesQuery.isLoading && (
+      {filesQuery.isLoading && destination === 'server' && (
         <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <Loader2 className="h-3.5 w-3.5 animate-spin" />
           Carregando arquivos…
         </div>
+      )}
+
+      {/* Lista de URLs (client mode, Inc-1) */}
+      {clientUrls && destination === 'client' && (
+        <FastqUrlList
+          urlResponse={clientUrls}
+          onDownloadAll={() => triggerBrowserDownloads(clientUrls.runs)}
+          onDownloadSingle={(item) => triggerBrowserDownloads([item])}
+        />
       )}
     </div>
   );

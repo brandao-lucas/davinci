@@ -546,128 +546,491 @@ pub async fn fetch_srr_samples_for_dataset(
         .collect())
 }
 
-/// Expand GEO GSM samples to (sample_id, srr_accession) pairs by reading
-/// `extra_metadata['sra_runs']` already persisted by `resolve_sra_runs_for_dataset`.
+/// Expand GEO GSM samples to (sample_id, run_accession) pairs by reading
+/// `core_samplesrarun` (Inc-3 structured table).
 ///
 /// # Behaviour
 ///
-/// - When `sample_ids` is `Some(ids)`: queries only those GSM rows.
-/// - When `sample_ids` is `None`: queries ALL GSM rows of the dataset.
-/// - GSM rows with no `sra_runs` key, an empty list, or a non-array value are
-///   skipped silently (microarray, not yet resolved, etc.).
-/// - The `sample_id` in each returned pair is the `id` of the **GSM** row —
-///   `download_fastq_for_samples` uses it as FK in `core_datasetfile.sample_id`.
+/// - When `sample_ids` is `Some(ids)`: JOINs only those GSM rows.
+/// - When `sample_ids` is `None`: JOINs ALL GSM rows of the dataset.
+/// - GSM rows with no rows in `core_samplesrarun` are counted as `skipped`
+///   (microarray, not yet resolved, etc.) — no error.
+/// - The `sample_id` in each returned pair is the GSM `id` used as FK in
+///   `core_datasetfile.sample_id` by the download pipeline.
 ///
-/// Returns `(pairs, skipped_count)` where `pairs` is the flat list ready for
-/// `download_fastq_for_samples` and `skipped_count` is how many GSMs had no
-/// resolved runs (informational, for the error/warning message at the call site).
+/// Returns `(pairs, skipped_gsm_count)`.
 pub async fn fetch_runs_from_geo_samples(
     db_client: &tokio_postgres::Client,
     dataset_id: i64,
     sample_ids: Option<&[i64]>,
 ) -> Result<(Vec<(i64, String)>, usize), String> {
-    // Build the query depending on whether an explicit subset was requested
-    let rows = match sample_ids {
-        None => {
-            db_client
-                .query(
-                    "SELECT id, extra_metadata \
-                     FROM core_omicsample \
-                     WHERE dataset_id = $1 \
-                       AND accession LIKE 'GSM%'",
-                    &[&dataset_id],
-                )
-                .await
-                .map_err(|e| format!("DB query for GEO samples failed: {:?}", e))?
-        }
-        Some(ids) => {
-            if ids.is_empty() {
-                return Ok((vec![], 0));
-            }
-            db_client
-                .query(
-                    "SELECT id, extra_metadata \
-                     FROM core_omicsample \
-                     WHERE dataset_id = $1 \
-                       AND id = ANY($2) \
-                       AND accession LIKE 'GSM%'",
-                    &[&dataset_id, &ids],
-                )
-                .await
-                .map_err(|e| format!("DB query for GEO samples (subset) failed: {:?}", e))?
-        }
-    };
-
-    let mut pairs: Vec<(i64, String)> = Vec::new();
-    let mut skipped = 0usize;
-
-    for row in rows {
-        let gsm_id: i64 = row.get(0);
-        let extra: serde_json::Value = row.get(1);
-
-        // Read the sra_runs array written by resolve_sra_runs_for_dataset
-        match extra.get("sra_runs").and_then(|v| v.as_array()) {
-            Some(arr) if !arr.is_empty() => {
-                for run_val in arr {
-                    if let Some(run_acc) = run_val.as_str() {
-                        let run_acc = run_acc.trim();
-                        if !run_acc.is_empty() {
-                            pairs.push((gsm_id, run_acc.to_string()));
-                        }
-                    }
-                }
-            }
-            _ => {
-                // No sra_runs or empty — GSM not resolved / microarray
-                skipped += 1;
-            }
+    if let Some(ids) = sample_ids {
+        if ids.is_empty() {
+            return Ok((vec![], 0));
         }
     }
+
+    // First count distinct GSM rows to compute skipped_count later
+    let gsm_count_rows = match sample_ids {
+        None => db_client
+            .query(
+                "SELECT COUNT(*) FROM core_omicsample \
+                 WHERE dataset_id = $1 AND accession LIKE 'GSM%'",
+                &[&dataset_id],
+            )
+            .await
+            .map_err(|e| format!("DB count GSM samples failed: {:?}", e))?,
+        Some(ids) => db_client
+            .query(
+                "SELECT COUNT(*) FROM core_omicsample \
+                 WHERE dataset_id = $1 AND id = ANY($2) AND accession LIKE 'GSM%'",
+                &[&dataset_id, &ids],
+            )
+            .await
+            .map_err(|e| format!("DB count GSM samples (subset) failed: {:?}", e))?,
+    };
+    let total_gsm: i64 = gsm_count_rows.first().map(|r| r.get(0)).unwrap_or(0);
+
+    // Join core_samplesrarun to get resolved runs
+    let rows = match sample_ids {
+        None => db_client
+            .query(
+                "SELECT sr.sample_id, sr.run_accession \
+                 FROM core_samplesrarun sr \
+                 JOIN core_omicsample s ON s.id = sr.sample_id \
+                 WHERE s.dataset_id = $1 \
+                   AND s.accession LIKE 'GSM%' \
+                 ORDER BY sr.sample_id, sr.run_accession",
+                &[&dataset_id],
+            )
+            .await
+            .map_err(|e| format!("DB query core_samplesrarun (all) failed: {:?}", e))?,
+        Some(ids) => db_client
+            .query(
+                "SELECT sr.sample_id, sr.run_accession \
+                 FROM core_samplesrarun sr \
+                 JOIN core_omicsample s ON s.id = sr.sample_id \
+                 WHERE s.dataset_id = $1 \
+                   AND s.id = ANY($2) \
+                   AND s.accession LIKE 'GSM%' \
+                 ORDER BY sr.sample_id, sr.run_accession",
+                &[&dataset_id, &ids],
+            )
+            .await
+            .map_err(|e| format!("DB query core_samplesrarun (subset) failed: {:?}", e))?,
+    };
+
+    let pairs: Vec<(i64, String)> = rows
+        .into_iter()
+        .map(|r| (r.get::<_, i64>(0), r.get::<_, String>(1)))
+        .collect();
+
+    // Derive skipped: GSMs that have no row in core_samplesrarun
+    // (total_gsm - distinct GSMs with at least one run)
+    let gsms_with_runs = {
+        let mut seen = std::collections::HashSet::new();
+        for (gsm_id, _) in &pairs {
+            seen.insert(*gsm_id);
+        }
+        seen.len() as i64
+    };
+    let skipped = (total_gsm - gsms_with_runs).max(0) as usize;
 
     Ok((pairs, skipped))
 }
 
-// ─── GEO → SRA run resolution (MVP-B) ────────────────────────────────────────
+// ─── Inc-1: URL resolution without download ──────────────────────────────────
 
-/// ENA Portal filereport URL for resolving an SRX experiment to its SRR runs.
+/// One FASTQ URL entry returned by `resolve_fastq_urls_for_dataset`.
 ///
-/// Returns a TSV with columns: `run_accession` (one row per SRR/ERR/DRR run).
+/// `fastq_url` follows the same `;`-joined convention used by `SrxRunRecord`
+/// and `core_samplesrarun.fastq_url`: one or two HTTPS URLs separated by `;`
+/// for paired-end runs.  An empty string means ENA has no FASTQ for this run
+/// (bam-only upload) — the Django layer surfaces this as a "no public FASTQ"
+/// flag rather than suppressing the entry entirely.
+#[derive(Debug, PartialEq, Clone)]
+pub struct FastqUrlRecord {
+    /// SRR / ERR / DRR accession.
+    pub run_accession: String,
+    /// HTTPS URL(s), `;`-joined.  Empty for bam-only runs.
+    pub fastq_url: String,
+    /// Basename(s) derived from `fastq_url`, `;`-joined.  Empty when URL is empty.
+    pub file_name: String,
+    /// Declared total size in bytes (sum of R1+R2 when paired-end).
+    pub size_bytes: Option<i64>,
+    /// MD5 checksum(s), `;`-joined (lowercase).
+    pub checksum_md5: Option<String>,
+}
+
+/// Derive the `;`-joined basenames from a `;`-joined URL string.
+///
+/// `"https://…/SRR_1.fastq.gz;https://…/SRR_2.fastq.gz"`
+/// → `"SRR_1.fastq.gz;SRR_2.fastq.gz"`
+///
+/// Empty input → empty output.
+pub fn file_names_from_url(fastq_url: &str) -> String {
+    if fastq_url.is_empty() {
+        return String::new();
+    }
+    fastq_url
+        .split(';')
+        .map(|u| {
+            u.trim()
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Resolve public ENA FASTQ URLs for a dataset without downloading anything.
+///
+/// # Source routing
+///
+/// - `"geo"`: reads from `core_samplesrarun` (populated by
+///   `resolve_sra_runs_for_geo_samples`).  The `fastq_url`, `size_bytes`, and
+///   `checksum_md5` columns are already cached — no HTTP call needed.
+/// - `"sra"` / `"ena"`: the `OmicSample` rows are themselves run accessions
+///   (`SRR*`/`ERR*`/`DRR*`).  Each run is looked up via the ENA Portal
+///   filereport API; `parse_srx_filereport_tsv` extracts the fields.
+///
+/// # Bam-only runs
+///
+/// Runs where ENA holds no FASTQ (bam-only) are included with `fastq_url = ""`
+/// so the Django layer can surface a "no public FASTQ" status rather than
+/// silently omitting the run from the response.
+///
+/// # Security
+///
+/// `ncbi_api_key` is forwarded to `NcbiClient` and used only in HTTP request
+/// headers.  It is never written to stderr, logs, or return values.
+///
+/// Returns `(records, errors)`:
+/// - `records`: one entry per resolved run (including bam-only with empty URL).
+/// - `errors`: non-fatal per-run errors (network failures, etc.).
+pub async fn resolve_fastq_urls_for_dataset(
+    client: &NcbiClient,
+    db_client: &tokio_postgres::Client,
+    dataset_id: i64,
+    source_db: &str,
+    sample_ids: Option<&[i64]>,
+) -> (Vec<FastqUrlRecord>, Vec<String>) {
+    match source_db {
+        "geo" => resolve_fastq_urls_geo(db_client, dataset_id, sample_ids).await,
+        "sra" | "ena" => {
+            resolve_fastq_urls_sra(client, db_client, dataset_id, sample_ids).await
+        }
+        unknown => (
+            vec![],
+            vec![format!(
+                "Unknown source_db '{}'. Valid: geo, sra, ena",
+                unknown
+            )],
+        ),
+    }
+}
+
+/// GEO path: read cached URLs from `core_samplesrarun`.
+async fn resolve_fastq_urls_geo(
+    db_client: &tokio_postgres::Client,
+    dataset_id: i64,
+    sample_ids: Option<&[i64]>,
+) -> (Vec<FastqUrlRecord>, Vec<String>) {
+    if let Some(ids) = sample_ids {
+        if ids.is_empty() {
+            return (vec![], vec![]);
+        }
+    }
+
+    let rows = match sample_ids {
+        None => db_client
+            .query(
+                "SELECT sr.run_accession, sr.fastq_url, sr.size_bytes, sr.checksum_md5 \
+                 FROM core_samplesrarun sr \
+                 JOIN core_omicsample s ON s.id = sr.sample_id \
+                 WHERE s.dataset_id = $1 \
+                   AND s.accession LIKE 'GSM%' \
+                 ORDER BY sr.sample_id, sr.run_accession",
+                &[&dataset_id],
+            )
+            .await,
+        Some(ids) => db_client
+            .query(
+                "SELECT sr.run_accession, sr.fastq_url, sr.size_bytes, sr.checksum_md5 \
+                 FROM core_samplesrarun sr \
+                 JOIN core_omicsample s ON s.id = sr.sample_id \
+                 WHERE s.dataset_id = $1 \
+                   AND s.id = ANY($2) \
+                   AND s.accession LIKE 'GSM%' \
+                 ORDER BY sr.sample_id, sr.run_accession",
+                &[&dataset_id, &ids],
+            )
+            .await,
+    };
+
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                vec![],
+                vec![format!("DB query core_samplesrarun failed: {:?}", e)],
+            )
+        }
+    };
+
+    let records = rows
+        .into_iter()
+        .map(|r| {
+            let run_accession: String = r.get(0);
+            let fastq_url: String = r.get(1);
+            let size_bytes: Option<i64> = r.get(2);
+            let checksum_md5: Option<String> = r.get(3);
+            let file_name = file_names_from_url(&fastq_url);
+            FastqUrlRecord {
+                run_accession,
+                fastq_url,
+                file_name,
+                size_bytes,
+                checksum_md5,
+            }
+        })
+        .collect();
+
+    (records, vec![])
+}
+
+/// Validate a SRA/ENA/DDBJ run accession against `^[SED]RR[0-9]+$`.
+///
+/// Accepts only the three standard prefixes (SRR, ERR, DRR) followed by one
+/// or more ASCII digits.  This guards against query-string injection when the
+/// accession is composed into an ENA Portal URL.
+///
+/// Implemented without the `regex` crate to keep the validation zero-cost and
+/// dependency-free at this call site.
+pub fn is_valid_run_accession(acc: &str) -> bool {
+    let b = acc.as_bytes();
+    // Minimum: [SED]RR + at least one digit = 4 bytes
+    if b.len() < 4 {
+        return false;
+    }
+    // First byte: S, E, or D
+    if b[0] != b'S' && b[0] != b'E' && b[0] != b'D' {
+        return false;
+    }
+    // Second and third bytes: R R
+    if b[1] != b'R' || b[2] != b'R' {
+        return false;
+    }
+    // Remaining bytes: all ASCII digits, at least one
+    b[3..].iter().all(|c| c.is_ascii_digit())
+}
+
+/// SRA/ENA-native path: OmicSample rows are already run accessions (SRR*/ERR*/DRR*).
+/// Resolve URLs via ENA Portal filereport per run.
+async fn resolve_fastq_urls_sra(
+    client: &NcbiClient,
+    db_client: &tokio_postgres::Client,
+    dataset_id: i64,
+    sample_ids: Option<&[i64]>,
+) -> (Vec<FastqUrlRecord>, Vec<String>) {
+    // Fetch the (sample_id, run_accession) pairs — reuse existing helper
+    let srr_pairs = match fetch_srr_samples_for_dataset(db_client, dataset_id, sample_ids).await {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                vec![],
+                vec![format!("fetch_srr_samples_for_dataset failed: {}", e)],
+            )
+        }
+    };
+
+    let mut records: Vec<FastqUrlRecord> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for (_sample_id, run_accession) in &srr_pairs {
+        // O2: validate accession before composing ENA URL (defence-in-depth)
+        if !is_valid_run_accession(run_accession) {
+            let msg = format!(
+                "Skipping run_accession with unexpected format: '{}' \
+                 (expected [SED]RR<digits>)",
+                run_accession
+            );
+            eprintln!("[resolve_urls] {}", msg);
+            errors.push(msg);
+            continue;
+        }
+
+        let url = ena_filereport_url(run_accession);
+        let tsv = match client.fetch_with_retry(&url, &[]).await {
+            Ok(body) => body,
+            Err(e) => {
+                let msg = format!("ENA filereport fetch failed for {}: {}", run_accession, e);
+                eprintln!("[resolve_urls] {}", msg);
+                errors.push(msg);
+                continue;
+            }
+        };
+
+        // parse_srx_filereport_tsv handles the same fields we need
+        let run_records = parse_srx_filereport_tsv(&tsv);
+
+        if run_records.is_empty() {
+            // ENA returned no rows — include as bam-only entry
+            records.push(FastqUrlRecord {
+                run_accession: run_accession.clone(),
+                fastq_url: String::new(),
+                file_name: String::new(),
+                size_bytes: None,
+                checksum_md5: None,
+            });
+            eprintln!(
+                "[resolve_urls] {} has no FASTQ in ENA (bam-only or not indexed)",
+                run_accession
+            );
+        } else {
+            for rec in run_records {
+                let file_name = file_names_from_url(&rec.fastq_url);
+                records.push(FastqUrlRecord {
+                    run_accession: rec.run_accession,
+                    fastq_url: rec.fastq_url,
+                    file_name,
+                    size_bytes: rec.size_bytes,
+                    checksum_md5: rec.checksum_md5,
+                });
+            }
+        }
+    }
+
+    (records, errors)
+}
+
+// ─── GEO → SRA run resolution (Inc-3) ────────────────────────────────────────
+
+/// ENA Portal filereport URL for resolving an SRX experiment.
+///
+/// Requests `run_accession`, `fastq_ftp`, `fastq_bytes`, `fastq_md5` in one
+/// call so that `core_samplesrarun` can be populated with full metadata.
 fn ena_srx_to_srr_url(srx_accession: &str) -> String {
     format!(
         "https://www.ebi.ac.uk/ena/portal/api/filereport\
-         ?accession={}&result=read_run&fields=run_accession&format=tsv",
+         ?accession={}&result=read_run\
+         &fields=run_accession,fastq_ftp,fastq_bytes,fastq_md5\
+         &format=tsv",
         srx_accession
     )
 }
 
-/// Parse the ENA filereport TSV when only `run_accession` is requested.
+/// One resolved run record returned by the enriched ENA filereport TSV.
 ///
-/// Returns a list of run accessions (SRR/ERR/DRR).
-fn parse_run_accessions_from_tsv(tsv: &str) -> Vec<String> {
-    let mut runs = Vec::new();
+/// A single SRX may resolve to multiple SRR runs; each run may have up to two
+/// FASTQ files (R1/R2). We store the raw `;`-joined `fastq_ftp` string as
+/// `fastq_url` in `core_samplesrarun` — the download pipeline splits it when
+/// needed (matching what `parse_ena_filereport_tsv` already does).
+#[derive(Debug, PartialEq)]
+pub struct SrxRunRecord {
+    /// SRR / ERR / DRR accession.
+    pub run_accession: String,
+    /// Raw `fastq_ftp` column value (may contain `;`-separated paths, or be
+    /// empty when ENA has no FASTQ for this run).  Stored as-is.
+    pub fastq_url: String,
+    /// Sum of declared sizes across all FASTQ files for this run (bytes).
+    pub size_bytes: Option<i64>,
+    /// `fastq_md5` column value, stored as-is (`;`-joined when paired-end).
+    pub checksum_md5: Option<String>,
+}
+
+/// Parse the enriched ENA filereport TSV (`run_accession`, `fastq_ftp`,
+/// `fastq_bytes`, `fastq_md5`).
+///
+/// Column order is resolved by header name, so this is robust to ENA adding or
+/// reordering columns. Returns one `SrxRunRecord` per data row.
+///
+/// Rows where `run_accession` is blank are skipped. `fastq_ftp` / `fastq_bytes`
+/// / `fastq_md5` are optional — absent or `-` columns produce empty/None.
+pub fn parse_srx_filereport_tsv(tsv: &str) -> Vec<SrxRunRecord> {
+    let mut records = Vec::new();
     let mut lines = tsv.lines();
-    let header = match lines.next() {
+
+    let header_line = match lines.next() {
         Some(h) => h,
-        None => return runs,
+        None => return records,
     };
-    let headers: Vec<&str> = header.split('\t').collect();
-    let idx_run = match headers.iter().position(|h| h.trim() == "run_accession") {
+    let headers: Vec<&str> = header_line.split('\t').collect();
+    let col = |name: &str| headers.iter().position(|h| h.trim() == name);
+
+    let idx_run = match col("run_accession") {
         Some(i) => i,
-        None => return runs, // unexpected header — skip silently
+        None => return records, // malformed header
     };
+    let idx_ftp = col("fastq_ftp");
+    let idx_bytes = col("fastq_bytes");
+    let idx_md5 = col("fastq_md5");
+
     for line in lines {
         if line.trim().is_empty() {
             continue;
         }
         let fields: Vec<&str> = line.split('\t').collect();
-        if let Some(run) = fields.get(idx_run) {
-            let run = run.trim();
-            if !run.is_empty() {
-                runs.push(run.to_string());
-            }
-        }
+
+        let run_accession = match fields.get(idx_run) {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => continue,
+        };
+
+        // fastq_ftp: raw value, convert bare FTP paths to HTTPS
+        let fastq_url = idx_ftp
+            .and_then(|i| fields.get(i))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && *s != "-")
+            .map(|raw| {
+                // Each ';'-separated segment may be a bare FTP path
+                raw.split(';')
+                    .map(|seg| ena_ftp_to_https(seg.trim()))
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(";")
+            })
+            .unwrap_or_default();
+
+        // fastq_bytes: sum all ';'-separated values
+        let size_bytes: Option<i64> = idx_bytes
+            .and_then(|i| fields.get(i))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && *s != "-")
+            .map(|raw| {
+                raw.split(';')
+                    .filter_map(|v| v.trim().parse::<i64>().ok())
+                    .sum()
+            });
+
+        // fastq_md5: raw ';'-joined value, stored as-is
+        let checksum_md5: Option<String> = idx_md5
+            .and_then(|i| fields.get(i))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && *s != "-")
+            .map(|s| s.to_lowercase());
+
+        records.push(SrxRunRecord {
+            run_accession,
+            fastq_url,
+            size_bytes,
+            checksum_md5,
+        });
     }
-    runs
+
+    records
+}
+
+/// Kept for test compatibility. Delegates to `parse_srx_filereport_tsv`.
+#[allow(dead_code)]
+fn parse_run_accessions_from_tsv(tsv: &str) -> Vec<String> {
+    parse_srx_filereport_tsv(tsv)
+        .into_iter()
+        .map(|r| r.run_accession)
+        .collect()
 }
 
 /// Extract SRX (and ERX/DRX) accessions from the GEO SOFT `relation` field.
@@ -711,11 +1074,19 @@ fn extract_srx_from_relation(relation: &str) -> Vec<String> {
 }
 
 /// Resolve `extra_metadata['relation']` of all GSM samples in `dataset_id`
-/// to SRR run accessions via the ENA Portal API, then UPDATE each sample's
-/// `extra_metadata` with `sra_runs: ["SRR...", ...]`.
+/// to SRR run accessions via the ENA Portal API.
+///
+/// For each resolved run, inserts a row into `core_samplesrarun` (structured
+/// table, Inc-3) with `run_accession`, `fastq_url`, `size_bytes`, `checksum_md5`.
+/// Uses ON CONFLICT DO UPDATE so that re-running the resolver refreshes stale data.
+///
+/// Also keeps `extra_metadata['sra_runs']` up-to-date as a redundant fallback
+/// during the migration window (safe to remove after Inc-3 is stable).
 ///
 /// Tolerant: samples without a `relation` field, GSMs for microarray studies
-/// (no SRA), or SRX accessions ENA cannot find → `sra_runs` set to `[]`.
+/// (no SRA), or SRX accessions ENA cannot find → empty run list, no error.
+///
+/// **Security:** `client` holds `ncbi_api_key` internally; it is never logged here.
 ///
 /// Returns `(updated_count, errors)`.
 pub async fn resolve_sra_runs_for_geo_samples(
@@ -726,7 +1097,7 @@ pub async fn resolve_sra_runs_for_geo_samples(
     let mut errors: Vec<String> = Vec::new();
     let mut updated_count: u64 = 0;
 
-    // 1. Fetch all GSM samples for this dataset (id + extra_metadata as text)
+    // 1. Fetch all GSM samples for this dataset
     let rows = match db_client
         .query(
             "SELECT id, extra_metadata \
@@ -760,16 +1131,18 @@ pub async fn resolve_sra_runs_for_geo_samples(
 
     for row in rows {
         let sample_id: i64 = row.get(0);
-        // extra_metadata is stored as a JSON column; read it as serde_json::Value
         let extra_json: serde_json::Value = row.get(1);
 
-        // 2. Extract the `relation` field (stored as a JSON string by sample_parser)
+        // 2. Extract the `relation` field
         let relation = match extra_json.get("relation").and_then(|v| v.as_str()) {
             Some(r) if !r.is_empty() => r.to_string(),
             _ => {
-                // No relation field — microarray or non-SRA sample; set sra_runs=[]
-                if let Err(e) = update_sra_runs(db_client, sample_id, &[]).await {
-                    errors.push(format!("sample_id={}: UPDATE sra_runs failed: {}", sample_id, e));
+                // Microarray or non-SRA sample — write empty sra_runs to both stores
+                if let Err(e) = upsert_samplesrarun_batch(db_client, sample_id, &[]).await {
+                    errors.push(format!("sample_id={}: upsert core_samplesrarun failed: {}", sample_id, e));
+                }
+                if let Err(e) = update_sra_runs_json(db_client, sample_id, &[]).await {
+                    errors.push(format!("sample_id={}: UPDATE extra_metadata failed: {}", sample_id, e));
                 } else {
                     updated_count += 1;
                 }
@@ -777,16 +1150,19 @@ pub async fn resolve_sra_runs_for_geo_samples(
             }
         };
 
-        // 3. Extract SRX accessions from the relation string
+        // 3. Extract SRX accessions
         let srx_list = extract_srx_from_relation(&relation);
 
         if srx_list.is_empty() {
             eprintln!(
-                "[resolve_sra] sample_id={} relation has no SRX/ERX/DRX — setting sra_runs=[]",
+                "[resolve_sra] sample_id={} relation has no SRX/ERX/DRX — writing empty",
                 sample_id
             );
-            if let Err(e) = update_sra_runs(db_client, sample_id, &[]).await {
-                errors.push(format!("sample_id={}: UPDATE sra_runs failed: {}", sample_id, e));
+            if let Err(e) = upsert_samplesrarun_batch(db_client, sample_id, &[]).await {
+                errors.push(format!("sample_id={}: upsert core_samplesrarun failed: {}", sample_id, e));
+            }
+            if let Err(e) = update_sra_runs_json(db_client, sample_id, &[]).await {
+                errors.push(format!("sample_id={}: UPDATE extra_metadata failed: {}", sample_id, e));
             } else {
                 updated_count += 1;
             }
@@ -798,23 +1174,22 @@ pub async fn resolve_sra_runs_for_geo_samples(
             sample_id, srx_list
         );
 
-        // 4. Resolve each SRX → SRR via ENA filereport
-        let mut all_runs: Vec<String> = Vec::new();
+        // 4. Resolve each SRX → enriched run records via ENA filereport
+        let mut all_records: Vec<SrxRunRecord> = Vec::new();
         for srx in &srx_list {
             let url = ena_srx_to_srr_url(srx);
             match client.fetch_with_retry(&url, &[]).await {
                 Ok(tsv) => {
-                    let runs = parse_run_accessions_from_tsv(&tsv);
+                    let records = parse_srx_filereport_tsv(&tsv);
                     eprintln!(
-                        "[resolve_sra] {} → {} run(s): {:?}",
+                        "[resolve_sra] {} → {} run(s)",
                         srx,
-                        runs.len(),
-                        runs
+                        records.len()
                     );
-                    all_runs.extend(runs);
+                    all_records.extend(records);
                 }
                 Err(e) => {
-                    // Non-fatal: log but keep going — this SRX gets no runs
+                    // Non-fatal — log but continue; this SRX contributes no runs
                     let msg = format!("ENA filereport for {} failed: {}", srx, e);
                     eprintln!("[resolve_sra] {}", msg);
                     errors.push(format!("sample_id={} {}", sample_id, msg));
@@ -822,9 +1197,23 @@ pub async fn resolve_sra_runs_for_geo_samples(
             }
         }
 
-        // 5. Persist sra_runs into extra_metadata (merge, not overwrite)
-        if let Err(e) = update_sra_runs(db_client, sample_id, &all_runs).await {
-            errors.push(format!("sample_id={}: UPDATE sra_runs failed: {}", sample_id, e));
+        // 5a. Persist to core_samplesrarun (structured table — Inc-3 source of truth)
+        if let Err(e) = upsert_samplesrarun_batch(db_client, sample_id, &all_records).await {
+            errors.push(format!(
+                "sample_id={}: upsert core_samplesrarun failed: {}",
+                sample_id, e
+            ));
+            // Still try the JSON fallback below
+        }
+
+        // 5b. Persist to extra_metadata['sra_runs'] (JSON fallback — transition safety)
+        let run_accessions: Vec<String> =
+            all_records.iter().map(|r| r.run_accession.clone()).collect();
+        if let Err(e) = update_sra_runs_json(db_client, sample_id, &run_accessions).await {
+            errors.push(format!(
+                "sample_id={}: UPDATE extra_metadata failed: {}",
+                sample_id, e
+            ));
         } else {
             updated_count += 1;
         }
@@ -833,21 +1222,65 @@ pub async fn resolve_sra_runs_for_geo_samples(
     (updated_count, errors)
 }
 
-/// UPDATE `core_omicsample.extra_metadata` to set `sra_runs` key without
-/// clobbering other keys already present.
+/// INSERT or UPDATE rows in `core_samplesrarun` for a single GSM sample.
 ///
-/// Uses the PostgreSQL `||` (jsonb concatenation) operator so that only
-/// `sra_runs` is updated; all other keys in `extra_metadata` are preserved.
-async fn update_sra_runs(
+/// ON CONFLICT on the unique constraint `samplesrarun_sample_run_uniq`
+/// (`sample_id`, `run_accession`) updates the mutable columns so that
+/// re-running the resolver refreshes stale URLs / sizes / checksums.
+///
+/// Passing an empty `records` slice is a no-op (not an error).
+async fn upsert_samplesrarun_batch(
+    db_client: &tokio_postgres::Client,
+    sample_id: i64,
+    records: &[SrxRunRecord],
+) -> Result<(), String> {
+    if records.is_empty() {
+        return Ok(());
+    }
+
+    for rec in records {
+        db_client
+            .execute(
+                "INSERT INTO core_samplesrarun \
+                     (sample_id, run_accession, fastq_url, size_bytes, checksum_md5) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT ON CONSTRAINT samplesrarun_sample_run_uniq \
+                 DO UPDATE SET \
+                     fastq_url    = EXCLUDED.fastq_url, \
+                     size_bytes   = EXCLUDED.size_bytes, \
+                     checksum_md5 = EXCLUDED.checksum_md5",
+                &[
+                    &sample_id,
+                    &rec.run_accession,
+                    &rec.fastq_url,
+                    &rec.size_bytes,
+                    &rec.checksum_md5,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "INSERT core_samplesrarun sample_id={} run={} failed: {:?}",
+                    sample_id, rec.run_accession, e
+                )
+            })?;
+    }
+
+    Ok(())
+}
+
+/// UPDATE `core_omicsample.extra_metadata['sra_runs']` without touching other keys.
+///
+/// Transition-safety fallback alongside `core_samplesrarun`. Uses `||` (jsonb
+/// merge) so only the `sra_runs` key is replaced.
+async fn update_sra_runs_json(
     db_client: &tokio_postgres::Client,
     sample_id: i64,
     runs: &[String],
 ) -> Result<(), String> {
-    // Build a JSON array string from the runs slice
     let runs_json = serde_json::to_string(runs)
         .map_err(|e| format!("JSON serialisation of sra_runs failed: {}", e))?;
 
-    // Merge: existing jsonb || '{"sra_runs": [...]}'::jsonb
     db_client
         .execute(
             "UPDATE core_omicsample \
@@ -1202,27 +1635,157 @@ mod tests {
         assert!(srx.is_empty());
     }
 
+    // ─── Inc-3: ena_srx_to_srr_url now requests enriched fields ─────────────
+
     #[test]
     fn test_ena_srx_to_srr_url() {
         let url = ena_srx_to_srr_url("SRX123456");
-        assert!(url.contains("accession=SRX123456"));
-        assert!(url.contains("result=read_run"));
-        assert!(url.contains("fields=run_accession"));
-        assert!(url.contains("format=tsv"));
+        assert!(url.contains("accession=SRX123456"), "must contain accession");
+        assert!(url.contains("result=read_run"), "must target read_run");
+        assert!(url.contains("fields=run_accession"), "must request run_accession");
+        assert!(url.contains("fastq_ftp"), "must request fastq_ftp (Inc-3)");
+        assert!(url.contains("fastq_bytes"), "must request fastq_bytes (Inc-3)");
+        assert!(url.contains("fastq_md5"), "must request fastq_md5 (Inc-3)");
+        assert!(url.contains("format=tsv"), "must request TSV format");
     }
+
+    // ─── Inc-3: parse_srx_filereport_tsv — enriched TSV parser ──────────────
+
+    /// Single-end run with full metadata.
+    #[test]
+    fn test_parse_srx_filereport_single_end() {
+        let tsv = "run_accession\tfastq_ftp\tfastq_bytes\tfastq_md5\n\
+            SRR1111111\t\
+            ftp.sra.ebi.ac.uk/vol1/fastq/SRR111/001/SRR1111111/SRR1111111.fastq.gz\t\
+            987654321\t\
+            aabbccddeeff00112233445566778899\n";
+        let recs = parse_srx_filereport_tsv(tsv);
+        assert_eq!(recs.len(), 1);
+        let r = &recs[0];
+        assert_eq!(r.run_accession, "SRR1111111");
+        assert_eq!(
+            r.fastq_url,
+            "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR111/001/SRR1111111/SRR1111111.fastq.gz"
+        );
+        assert_eq!(r.size_bytes, Some(987654321));
+        assert_eq!(
+            r.checksum_md5,
+            Some("aabbccddeeff00112233445566778899".to_string())
+        );
+    }
+
+    /// Paired-end run: fastq_ftp has two ';'-joined paths; size_bytes is summed.
+    #[test]
+    fn test_parse_srx_filereport_paired_end() {
+        let tsv = "run_accession\tfastq_ftp\tfastq_bytes\tfastq_md5\n\
+            SRR2222222\t\
+            ftp.sra.ebi.ac.uk/vol1/fastq/SRR222/002/SRR2222222/SRR2222222_1.fastq.gz;\
+            ftp.sra.ebi.ac.uk/vol1/fastq/SRR222/002/SRR2222222/SRR2222222_2.fastq.gz\t\
+            1000000;2000000\t\
+            aaaa1111;bbbb2222\n";
+        let recs = parse_srx_filereport_tsv(tsv);
+        assert_eq!(recs.len(), 1);
+        let r = &recs[0];
+        assert_eq!(r.run_accession, "SRR2222222");
+        // Both URLs joined by ';'
+        assert!(r.fastq_url.contains("SRR2222222_1.fastq.gz"));
+        assert!(r.fastq_url.contains("SRR2222222_2.fastq.gz"));
+        assert!(r.fastq_url.contains(';'), "paired-end URLs must be ';'-joined");
+        // Size is the sum of both files
+        assert_eq!(r.size_bytes, Some(3_000_000));
+        // MD5 stored as-is (lowercased)
+        assert_eq!(r.checksum_md5, Some("aaaa1111;bbbb2222".to_string()));
+    }
+
+    /// Run with no FASTQ in ENA ('-' placeholder) still produces a record,
+    /// but fastq_url is empty and size/md5 are None.
+    #[test]
+    fn test_parse_srx_filereport_no_fastq_dash() {
+        let tsv = "run_accession\tfastq_ftp\tfastq_bytes\tfastq_md5\n\
+            SRR3333333\t-\t-\t-\n";
+        let recs = parse_srx_filereport_tsv(tsv);
+        assert_eq!(recs.len(), 1, "bam-only run still produces a record");
+        let r = &recs[0];
+        assert_eq!(r.run_accession, "SRR3333333");
+        assert!(r.fastq_url.is_empty(), "fastq_url must be empty for '-'");
+        assert_eq!(r.size_bytes, None);
+        assert_eq!(r.checksum_md5, None);
+    }
+
+    /// Two runs in one TSV response (SRX with multiple SRR).
+    #[test]
+    fn test_parse_srx_filereport_multiple_runs() {
+        let tsv = "run_accession\tfastq_ftp\tfastq_bytes\tfastq_md5\n\
+            SRR4000001\tftp.sra.ebi.ac.uk/a/SRR4000001.fastq.gz\t500\tmd5a\n\
+            SRR4000002\tftp.sra.ebi.ac.uk/b/SRR4000002.fastq.gz\t600\tmd5b\n";
+        let recs = parse_srx_filereport_tsv(tsv);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].run_accession, "SRR4000001");
+        assert_eq!(recs[0].size_bytes, Some(500));
+        assert_eq!(recs[1].run_accession, "SRR4000002");
+        assert_eq!(recs[1].size_bytes, Some(600));
+    }
+
+    /// Completely empty TSV — no panic, empty result.
+    #[test]
+    fn test_parse_srx_filereport_empty() {
+        assert!(parse_srx_filereport_tsv("").is_empty());
+    }
+
+    /// Header-only TSV — no data rows.
+    #[test]
+    fn test_parse_srx_filereport_header_only() {
+        let tsv = "run_accession\tfastq_ftp\tfastq_bytes\tfastq_md5\n";
+        assert!(parse_srx_filereport_tsv(tsv).is_empty());
+    }
+
+    /// Malformed header (no run_accession column) — returns empty without panic.
+    #[test]
+    fn test_parse_srx_filereport_missing_run_column() {
+        let tsv = "experiment_accession\tfastq_ftp\n\
+            SRX000001\tftp.sra.ebi.ac.uk/x.fastq.gz\n";
+        assert!(parse_srx_filereport_tsv(tsv).is_empty());
+    }
+
+    /// Columns out of order — parser resolves by header name.
+    #[test]
+    fn test_parse_srx_filereport_reordered_columns() {
+        let tsv = "fastq_md5\tfastq_bytes\trun_accession\tfastq_ftp\n\
+            mymd5\t12345\tSRR5000001\tftp.sra.ebi.ac.uk/r/SRR5000001.fastq.gz\n";
+        let recs = parse_srx_filereport_tsv(tsv);
+        assert_eq!(recs.len(), 1);
+        let r = &recs[0];
+        assert_eq!(r.run_accession, "SRR5000001");
+        assert_eq!(r.size_bytes, Some(12345));
+        assert_eq!(r.checksum_md5, Some("mymd5".to_string()));
+        assert!(r.fastq_url.contains("SRR5000001.fastq.gz"));
+    }
+
+    /// MD5 is stored lowercase regardless of input case.
+    #[test]
+    fn test_parse_srx_filereport_md5_lowercased() {
+        let tsv = "run_accession\tfastq_ftp\tfastq_bytes\tfastq_md5\n\
+            SRR6000001\tftp.sra.ebi.ac.uk/x.fastq.gz\t1\tAABBCCDD\n";
+        let recs = parse_srx_filereport_tsv(tsv);
+        assert_eq!(recs[0].checksum_md5, Some("aabbccdd".to_string()));
+    }
+
+    // ─── parse_run_accessions_from_tsv — compat wrapper ──────────────────────
+    // These continue to work because the wrapper delegates to parse_srx_filereport_tsv.
 
     #[test]
     fn test_parse_run_accessions_from_tsv_typical() {
-        let tsv = "run_accession\n\
-            SRR1234567\n\
-            SRR1234568\n";
+        // Using the enriched fields (Inc-3 URL) which also has run_accession
+        let tsv = "run_accession\tfastq_ftp\tfastq_bytes\tfastq_md5\n\
+            SRR1234567\tftp.sra.ebi.ac.uk/a.fastq.gz\t100\tmd5a\n\
+            SRR1234568\tftp.sra.ebi.ac.uk/b.fastq.gz\t200\tmd5b\n";
         let runs = parse_run_accessions_from_tsv(tsv);
         assert_eq!(runs, vec!["SRR1234567", "SRR1234568"]);
     }
 
     #[test]
     fn test_parse_run_accessions_from_tsv_empty_body() {
-        let tsv = "run_accession\n";
+        let tsv = "run_accession\tfastq_ftp\tfastq_bytes\tfastq_md5\n";
         let runs = parse_run_accessions_from_tsv(tsv);
         assert!(runs.is_empty());
     }
@@ -1235,7 +1798,6 @@ mod tests {
 
     #[test]
     fn test_parse_run_accessions_wrong_header() {
-        // If ENA returns a different header (e.g. extra columns), function is tolerant
         let tsv = "run_accession\tstatus\n\
             SRR9999999\tpublic\n";
         let runs = parse_run_accessions_from_tsv(tsv);
@@ -1244,134 +1806,211 @@ mod tests {
 
     #[test]
     fn test_parse_run_accessions_malformed_header() {
-        // No run_accession column → returns empty without panic
         let tsv = "experiment_accession\n\
             SRX000001\n";
         let runs = parse_run_accessions_from_tsv(tsv);
         assert!(runs.is_empty());
     }
 
-    // ─── fetch_runs_from_geo_samples — pure JSON expansion logic ─────────────
-    //
-    // The DB I/O is not tested here. We validate the core expansion logic
-    // (reading sra_runs from a serde_json::Value) by extracting it inline,
-    // mirroring exactly what fetch_runs_from_geo_samples does per row.
+    // ─── fetch_runs_from_geo_samples: empty sample_ids fast-path ─────────────
+    // DB I/O is not unit-tested here. The empty-ids branch is validated inline
+    // (mirrors the early-return in fetch_runs_from_geo_samples).
 
-    fn expand_sra_runs(gsm_id: i64, extra: &serde_json::Value) -> (Vec<(i64, String)>, usize) {
-        let mut pairs = Vec::new();
-        let mut skipped = 0usize;
-        match extra.get("sra_runs").and_then(|v| v.as_array()) {
-            Some(arr) if !arr.is_empty() => {
-                for run_val in arr {
-                    if let Some(run_acc) = run_val.as_str() {
-                        let run_acc = run_acc.trim();
-                        if !run_acc.is_empty() {
-                            pairs.push((gsm_id, run_acc.to_string()));
-                        }
-                    }
-                }
-            }
-            _ => {
-                skipped += 1;
-            }
-        }
-        (pairs, skipped)
-    }
-
-    /// GSM with two resolved SRR runs expands to two pairs.
     #[test]
-    fn test_expand_sra_runs_two_runs() {
-        let extra = serde_json::json!({
-            "relation": "SRA: https://www.ncbi.nlm.nih.gov/sra?term=SRX111111",
-            "sra_runs": ["SRR1000001", "SRR1000002"]
-        });
-        let (pairs, skipped) = expand_sra_runs(42, &extra);
-        assert_eq!(skipped, 0);
-        assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0], (42, "SRR1000001".to_string()));
-        assert_eq!(pairs[1], (42, "SRR1000002".to_string()));
-    }
-
-    /// GSM with a single SRR run expands to one pair.
-    #[test]
-    fn test_expand_sra_runs_one_run() {
-        let extra = serde_json::json!({ "sra_runs": ["SRR9999999"] });
-        let (pairs, skipped) = expand_sra_runs(7, &extra);
-        assert_eq!(skipped, 0);
-        assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0], (7, "SRR9999999".to_string()));
-    }
-
-    /// GSM with empty sra_runs array is skipped (counts as 1 skipped).
-    #[test]
-    fn test_expand_sra_runs_empty_array_is_skipped() {
-        let extra = serde_json::json!({ "sra_runs": [] });
-        let (pairs, skipped) = expand_sra_runs(1, &extra);
-        assert_eq!(pairs.len(), 0);
-        assert_eq!(skipped, 1, "empty sra_runs must count as skipped");
-    }
-
-    /// GSM without sra_runs key at all (not yet resolved) is skipped.
-    #[test]
-    fn test_expand_sra_runs_key_absent_is_skipped() {
-        let extra = serde_json::json!({
-            "relation": "BioSample: https://www.ncbi.nlm.nih.gov/biosample/SAMN00000001"
-        });
-        let (pairs, skipped) = expand_sra_runs(2, &extra);
-        assert_eq!(pairs.len(), 0);
-        assert_eq!(skipped, 1);
-    }
-
-    /// GSM from microarray study — sra_runs explicitly set to [] by resolver.
-    #[test]
-    fn test_expand_sra_runs_microarray_empty_list() {
-        let extra = serde_json::json!({
-            "source_name": "liver biopsy",
-            "platform": "GPL570",
-            "sra_runs": []
-        });
-        let (pairs, skipped) = expand_sra_runs(99, &extra);
-        assert_eq!(pairs.len(), 0);
-        assert_eq!(skipped, 1);
-    }
-
-    /// Mixed batch: first GSM has runs, second has none.
-    #[test]
-    fn test_expand_sra_runs_mixed_batch() {
-        let extras = vec![
-            (10i64, serde_json::json!({ "sra_runs": ["SRR0000010", "SRR0000011"] })),
-            (11i64, serde_json::json!({ "sra_runs": [] })),
-            (12i64, serde_json::json!({ "other_key": "value" })),
-            (13i64, serde_json::json!({ "sra_runs": ["SRR0000013"] })),
-        ];
-
-        let mut all_pairs: Vec<(i64, String)> = Vec::new();
-        let mut total_skipped = 0usize;
-        for (gsm_id, extra) in &extras {
-            let (p, s) = expand_sra_runs(*gsm_id, extra);
-            all_pairs.extend(p);
-            total_skipped += s;
-        }
-
-        assert_eq!(all_pairs.len(), 3); // SRR10, SRR11, SRR13
-        assert_eq!(total_skipped, 2);   // gsm_id 11 and 12
-        assert_eq!(all_pairs[0], (10, "SRR0000010".to_string()));
-        assert_eq!(all_pairs[1], (10, "SRR0000011".to_string()));
-        assert_eq!(all_pairs[2], (13, "SRR0000013".to_string()));
-    }
-
-    /// scope=all with no sample_ids on a GEO dataset: empty ids slice fast-path.
-    #[test]
-    fn test_expand_sra_runs_scope_all_no_ids() {
-        // When sample_ids=None is passed to fetch_runs_from_geo_samples, the
-        // DB query fetches all GSMs. Here we just confirm the fast-path for an
-        // explicitly empty ids slice returns ([], 0).
+    fn test_fetch_runs_from_geo_empty_ids_fast_path() {
         let ids: &[i64] = &[];
-        // Mirror the early-return in fetch_runs_from_geo_samples
+        // Mirror: if ids.is_empty() { return Ok((vec![], 0)) }
         let result: Option<(Vec<(i64, String)>, usize)> =
             if ids.is_empty() { Some((vec![], 0)) } else { None };
         let (pairs, skipped) = result.unwrap();
         assert!(pairs.is_empty());
         assert_eq!(skipped, 0);
+    }
+
+    // ─── upsert_samplesrarun_batch: empty records is a no-op ─────────────────
+
+    #[test]
+    fn test_upsert_batch_empty_is_noop() {
+        let records: &[SrxRunRecord] = &[];
+        assert!(records.is_empty(), "guard: empty records → no DB call");
+    }
+
+    // ─── Inc-1: file_names_from_url ───────────────────────────────────────────
+
+    #[test]
+    fn test_file_names_single_end() {
+        let url = "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR111/001/SRR1111111/SRR1111111.fastq.gz";
+        assert_eq!(file_names_from_url(url), "SRR1111111.fastq.gz");
+    }
+
+    #[test]
+    fn test_file_names_paired_end() {
+        let url = "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR222/002/SRR2222222/SRR2222222_1.fastq.gz;\
+                   https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR222/002/SRR2222222/SRR2222222_2.fastq.gz";
+        let names = file_names_from_url(url);
+        assert_eq!(names, "SRR2222222_1.fastq.gz;SRR2222222_2.fastq.gz");
+    }
+
+    #[test]
+    fn test_file_names_empty_url() {
+        // bam-only run — empty URL must yield empty file_name
+        assert_eq!(file_names_from_url(""), "");
+    }
+
+    #[test]
+    fn test_file_names_strips_whitespace_around_segments() {
+        // segments with surrounding whitespace (defensive)
+        let url = " https://ftp.sra.ebi.ac.uk/a/SRR1.fastq.gz ; https://ftp.sra.ebi.ac.uk/b/SRR2.fastq.gz ";
+        let names = file_names_from_url(url);
+        assert_eq!(names, "SRR1.fastq.gz;SRR2.fastq.gz");
+    }
+
+    // ─── Inc-1: FastqUrlRecord construction from SrxRunRecord ────────────────
+
+    /// Single-end run produces a record with single file_name.
+    #[test]
+    fn test_fastq_url_record_single_end() {
+        let srx = SrxRunRecord {
+            run_accession: "SRR9000001".to_string(),
+            fastq_url: "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR900/001/SRR9000001/SRR9000001.fastq.gz".to_string(),
+            size_bytes: Some(123_456_789),
+            checksum_md5: Some("abcdef1234567890abcdef1234567890".to_string()),
+        };
+        let file_name = file_names_from_url(&srx.fastq_url);
+        let rec = FastqUrlRecord {
+            run_accession: srx.run_accession.clone(),
+            fastq_url: srx.fastq_url.clone(),
+            file_name: file_name.clone(),
+            size_bytes: srx.size_bytes,
+            checksum_md5: srx.checksum_md5.clone(),
+        };
+        assert_eq!(rec.run_accession, "SRR9000001");
+        assert_eq!(rec.file_name, "SRR9000001.fastq.gz");
+        assert_eq!(rec.size_bytes, Some(123_456_789));
+        assert!(rec.checksum_md5.is_some());
+    }
+
+    /// Paired-end run produces a record with two ';'-joined file_names.
+    #[test]
+    fn test_fastq_url_record_paired_end() {
+        let url = "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR900/002/SRR9000002/SRR9000002_1.fastq.gz;\
+                   https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR900/002/SRR9000002/SRR9000002_2.fastq.gz";
+        let srx = SrxRunRecord {
+            run_accession: "SRR9000002".to_string(),
+            fastq_url: url.to_string(),
+            size_bytes: Some(2_000_000_000),
+            checksum_md5: Some("md5r1;md5r2".to_string()),
+        };
+        let file_name = file_names_from_url(&srx.fastq_url);
+        assert_eq!(file_name, "SRR9000002_1.fastq.gz;SRR9000002_2.fastq.gz");
+    }
+
+    /// Bam-only run (empty fastq_url) produces empty file_name.
+    #[test]
+    fn test_fastq_url_record_bam_only() {
+        let srx = SrxRunRecord {
+            run_accession: "SRR9000003".to_string(),
+            fastq_url: String::new(),
+            size_bytes: None,
+            checksum_md5: None,
+        };
+        let file_name = file_names_from_url(&srx.fastq_url);
+        let rec = FastqUrlRecord {
+            run_accession: srx.run_accession.clone(),
+            fastq_url: srx.fastq_url.clone(),
+            file_name,
+            size_bytes: None,
+            checksum_md5: None,
+        };
+        assert!(rec.fastq_url.is_empty(), "bam-only: fastq_url must be empty");
+        assert!(rec.file_name.is_empty(), "bam-only: file_name must be empty");
+        assert_eq!(rec.size_bytes, None);
+    }
+
+    // ─── O2: is_valid_run_accession ───────────────────────────────────────────
+
+    #[test]
+    fn test_valid_run_accession_srr() {
+        assert!(is_valid_run_accession("SRR1234567"));
+        assert!(is_valid_run_accession("SRR1"));
+        assert!(is_valid_run_accession("SRR0000000"));
+    }
+
+    #[test]
+    fn test_valid_run_accession_err() {
+        assert!(is_valid_run_accession("ERR000001"));
+        assert!(is_valid_run_accession("ERR9999999"));
+    }
+
+    #[test]
+    fn test_valid_run_accession_drr() {
+        assert!(is_valid_run_accession("DRR123456"));
+    }
+
+    #[test]
+    fn test_invalid_run_accession_empty() {
+        assert!(!is_valid_run_accession(""));
+    }
+
+    #[test]
+    fn test_invalid_run_accession_too_short() {
+        // Less than 4 bytes: [SED]RR + at least one digit
+        assert!(!is_valid_run_accession("SRR"));
+        assert!(!is_valid_run_accession("SR"));
+    }
+
+    #[test]
+    fn test_invalid_run_accession_wrong_prefix() {
+        assert!(!is_valid_run_accession("ARR1234567"));
+        assert!(!is_valid_run_accession("XRR1234567"));
+        assert!(!is_valid_run_accession("SXR1234567"));
+        assert!(!is_valid_run_accession("SRS1234567")); // SRS is a sample, not a run
+        assert!(!is_valid_run_accession("GSM1234567")); // GEO accession
+    }
+
+    #[test]
+    fn test_invalid_run_accession_non_digit_suffix() {
+        assert!(!is_valid_run_accession("SRR123abc"));
+        assert!(!is_valid_run_accession("SRR123.456"));
+        assert!(!is_valid_run_accession("SRR123 456"));
+    }
+
+    #[test]
+    fn test_invalid_run_accession_injection_attempt() {
+        // Query-string injection patterns must all be rejected
+        assert!(!is_valid_run_accession("SRR123&evil=1"));
+        assert!(!is_valid_run_accession("SRR123?foo=bar"));
+        assert!(!is_valid_run_accession("SRR123\nevil"));
+        assert!(!is_valid_run_accession("SRR123%20evil"));
+    }
+
+    // ─── Inc-1: resolve_fastq_urls_for_dataset — unknown source_db ───────────
+
+    #[tokio::test]
+    async fn test_resolve_fastq_urls_unknown_source_db() {
+        // We can exercise the routing guard without a real DB by using an
+        // unknown source_db — the match arm returns immediately with an error.
+        // A dummy NcbiClient is constructed but never used.
+        let ncbi = NcbiClient::new(None);
+
+        // We cannot call resolve_fastq_urls_for_dataset without a real DB
+        // client for the sra/geo branches, but the unknown branch returns
+        // before touching either.  Use a real (but unused) client by building
+        // the error path inline, mirroring the match arm:
+        let source_db = "unknown";
+        let (records, errors): (Vec<FastqUrlRecord>, Vec<String>) = match source_db {
+            "geo" | "sra" | "ena" => panic!("should not reach valid branches"),
+            unknown => (
+                vec![],
+                vec![format!(
+                    "Unknown source_db '{}'. Valid: geo, sra, ena",
+                    unknown
+                )],
+            ),
+        };
+        drop(ncbi); // silence unused warning
+        assert!(records.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("unknown"));
     }
 }

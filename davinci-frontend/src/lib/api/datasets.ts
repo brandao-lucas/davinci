@@ -5,10 +5,14 @@ import type {
   DatasetFilters,
   DownloadDispatchRequest,
   DownloadDispatchResponse,
+  FastqUrlListResponse,
   PaginatedDatasetFileList,
   BulkCurateDatasetByFilterInput,
   BulkCurateResponse,
   SraResolutionResponse,
+  BatchDownloadRequest,
+  BatchDownloadResponse,
+  BatchFastqUrlListResponse,
 } from '@/lib/types/dataset';
 import type { PaginatedResponse } from '@/lib/types/api';
 
@@ -51,17 +55,20 @@ export const datasetsApi = {
     ),
 
   // POST /projects/{project_pk}/datasets/{id}/download/
-  // Dispara o download dos arquivos do dataset. Retorna 202 com o IngestionJob criado.
-  // Para SRA/GEO com sra_runs: aceita scope, sample_ids, confirm, file_kind.
-  //   - scope='all' (padrão): todas as runs do dataset.
-  //   - scope='included': só samples com curation_status='included'.
-  //   - scope='manual': exatamente os sample_ids informados.
-  //   - sem confirm (ou confirm=false): retorna 400 com DownloadQuotaPreview (prévia de quota).
-  //   - com confirm=true: enfileira o job (202).
-  //   - quota esgotada: 409 com DownloadQuotaPreview (confirm_required=false).
-  // destination: 'server' (padrão, único implementado no MVP); 'client' retorna 400 (Inc-1).
+  //
+  // destination='server' (padrão): enfileira job Celery → HTTP 202 (DownloadDispatchResponse)
+  //   ou HTTP 400/409 (DownloadQuotaPreview) quando falta confirm ou quota esgotada.
+  // destination='client' (Inc-1): resolve URLs públicas ENA e retorna lista síncrona → HTTP 200
+  //   (FastqUrlListResponse). Sem job, sem quota, sem DatasetFile.
+  //
+  // scope: 'all' | 'included' | 'manual' | 'filter' (Inc-2)
+  //   - 'manual': obriga sample_ids (ProjectSample.id).
+  //   - 'filter': obriga filters (SampleFilter com curation_status/organism/platform).
+  //
+  // O tipo de retorno usa union porque o status HTTP discrimina a resposta.
+  // O hook (useTriggerDatasetDownload) trata a discriminação pelo httpStatus da resposta.
   triggerDownload: (projectId: string, datasetId: number, body?: Partial<DownloadDispatchRequest>) =>
-    apiClient.post<DownloadDispatchResponse>(
+    apiClient.post<DownloadDispatchResponse | FastqUrlListResponse>(
       `/projects/${projectId}/datasets/${datasetId}/download/`,
       body ?? {},
     ),
@@ -69,7 +76,6 @@ export const datasetsApi = {
   // POST /projects/{project_pk}/datasets/{id}/resolve-sra/
   // Dispara resolução GEO→SRA: para cada GSM do dataset, lê extra_metadata['relation'],
   // extrai SRX e resolve SRX→SRR via ENA. Grava sra_runs nos GSMs. Retorna 202 com IngestionJob.
-  // Usado em datasets GEO antes de permitir download FASTQ.
   resolveSra: (projectId: string, datasetId: number) =>
     apiClient.post<SraResolutionResponse>(
       `/projects/${projectId}/datasets/${datasetId}/resolve-sra/`,
@@ -79,5 +85,19 @@ export const datasetsApi = {
   listFiles: (projectId: string, datasetId: number) =>
     apiClient.get<PaginatedDatasetFileList>(
       `/projects/${projectId}/datasets/${datasetId}/files/`,
+    ),
+
+  // POST /projects/{project_pk}/datasets/download-batch/ (Inc-5)
+  // Lote de downloads FASTQ para múltiplos datasets do projeto.
+  //
+  // destination='server': HTTP 202 (BatchDownloadResponse) ou 400/409 (BatchDownloadQuotaPreview).
+  // destination='client': HTTP 200 (BatchFastqUrlListResponse).
+  //
+  // dataset_ids: lista de OmicDataset.id; omitido = todos os datasets com amostras no scope.
+  // scope: 'included' (padrão) | 'all' — sem 'manual'/'filter' no batch.
+  downloadBatch: (projectId: string, body: Partial<BatchDownloadRequest>) =>
+    apiClient.post<BatchDownloadResponse | BatchFastqUrlListResponse>(
+      `/projects/${projectId}/datasets/download-batch/`,
+      body,
     ),
 };
