@@ -229,11 +229,12 @@ class DiseaseAxisQueueDatasetIsolationTests(APITestCase):
         """
         Fila de A contém apenas o pd_a — pd_b e pd_b_disc de B não aparecem.
         Verifica ausência por PK de ProjectDataset.
+        Resposta paginada: acessa via response.data['results'].
         """
         response = self.client_a.get(disease_axis_queue_url(self.project_a.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        pks = [item['id'] for item in response.data]
+        pks = [item['id'] for item in response.data['results']]
 
         self.assertIn(
             self.pd_a.pk, pks,
@@ -251,11 +252,12 @@ class DiseaseAxisQueueDatasetIsolationTests(APITestCase):
     def test_user_b_sees_only_own_datasets(self):
         """
         Fila de B contém pd_b e pd_b_disc — pd_a de A não aparece.
+        Resposta paginada: acessa via response.data['results'].
         """
         response = self.client_b.get(disease_axis_queue_url(self.project_b.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        pks = [item['id'] for item in response.data]
+        pks = [item['id'] for item in response.data['results']]
 
         self.assertNotIn(
             self.pd_a.pk, pks,
@@ -273,13 +275,14 @@ class DiseaseAxisQueueDatasetIsolationTests(APITestCase):
     def test_queue_count_matches_only_own_project(self):
         """
         Contagem da fila de A é exatamente 1 (apenas pd_a), sem contágio de B.
+        Verifica via envelope paginado: response.data['count'].
         """
         response = self.client_a.get(disease_axis_queue_url(self.project_a.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(
-            len(response.data),
+            response.data['count'],
             1,
-            f'Fila de A deve ter exatamente 1 item, obteve {len(response.data)}.',
+            f"Fila de A deve ter exatamente 1 item, obteve count={response.data['count']}.",
         )
 
 
@@ -301,19 +304,20 @@ class DiseaseAxisQueueContentPolicyTests(APITestCase):
         self.project = make_project(self.user, title='Policy Project')
 
     def test_mixed_appears_in_queue(self):
-        """disease_axis='mixed' → entra na fila."""
+        """disease_axis='mixed' → entra na fila. Resposta paginada: acessa via results."""
         ds = make_dataset('DAQ_POL_MIXED', disease_axis='mixed')
         pd = make_project_dataset(self.project, ds)
 
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        pks = [item['id'] for item in response.data]
+        pks = [item['id'] for item in response.data['results']]
         self.assertIn(pd.pk, pks, 'mixed deve aparecer na fila.')
 
     def test_discordance_appears_in_queue(self):
         """
         monogenic_gene_hit presente + disease_axis='multifactorial'
         → discordância → entra na fila.
+        Resposta paginada: acessa via results.
         """
         ds = make_dataset(
             'DAQ_POL_DISC',
@@ -324,13 +328,14 @@ class DiseaseAxisQueueContentPolicyTests(APITestCase):
 
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        pks = [item['id'] for item in response.data]
+        pks = [item['id'] for item in response.data['results']]
         self.assertIn(pd.pk, pks, 'Discordante (gene_hit + multifactorial) deve aparecer na fila.')
 
     def test_discordance_indeterminate_with_gene_hit_appears(self):
         """
         monogenic_gene_hit presente + disease_axis='indeterminate'
         → discordância (axis ∉ {monogenic, mixed}) → entra na fila.
+        Resposta paginada: acessa via results.
         """
         ds = make_dataset(
             'DAQ_POL_DISC_INDET',
@@ -341,7 +346,7 @@ class DiseaseAxisQueueContentPolicyTests(APITestCase):
 
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        pks = [item['id'] for item in response.data]
+        pks = [item['id'] for item in response.data['results']]
         self.assertIn(
             pd.pk, pks,
             'indeterminate COM gene_hit deve aparecer como discordante.',
@@ -350,6 +355,7 @@ class DiseaseAxisQueueContentPolicyTests(APITestCase):
     def test_indeterminate_pure_excluded_from_queue(self):
         """
         disease_axis='indeterminate' SEM monogenic_gene_hit → terminal → NÃO entra.
+        Resposta paginada: acessa via results.
         """
         ds = make_dataset(
             'DAQ_POL_INDET_PURE',
@@ -360,25 +366,27 @@ class DiseaseAxisQueueContentPolicyTests(APITestCase):
 
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        pks = [item['id'] for item in response.data]
+        pks = [item['id'] for item in response.data['results']]
         self.assertNotIn(pd.pk, pks, 'indeterminate puro NÃO deve aparecer na fila.')
 
     def test_monogenic_excluded_from_queue(self):
         """
         disease_axis='monogenic' → não é mixed, nem discordante → NÃO entra.
+        Resposta paginada: acessa via results.
         """
         ds = make_dataset('DAQ_POL_MONO', disease_axis='monogenic')
         pd = make_project_dataset(self.project, ds)
 
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        pks = [item['id'] for item in response.data]
+        pks = [item['id'] for item in response.data['results']]
         self.assertNotIn(pd.pk, pks, 'monogenic puro NÃO deve aparecer na fila.')
 
     def test_multifactorial_without_gene_hit_excluded(self):
         """
         disease_axis='multifactorial' sem monogenic_gene_hit → NÃO entra.
         Discordância exige gene_hit presente.
+        Resposta paginada: acessa via results.
         """
         ds = make_dataset(
             'DAQ_POL_MULTI_NOHIT',
@@ -389,7 +397,7 @@ class DiseaseAxisQueueContentPolicyTests(APITestCase):
 
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        pks = [item['id'] for item in response.data]
+        pks = [item['id'] for item in response.data['results']]
         self.assertNotIn(
             pd.pk, pks,
             'multifactorial sem gene_hit NÃO deve aparecer (não há discordância).',
@@ -399,6 +407,7 @@ class DiseaseAxisQueueContentPolicyTests(APITestCase):
         """
         disease_axis='mixed' com gene_hit → entra como 'mixed' (não 'discordance').
         Política: 'mixed' tem prioridade; 'discordance' exclui 'mixed' explicitamente.
+        Resposta paginada: acessa via results.
         """
         ds = make_dataset(
             'DAQ_POL_MIXED_WITH_HIT',
@@ -410,7 +419,7 @@ class DiseaseAxisQueueContentPolicyTests(APITestCase):
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        items_by_pk = {item['id']: item for item in response.data}
+        items_by_pk = {item['id']: item for item in response.data['results']}
         self.assertIn(pd.pk, items_by_pk, 'mixed com gene_hit deve aparecer na fila.')
         # Deve estar no grupo 'mixed', não 'discordance'
         self.assertEqual(
@@ -423,6 +432,7 @@ class DiseaseAxisQueueContentPolicyTests(APITestCase):
         """
         monogenic_gene_hit presente mas lista 'genes' vazia → sem discordância.
         _has_monogenic_gene_hit() exige genes=[...] não-vazia.
+        Resposta paginada: acessa via results.
         """
         ds = make_dataset(
             'DAQ_POL_EMPTY_GENES',
@@ -441,18 +451,23 @@ class DiseaseAxisQueueContentPolicyTests(APITestCase):
 
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        pks = [item['id'] for item in response.data]
+        pks = [item['id'] for item in response.data['results']]
         self.assertNotIn(
             pd.pk, pks,
             'gene_hit com genes=[] NÃO deve disparar discordância.',
         )
 
     def test_empty_project_returns_empty_list(self):
-        """Projeto sem datasets → fila vazia []."""
+        """
+        Projeto sem datasets → fila vazia.
+        Resposta paginada: count=0, results=[].
+        """
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertIsInstance(response.data, list)
-        self.assertEqual(len(response.data), 0)
+        self.assertIn('count', response.data, 'Resposta deve conter envelope paginado.')
+        self.assertEqual(response.data['count'], 0)
+        self.assertIsInstance(response.data['results'], list)
+        self.assertEqual(len(response.data['results']), 0)
 
 
 # =============================================================================
@@ -471,14 +486,14 @@ class DiseaseAxisQueueReasonTests(APITestCase):
         self.project = make_project(self.user, title='Reason Project')
 
     def test_queue_reason_mixed_for_disease_axis_mixed(self):
-        """disease_axis='mixed' → queue_reason='mixed'."""
+        """disease_axis='mixed' → queue_reason='mixed'. Acessa via results."""
         ds = make_dataset('DAQ_RSN_MIXED', disease_axis='mixed')
         pd = make_project_dataset(self.project, ds)
 
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        items = {item['id']: item for item in response.data}
+        items = {item['id']: item for item in response.data['results']}
         self.assertIn(pd.pk, items)
         self.assertEqual(
             items[pd.pk]['queue_reason'],
@@ -489,6 +504,7 @@ class DiseaseAxisQueueReasonTests(APITestCase):
     def test_queue_reason_discordance_for_gene_hit_with_multifactorial(self):
         """
         monogenic_gene_hit + disease_axis='multifactorial' → queue_reason='discordance'.
+        Acessa via results.
         """
         ds = make_dataset(
             'DAQ_RSN_DISC_MULTI',
@@ -500,7 +516,7 @@ class DiseaseAxisQueueReasonTests(APITestCase):
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        items = {item['id']: item for item in response.data}
+        items = {item['id']: item for item in response.data['results']}
         self.assertIn(pd.pk, items)
         self.assertEqual(
             items[pd.pk]['queue_reason'],
@@ -512,6 +528,7 @@ class DiseaseAxisQueueReasonTests(APITestCase):
         """
         monogenic_gene_hit + disease_axis='indeterminate' → queue_reason='discordance'.
         indeterminate ∉ {monogenic, mixed} — satisfaz a condição de discordância.
+        Acessa via results.
         """
         ds = make_dataset(
             'DAQ_RSN_DISC_INDET',
@@ -523,7 +540,7 @@ class DiseaseAxisQueueReasonTests(APITestCase):
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        items = {item['id']: item for item in response.data}
+        items = {item['id']: item for item in response.data['results']}
         self.assertIn(pd.pk, items)
         self.assertEqual(
             items[pd.pk]['queue_reason'],
@@ -534,6 +551,7 @@ class DiseaseAxisQueueReasonTests(APITestCase):
     def test_both_groups_present_with_correct_reasons(self):
         """
         Projeto com mixed e discordante → ambos aparecem com queue_reason correto.
+        Verifica count=2 via envelope paginado.
         """
         ds_mixed = make_dataset('DAQ_RSN_BOTH_MIX', disease_axis='mixed')
         pd_mixed = make_project_dataset(self.project, ds_mixed)
@@ -547,9 +565,9 @@ class DiseaseAxisQueueReasonTests(APITestCase):
 
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 2)
+        self.assertEqual(response.data['count'], 2)
 
-        items = {item['id']: item for item in response.data}
+        items = {item['id']: item for item in response.data['results']}
 
         self.assertEqual(items[pd_mixed.pk]['queue_reason'], 'mixed')
         self.assertEqual(items[pd_disc.pk]['queue_reason'], 'discordance')
@@ -632,16 +650,21 @@ class DiseaseAxisQueueSerializerFieldTests(APITestCase):
         )
         self.pd = make_project_dataset(self.project, self.ds, notes='nota do curador')
 
+    def _first_result(self, response):
+        """Helper: retorna o primeiro item de response.data['results']."""
+        return response.data['results'][0]
+
     def test_extra_metadata_not_exposed(self):
         """
         extra_metadata inteiro NÃO deve aparecer na resposta.
         Reduz superfície de dado potencialmente sensível.
+        Resposta paginada: acessa via results.
         """
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data['count'], 1)
 
-        item = response.data[0]
+        item = self._first_result(response)
         self.assertNotIn(
             'extra_metadata',
             item,
@@ -652,11 +675,12 @@ class DiseaseAxisQueueSerializerFieldTests(APITestCase):
         """
         contract_confidence inteiro NÃO deve aparecer na resposta.
         Apenas disease_axis_confidence (sub-chave) é exposta.
+        Resposta paginada: acessa via results.
         """
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        item = response.data[0]
+        item = self._first_result(response)
         self.assertNotIn(
             'contract_confidence',
             item,
@@ -667,11 +691,12 @@ class DiseaseAxisQueueSerializerFieldTests(APITestCase):
         """
         disease_axis_confidence expõe apenas contract_confidence['disease_axis'].
         NÃO expõe has_control_group nem outras chaves do contract_confidence.
+        Resposta paginada: acessa via results.
         """
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        item = response.data[0]
+        item = self._first_result(response)
         self.assertIn(
             'disease_axis_confidence',
             item,
@@ -701,11 +726,12 @@ class DiseaseAxisQueueSerializerFieldTests(APITestCase):
         """
         monogenic_gene_hit expõe apenas extra_metadata['contract']['monogenic_gene_hit'].
         NÃO expõe disease_raw nem outras chaves do contract.
+        Resposta paginada: acessa via results.
         """
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        item = response.data[0]
+        item = self._first_result(response)
         self.assertIn(
             'monogenic_gene_hit',
             item,
@@ -736,11 +762,12 @@ class DiseaseAxisQueueSerializerFieldTests(APITestCase):
         """
         Os campos da resposta correspondem EXATAMENTE a EXPECTED_FIELDS.
         Sem campos extras não documentados.
+        Resposta paginada: acessa o primeiro item de results.
         """
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        item = response.data[0]
+        item = self._first_result(response)
         actual_fields = set(item.keys())
 
         unexpected = actual_fields - self.EXPECTED_FIELDS
@@ -759,6 +786,7 @@ class DiseaseAxisQueueSerializerFieldTests(APITestCase):
     def test_monogenic_gene_hit_is_none_when_absent(self):
         """
         Dataset sem monogenic_gene_hit em extra_metadata → campo é None na resposta.
+        Resposta paginada: acessa via results.
         """
         ds_no_hit = make_dataset(
             'DAQ_SER_NO_HIT',
@@ -771,7 +799,7 @@ class DiseaseAxisQueueSerializerFieldTests(APITestCase):
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        items = {item['id']: item for item in response.data}
+        items = {item['id']: item for item in response.data['results']}
         self.assertIn(pd_no_hit.pk, items)
         self.assertIsNone(
             items[pd_no_hit.pk]['monogenic_gene_hit'],
@@ -781,6 +809,7 @@ class DiseaseAxisQueueSerializerFieldTests(APITestCase):
     def test_disease_axis_confidence_is_none_when_absent(self):
         """
         Dataset sem disease_axis no contract_confidence → disease_axis_confidence=None.
+        Resposta paginada: acessa via results.
         """
         ds_no_conf = make_dataset(
             'DAQ_SER_NO_CONF',
@@ -793,7 +822,7 @@ class DiseaseAxisQueueSerializerFieldTests(APITestCase):
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        items = {item['id']: item for item in response.data}
+        items = {item['id']: item for item in response.data['results']}
         self.assertIn(pd_no_conf.pk, items)
         self.assertIsNone(
             items[pd_no_conf.pk]['disease_axis_confidence'],
@@ -804,11 +833,12 @@ class DiseaseAxisQueueSerializerFieldTests(APITestCase):
         """
         notes, curation_status, added_at, curated_at estão presentes na resposta.
         Campos de auditoria de curadoria (skill curation-audit-trail).
+        Resposta paginada: acessa via results.
         """
         response = self.client.get(disease_axis_queue_url(self.project.id))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        item = response.data[0]
+        item = self._first_result(response)
         self.assertIn('notes', item)
         self.assertIn('curation_status', item)
         self.assertIn('added_at', item)
