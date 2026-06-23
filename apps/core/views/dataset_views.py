@@ -16,6 +16,7 @@ from apps.core.models import (
     OmicDataset,
     OmicSample,
     ProjectDataset,
+    ProjectSample,
 )
 
 
@@ -133,6 +134,7 @@ from apps.core.serializers.download import (
     DownloadDispatchRequestSerializer,
     DownloadDispatchResponseSerializer,
     DownloadQuotaPreviewSerializer,
+    SraResolutionResponseSerializer,
 )
 from apps.core.serializers.link import AddDatasetToProjectRequestSerializer
 from apps.core.tasks.ingestion_tasks import run_sample_ingestion
@@ -218,6 +220,7 @@ class ProjectDatasetViewSet(
         )
 
     def get_queryset(self):
+        from django.db.models import Exists, OuterRef
         project = self._get_project()
         qs = ProjectDataset.objects.filter(project=project).select_related('dataset')
 
@@ -227,6 +230,17 @@ class ProjectDatasetViewSet(
             qs = qs.prefetch_related(
                 'projectpaperdataset_set__project_paper__paper',
             )
+
+        # Anota sra_resolved: True quando ao menos um OmicSample do dataset tem
+        # extra_metadata com a chave 'sra_runs' (MVP-B — ligação GEO→SRA resolvida).
+        # Subquery Exists evita N+1 na listagem; o serializer lê a anotação diretamente.
+        sra_resolved_subquery = Exists(
+            OmicSample.objects.filter(
+                dataset_id=OuterRef('dataset_id'),
+                extra_metadata__has_key='sra_runs',
+            )
+        )
+        qs = qs.annotate(sra_resolved=sra_resolved_subquery)
 
         qs = apply_dataset_filters(qs, self.request.query_params)
 
@@ -362,15 +376,22 @@ class ProjectDatasetViewSet(
             "**Derivação de file_kind por source_db:**\n"
             "- `source_db='geo'` → `file_kind='geo_supplementary'` (padrão F1, MB).\n"
             "  Body pode ser vazio ou omitir `file_kind`.\n"
-            "- `source_db='sra'` → `file_kind='fastq'` (F2, GB–TB). Exige "
-            "  `confirm=true` no body; sem confirm retorna HTTP 400 com prévia de quota.\n\n"
+            "- `source_db='sra'` ou `source_db='geo'` com `sra_runs` resolvidos → "
+            "  `file_kind='fastq'` (F2, GB–TB). Exige `confirm=true`.\n\n"
+            "**Seleção de amostras (MVP-A):**\n"
+            "- `scope='all'` (padrão): todas as runs do dataset.\n"
+            "- `scope='included'`: só amostras com `curation_status='included'` no projeto.\n"
+            "- `scope='manual'`: exatamente os `sample_ids` fornecidos (validados contra "
+            "  o projeto do usuário — ids de outro projeto → 403/404).\n\n"
+            "**GEO → FASTQ (MVP-B):** requer resolução SRA prévia via "
+            "`POST .../resolve-sra/`. Sem resolução retorna HTTP 400 orientativo.\n\n"
             "**Quota (apenas FASTQ):**\n"
             "- Soma `DatasetFile.size_bytes` já baixados (`status='downloaded'`) do "
             "  projeto e compara com `DOWNLOAD_QUOTA_BYTES` (padrão: 200 GB).\n"
             "- Se excedida: HTTP 409 com `used_bytes` / `quota_bytes`.\n"
-            "- Se `confirm=false`/ausente: HTTP 400 com prévia de quota (mesmo payload).\n\n"
+            "- Se `confirm=false`/ausente: HTTP 400 com prévia de quota.\n\n"
             "**GEO supplementary (F1):** sem gate de confirm ou quota — fluxo simples.\n\n"
-            "Idempotente: job ativo para o mesmo dataset retorna o existente (202).\n"
+            "Idempotente: job ativo para o mesmo dataset+scope+sample_ids retorna o existente (202).\n"
             "Progresso monitorável via GET /projects/{project_pk}/jobs/ com filtro "
             "?job_type=geo_supplementary_download ou ?job_type=fastq_download."
         ),
@@ -380,11 +401,21 @@ class ProjectDatasetViewSet(
         """
         POST /projects/{project_pk}/datasets/{pk}/download/
 
-        Body (opcional para GEO; obrigatório para SRA):
+        Body:
           {
-            "file_kind": "fastq",   // opcional — derivado de source_db se omitido
-            "confirm": true         // obrigatório para FASTQ (arquivo GB–TB)
+            "file_kind": "fastq",       // opcional — derivado de source_db se omitido
+            "confirm": true,            // obrigatório para FASTQ (arquivo GB–TB)
+            "scope": "included",        // "all" (default) | "included" | "manual"
+            "sample_ids": [12, 34],     // obrigatório se scope="manual"
+            "destination": "server"     // apenas "server" neste MVP
           }
+
+        Resolve scope→lista de OmicSample.id:
+          - "all"      → None (Rust usa WHERE dataset_id)
+          - "included" → ids de OmicSample cujas ProjectSample têm status='included'
+                         no projeto do usuário (firebase-auth-guard / Regra #3)
+          - "manual"   → sample_ids validados contra ProjectSample do projeto;
+                         id de outro projeto → 403/404
 
         Seta ProjectDataset.curation_status='queued' e despacha
         DownloadService.dispatch para enfileirar o job Celery.
@@ -392,6 +423,8 @@ class ProjectDatasetViewSet(
 
         Erros:
           HTTP 400 — FASTQ sem confirm=true (retorna prévia de quota)
+          HTTP 400 — GEO FASTQ sem sra_runs resolvidos
+          HTTP 400 — destination='client' (Inc-1, não implementado)
           HTTP 409 — quota de download excedida
           HTTP 404 — projeto ou dataset não pertence ao usuário
         """
@@ -406,13 +439,14 @@ class ProjectDatasetViewSet(
         dataset = project_dataset.dataset
 
         # ── Derivação de file_kind por source_db ──────────────────────────────
-        # O body pode sobrescrever, mas o comportamento padrão é derivado da fonte.
         # GEO → geo_supplementary (F1, sem quota/confirm)
-        # SRA → fastq (F2, exige confirm + quota)
-        # Outras fontes sem suporte ainda retornam 400 explícito.
+        # SRA/ENA → fastq (F2, exige confirm + quota)
+        # GEO com sra_runs resolvidos → fastq (MVP-B, exige confirm + quota)
+        # Outras fontes retornam 400 explícito.
         _SOURCE_FILE_KIND = {
             'geo': 'geo_supplementary',
             'sra': 'fastq',
+            'ena': 'fastq',
         }
 
         body_serializer = DownloadDispatchRequestSerializer(data=request.data)
@@ -421,24 +455,119 @@ class ProjectDatasetViewSet(
 
         file_kind = body_data.get('file_kind') or _SOURCE_FILE_KIND.get(dataset.source_db)
         confirm = body_data.get('confirm', False)
+        scope = body_data.get('scope', 'all')
+        requested_sample_ids = body_data.get('sample_ids')  # None ou lista de int
 
         if file_kind is None:
             return Response(
                 {
                     'detail': (
                         f"Download não suportado para source_db={dataset.source_db!r}. "
-                        "Fontes suportadas: 'geo' (geo_supplementary), 'sra' (fastq)."
+                        "Fontes suportadas: 'geo' (geo_supplementary), 'sra'/'ena' (fastq)."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Valida consistência: file_kind='fastq' só faz sentido para SRA
-        if file_kind == 'fastq' and dataset.source_db not in ('sra', 'ena'):
-            return Response(
-                {'detail': "file_kind='fastq' é válido apenas para source_db='sra'."},
-                status=status.HTTP_400_BAD_REQUEST,
+        # ── Validação de file_kind='fastq' para dataset GEO (MVP-B) ──────────
+        # GEO nativo sem sra_runs → 400 orientativo.
+        # GEO com sra_runs resolvidos → permitido (caminho MVP-B).
+        # SRA/ENA → sempre permitido.
+        if file_kind == 'fastq':
+            if dataset.source_db == 'geo':
+                has_resolved_runs = OmicSample.objects.filter(
+                    dataset=dataset,
+                ).exclude(
+                    extra_metadata__sra_runs=[]
+                ).filter(
+                    extra_metadata__has_key='sra_runs'
+                ).exists()
+                if not has_resolved_runs:
+                    return Response(
+                        {
+                            'detail': (
+                                "Dataset GEO não possui runs SRA resolvidos. "
+                                "Execute a resolução SRA antes de solicitar download FASTQ: "
+                                f"POST /projects/{project_pk}/datasets/{pk}/resolve-sra/"
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            elif dataset.source_db not in ('sra', 'ena'):
+                return Response(
+                    {
+                        'detail': (
+                            f"file_kind='fastq' não é suportado para source_db={dataset.source_db!r}. "
+                            "Suportados: 'sra', 'ena', e 'geo' com runs SRA resolvidos."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # ── Resolução de scope → sample_ids (firebase-auth-guard / Regra #3) ──
+        # Toda resolução é feita contra ProjectSample do projeto do usuário autenticado.
+        # NUNCA resolve ids fora do projeto — queryset sempre filtrado por project.
+        resolved_sample_ids: list[int] | None = None
+
+        if scope == 'all':
+            # None → Rust usa WHERE dataset_id (comportamento original)
+            resolved_sample_ids = None
+
+        elif scope == 'included':
+            # Ids dos OmicSample cujas ProjectSample têm curation_status='included'
+            # no projeto do usuário autenticado (Regra #3 — sem cross-project).
+            resolved_sample_ids = list(
+                ProjectSample.objects.filter(
+                    project=project,
+                    sample__dataset=dataset,
+                    curation_status=ProjectSample.CurationStatus.INCLUDED,
+                ).values_list('sample_id', flat=True)
             )
+            if not resolved_sample_ids:
+                return Response(
+                    {
+                        'detail': (
+                            "Nenhuma amostra com curation_status='included' encontrada "
+                            "no projeto para este dataset. Cure as amostras antes de usar scope='included'."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        elif scope == 'manual':
+            # sample_ids são ProjectSample.id (padrão da API — igual a bulk_curate de samples).
+            # Valida pertencimento ao projeto/dataset e resolve para OmicSample.id internamente,
+            # pois o Rust e o scope='included' operam com OmicSample.id.
+            # Id de outro projeto → 404 (não vaza existência de ids alheios — Regra #3).
+            if not requested_sample_ids:
+                # O serializer já valida isso, mas defesa em profundidade.
+                return Response(
+                    {'detail': "sample_ids é obrigatório quando scope='manual'."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Filtra por ProjectSample.id (pk) do projeto+dataset do user autenticado.
+            # values_list('sample_id') resolve diretamente para OmicSample.id.
+            matched = ProjectSample.objects.filter(
+                project=project,
+                sample__dataset=dataset,
+                id__in=requested_sample_ids,
+            ).values_list('id', 'sample_id')
+
+            matched_project_ids = {ps_id for ps_id, _ in matched}
+            invalid = [sid for sid in requested_sample_ids if sid not in matched_project_ids]
+            if invalid:
+                return Response(
+                    {
+                        'detail': (
+                            f"sample_ids {invalid} não pertencem ao projeto ou ao dataset. "
+                            "Verifique os ids e tente novamente."
+                        )
+                    },
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            # OmicSample.id para repassar ao Rust (consistente com scope='included')
+            resolved_sample_ids = sorted({omic_id for _, omic_id in matched})
 
         # Seta status agregado do ProjectDataset como 'queued'
         # (curation-audit-trail: não toca curated_at/exclusion_reason/notes)
@@ -453,6 +582,8 @@ class ProjectDatasetViewSet(
                 file_kind=file_kind,
                 user=request.user,
                 confirm=confirm,
+                scope=scope,
+                sample_ids=resolved_sample_ids,
             )
         except FastqConfirmRequiredError as exc:
             # Retorna HTTP 400 com prévia de uso — cliente reenvia com confirm=true
@@ -482,6 +613,65 @@ class ProjectDatasetViewSet(
             return Response(preview_serializer.data, status=status.HTTP_409_CONFLICT)
 
         serializer = DownloadDispatchResponseSerializer(job)
+        return Response(serializer.data, status=status.HTTP_202_ACCEPTED)
+
+    @extend_schema(
+        request=None,
+        responses={
+            202: SraResolutionResponseSerializer,
+            400: None,
+            404: None,
+        },
+        summary="Disparar resolução GSM→SRR para dataset GEO",
+        description=(
+            "Enfileira a resolução SRA para um dataset GEO (MVP-B).\n\n"
+            "O Rust lê `OmicSample.extra_metadata['relation']` de cada GSM, "
+            "extrai o SRX correspondente, resolve SRX→SRR via ENA filereport API "
+            "e grava os runs em `extra_metadata['sra_runs']` de cada GSM — "
+            "sem migration nova (usa JSONField existente, D1 aprovado).\n\n"
+            "Após a resolução, o download FASTQ via `POST .../download/` passa a "
+            "ser disponível para o dataset GEO.\n\n"
+            "Apenas datasets com `source_db='geo'` são aceitos; outros retornam HTTP 400.\n\n"
+            "Idempotente: job ativo para o mesmo dataset retorna o existente (202).\n"
+            "Progresso monitorável via GET /projects/{project_pk}/jobs/{id}/."
+        ),
+    )
+    @action(detail=True, methods=['post'], url_path='resolve-sra')
+    def resolve_sra(self, request, project_pk=None, pk=None):
+        """
+        POST /projects/{project_pk}/datasets/{pk}/resolve-sra/
+
+        Dispara resolução GSM→SRR para o dataset GEO.
+        Retorna HTTP 202 com o IngestionJob criado/ativo.
+
+        Erros:
+          HTTP 400 — dataset não é GEO (source_db != 'geo')
+          HTTP 404 — projeto ou dataset não pertence ao usuário
+        """
+        from apps.core.services.download_service import SraResolutionService
+
+        project = self._get_project()  # 404 se projeto não pertence ao user
+        project_dataset = get_object_or_404(ProjectDataset, pk=pk, project=project)
+        dataset = project_dataset.dataset
+
+        if dataset.source_db != 'geo':
+            return Response(
+                {
+                    'detail': (
+                        f"Resolução SRA é válida apenas para source_db='geo'. "
+                        f"Este dataset tem source_db={dataset.source_db!r}."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        job = SraResolutionService.dispatch_resolution(
+            project=project,
+            dataset=dataset,
+            user=request.user,
+        )
+
+        serializer = SraResolutionResponseSerializer(job)
         return Response(serializer.data, status=status.HTTP_202_ACCEPTED)
 
     @extend_schema(

@@ -839,7 +839,7 @@ impl DownloadResult {
 /// Raises `PyRuntimeError` only on fatal errors (DB connection, COPY failure).
 /// Per-file errors (network, parse) are non-fatal and appear in `errors`.
 #[pyfunction]
-#[pyo3(signature = (job_id, dataset_id, dataset_accession, source_db, file_kind, dest_dir, db_url, ncbi_api_key=None))]
+#[pyo3(signature = (job_id, dataset_id, dataset_accession, source_db, file_kind, dest_dir, db_url, ncbi_api_key=None, sample_ids=None))]
 fn download_dataset_files(
     job_id: String,
     dataset_id: i64,
@@ -849,6 +849,7 @@ fn download_dataset_files(
     dest_dir: String,
     db_url: String,
     ncbi_api_key: Option<String>,
+    sample_ids: Option<Vec<i64>>,
 ) -> PyResult<DownloadResult> {
     let rt = Runtime::new().unwrap();
 
@@ -908,9 +909,110 @@ fn download_dataset_files(
                         // Also record failed files so Django knows they exist
                         // (errors list already carries the messages above)
                     }
+
+                    // GEO→FASTQ via ENA: expand GSM sra_runs → SRR pairs then
+                    // use the same download pipeline as the native SRA branch.
+                    "fastq" => {
+                        // 1. Expand GSM samples → (gsm_id, srr_accession) pairs
+                        //    using extra_metadata['sra_runs'] written by resolve_sra_runs_for_dataset.
+                        let (srr_pairs, skipped) =
+                            match crate::omics::downloader::fetch_runs_from_geo_samples(
+                                &db_client,
+                                dataset_id,
+                                sample_ids.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let msg =
+                                        format!("fetch_runs_from_geo_samples failed: {}", e);
+                                    crate::db::job_tracker::update_job_status(
+                                        &db_client,
+                                        &job_id,
+                                        "failed",
+                                        0,
+                                        0,
+                                        0,
+                                        Some(&msg),
+                                    )
+                                    .await?;
+                                    return Err(msg);
+                                }
+                            };
+
+                        if skipped > 0 {
+                            eprintln!(
+                                "[download] dataset_id={} (GEO): {} GSM sample(s) skipped \
+                                 (no sra_runs resolved — run resolve_sra_runs_for_dataset first \
+                                 or sample is microarray-only)",
+                                dataset_id, skipped
+                            );
+                        }
+
+                        eprintln!(
+                            "[download] dataset_id={} (GEO→ENA): {} SRR run(s) to download",
+                            dataset_id,
+                            srr_pairs.len()
+                        );
+
+                        if srr_pairs.is_empty() {
+                            errors.push(format!(
+                                "No resolved SRR runs found for GEO dataset_id={} \
+                                 (accession={}). Run resolve_sra_runs_for_dataset before \
+                                 downloading FASTQ, or dataset may be microarray-only.",
+                                dataset_id, dataset_accession
+                            ));
+                        } else {
+                            // 2. Download via ENA — identical pipeline to the SRA branch
+                            let (fastq_results, download_errors) =
+                                crate::omics::downloader::download_fastq_for_samples(
+                                    &ncbi,
+                                    &srr_pairs,
+                                    dest_path,
+                                )
+                                .await;
+
+                            errors.extend(download_errors);
+
+                            // 3. Build DB rows — sample_id = gsm_id, dataset_id = NULL (XOR)
+                            for fr in &fastq_results {
+                                let md5_ok =
+                                    fr.entry.expected_md5.as_ref().map_or(true, |expected| {
+                                        expected.is_empty() || *expected == fr.checksum_md5
+                                    });
+                                let dl_status = if md5_ok { "downloaded" } else { "failed" };
+                                let err_msg = if md5_ok {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        "MD5 mismatch: expected {:?}, got {}",
+                                        fr.entry.expected_md5, fr.checksum_md5
+                                    )
+                                };
+
+                                db_rows.push(crate::db::copy_writer::DatasetFileRow {
+                                    accession: fr.entry.accession_key.clone(),
+                                    file_type: "fastq".to_string(),
+                                    source: "ena_ftp".to_string(),
+                                    remote_url: fr.entry.url.clone(),
+                                    storage_key: fr.local_path.clone(),
+                                    size_bytes: Some(fr.size_bytes as i64),
+                                    checksum_md5: Some(fr.checksum_md5.clone()),
+                                    download_status: dl_status.to_string(),
+                                    bytes_downloaded: fr.size_bytes as i64,
+                                    error_message: err_msg,
+                                    dataset_id: None, // XOR: FASTQ belongs to sample (GSM)
+                                    sample_id: Some(fr.sample_id),
+                                });
+                            }
+                        }
+                    }
+
                     unknown => {
                         errors.push(format!(
-                            "Unknown file_kind '{}' for source 'geo'. Expected: geo_supplementary",
+                            "Unknown file_kind '{}' for source 'geo'. \
+                             Expected: geo_supplementary, fastq",
                             unknown
                         ));
                     }
@@ -921,9 +1023,11 @@ fn download_dataset_files(
                 match file_kind.as_str() {
                     "fastq" => {
                         // 1. Resolve SRR samples for this dataset from the DB
+                        //    sample_ids=Some(vec) → subset; None → all SRR samples
                         let srr_samples = match crate::omics::downloader::fetch_srr_samples_for_dataset(
                             &db_client,
                             dataset_id,
+                            sample_ids.as_deref(),
                         )
                         .await
                         {
@@ -1064,6 +1168,100 @@ fn download_dataset_files(
     }
 }
 
+// ─── GEO → SRA run resolution (MVP-B) ────────────────────────────────────────
+
+/// Result returned by `resolve_sra_runs_for_dataset`.
+#[pyclass]
+#[derive(Clone)]
+pub struct SraResolutionResult {
+    /// Number of GSM samples whose `extra_metadata['sra_runs']` was written.
+    #[pyo3(get)]
+    pub samples_updated: u64,
+    /// Non-fatal error messages (rate-limit, missing SRX, etc.).
+    #[pyo3(get)]
+    pub errors: Vec<String>,
+}
+
+#[pymethods]
+impl SraResolutionResult {
+    #[new]
+    fn new() -> Self {
+        SraResolutionResult {
+            samples_updated: 0,
+            errors: Vec::new(),
+        }
+    }
+}
+
+/// Resolve GSM → SRR run accessions for all GEO samples in `dataset_id`.
+///
+/// For each sample with accession `GSM*`:
+/// 1. Read `extra_metadata['relation']` (captured by the GEO SOFT parser).
+/// 2. Extract `SRX*` / `ERX*` / `DRX*` accessions.
+/// 3. Query the ENA Portal filereport API: `SRX → [SRR, ...]`.
+/// 4. UPDATE `core_omicsample.extra_metadata['sra_runs']` with the resolved list.
+///
+/// Tolerant of missing `relation`, microarray GSMs, and SRX with no ENA FASTQ.
+/// Respects ENA rate limits via `NcbiClient` backoff (429 handling).
+///
+/// **Security:** `ncbi_api_key` is used only in HTTP headers — never logged.
+///
+/// # Returns
+///
+/// `SraResolutionResult { samples_updated, errors }`.
+/// Raises `PyRuntimeError` only on fatal errors (DB connection failure).
+/// Per-sample errors are non-fatal and appear in `errors`.
+#[pyfunction]
+#[pyo3(signature = (dataset_id, db_url, ncbi_api_key=None))]
+fn resolve_sra_runs_for_dataset(
+    dataset_id: i64,
+    db_url: String,
+    ncbi_api_key: Option<String>,
+) -> PyResult<SraResolutionResult> {
+    let rt = Runtime::new().unwrap();
+
+    let result: Result<SraResolutionResult, String> = rt.block_on(async {
+        let db_client = match crate::db::connection::connect_db(&db_url).await {
+            Ok(c) => c,
+            Err(e) => return Err(format!("DB connection failed: {e}")),
+        };
+
+        // ncbi_api_key is intentionally NOT logged anywhere in this function
+        let ncbi = crate::ncbi::client::NcbiClient::new(ncbi_api_key);
+
+        let (samples_updated, errors) =
+            crate::omics::downloader::resolve_sra_runs_for_geo_samples(
+                &ncbi,
+                &db_client,
+                dataset_id,
+            )
+            .await;
+
+        Ok(SraResolutionResult {
+            samples_updated,
+            errors,
+        })
+    });
+
+    match result {
+        Ok(res) => Ok(res),
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
+// ─── NER bindings ─────────────────────────────────────────────────────────────
+
+/// Extrai genes mencionados em `text` usando o dicionário HGNC canônico.
+///
+/// Retorna lista de tuplas `(gene_symbol, mention_count)` em ordem
+/// decrescente de frequência. Função puramente síncrona, sem I/O.
+#[pyfunction]
+fn extract_genes(text: &str) -> Vec<(String, i32)> {
+    let mut results = crate::categorization::gene_ner::extract_genes(text);
+    results.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    results
+}
+
 // ─── Python module registration ───────────────────────────────────────────────
 
 #[pymodule]
@@ -1072,6 +1270,7 @@ fn rust_engine(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<OmicsResult>()?;
     m.add_class::<SampleIngestionResult>()?;
     m.add_class::<DownloadResult>()?;
+    m.add_class::<SraResolutionResult>()?;
     // MeSH / preview types and functions
     m.add_class::<MagnitudePreview>()?;
     m.add_class::<MeshSuggestion>()?;
@@ -1081,7 +1280,9 @@ fn rust_engine(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resolve_pending_links, m)?)?;
     m.add_function(wrap_pyfunction!(ingest_samples_for_dataset, m)?)?;
     m.add_function(wrap_pyfunction!(download_dataset_files, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_sra_runs_for_dataset, m)?)?;
     m.add_function(wrap_pyfunction!(pubmed_magnitude_preview, m)?)?;
     m.add_function(wrap_pyfunction!(mesh_suggest, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_genes, m)?)?;
     Ok(())
 }

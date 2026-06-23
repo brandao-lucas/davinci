@@ -1788,6 +1788,7 @@ class IngestionJob(models.Model):
         CONTEXT_EXTRACTION = 'context_extraction', 'Extração de Contextos'
         GEO_SUPPLEMENTARY_DOWNLOAD = 'geo_supplementary_download', 'Download Suplementar GEO'
         FASTQ_DOWNLOAD = 'fastq_download', 'Download FASTQ'
+        SRA_RESOLUTION = 'sra_resolution', 'Resolução GSM→SRR (GEO→SRA)'
 
     class JobStatus(models.TextChoices):
         PENDING = 'pending', 'Pendente'

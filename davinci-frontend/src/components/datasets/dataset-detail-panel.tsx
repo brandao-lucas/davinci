@@ -262,6 +262,7 @@ export function DatasetDetailPanel({ dataset, projectId, onClose }: DatasetDetai
             projectId={projectId}
             datasetId={dataset.id}
             sourceDb={dataset.source_db}
+            sraResolved={dataset.sra_resolved}
           />
         </div>
       </SheetContent>

@@ -268,6 +268,46 @@ export interface paths {
         patch: operations["projects_categories_partial_update"];
         trace?: never;
     };
+    "/api/v1/projects/{project_pk}/curation-queue/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Listar fila de curadoria manual
+         * @description Lista datasets do projeto com has_control_group classificado-indeterminado (score < 0.5 pelo classificador automático). Apenas datasets do projeto do usuário autenticado são expostos (sem vazamento cross-user). Retorna lista vazia se não houver itens pendentes de revisão.
+         */
+        get: operations["projects_curation_queue_list"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_pk}/curation-queue/{id}/resolve/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resolver item da fila de curadoria manualmente
+         * @description Curador define has_control_group como "yes" ou "no" manualmente. Preserva auditoria: grava curated_at e notes no ProjectDataset; marca origem manual em contract_confidence do OmicDataset (score=1.0, is_manual=True). Nunca deleta. HTTP 403 se o ProjectDataset não pertencer ao projeto do usuário.
+         */
+        post: operations["projects_curation_queue_resolve_create"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/projects/{project_pk}/datasets/": {
         parameters: {
             query?: never;
@@ -374,16 +414,23 @@ export interface paths {
          *     **Derivação de file_kind por source_db:**
          *     - `source_db='geo'` → `file_kind='geo_supplementary'` (padrão F1, MB).
          *       Body pode ser vazio ou omitir `file_kind`.
-         *     - `source_db='sra'` → `file_kind='fastq'` (F2, GB–TB). Exige   `confirm=true` no body; sem confirm retorna HTTP 400 com prévia de quota.
+         *     - `source_db='sra'` ou `source_db='geo'` com `sra_runs` resolvidos →   `file_kind='fastq'` (F2, GB–TB). Exige `confirm=true`.
+         *
+         *     **Seleção de amostras (MVP-A):**
+         *     - `scope='all'` (padrão): todas as runs do dataset.
+         *     - `scope='included'`: só amostras com `curation_status='included'` no projeto.
+         *     - `scope='manual'`: exatamente os `sample_ids` fornecidos (validados contra   o projeto do usuário — ids de outro projeto → 403/404).
+         *
+         *     **GEO → FASTQ (MVP-B):** requer resolução SRA prévia via `POST .../resolve-sra/`. Sem resolução retorna HTTP 400 orientativo.
          *
          *     **Quota (apenas FASTQ):**
          *     - Soma `DatasetFile.size_bytes` já baixados (`status='downloaded'`) do   projeto e compara com `DOWNLOAD_QUOTA_BYTES` (padrão: 200 GB).
          *     - Se excedida: HTTP 409 com `used_bytes` / `quota_bytes`.
-         *     - Se `confirm=false`/ausente: HTTP 400 com prévia de quota (mesmo payload).
+         *     - Se `confirm=false`/ausente: HTTP 400 com prévia de quota.
          *
          *     **GEO supplementary (F1):** sem gate de confirm ou quota — fluxo simples.
          *
-         *     Idempotente: job ativo para o mesmo dataset retorna o existente (202).
+         *     Idempotente: job ativo para o mesmo dataset+scope+sample_ids retorna o existente (202).
          *     Progresso monitorável via GET /projects/{project_pk}/jobs/ com filtro ?job_type=geo_supplementary_download ou ?job_type=fastq_download.
          */
         post: operations["projects_datasets_download_create"];
@@ -433,6 +480,35 @@ export interface paths {
         get: operations["projects_datasets_files_content_retrieve"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_pk}/datasets/{id}/resolve-sra/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Disparar resolução GSM→SRR para dataset GEO
+         * @description Enfileira a resolução SRA para um dataset GEO (MVP-B).
+         *
+         *     O Rust lê `OmicSample.extra_metadata['relation']` de cada GSM, extrai o SRX correspondente, resolve SRX→SRR via ENA filereport API e grava os runs em `extra_metadata['sra_runs']` de cada GSM — sem migration nova (usa JSONField existente, D1 aprovado).
+         *
+         *     Após a resolução, o download FASTQ via `POST .../download/` passa a ser disponível para o dataset GEO.
+         *
+         *     Apenas datasets com `source_db='geo'` são aceitos; outros retornam HTTP 400.
+         *
+         *     Idempotente: job ativo para o mesmo dataset retorna o existente (202).
+         *     Progresso monitorável via GET /projects/{project_pk}/jobs/{id}/.
+         */
+        post: operations["projects_datasets_resolve_sra_create"];
         delete?: never;
         options?: never;
         head?: never;
@@ -495,6 +571,26 @@ export interface paths {
          * @description Busca full-text em datasets do projeto via search_vector. Parâmetro obrigatório: ?q=termo.
          */
         get: operations["projects_datasets_search_list"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project_pk}/disease-axis-queue/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Listar fila de curadoria de alto valor (disease_axis)
+         * @description Lista ProjectDatasets do projeto com disease_axis classificado como "mixed" (âncora monogênica + multifatorial detectadas) ou com discordância (monogenic_gene_hit presente mas disease_axis fora de {monogenic, mixed}). "indeterminate" puro (sem gene hit) é terminal e NÃO aparece aqui. Cada item inclui o campo queue_reason ("mixed" ou "discordance") para a UI saber por que o dataset entrou na fila. Apenas datasets do projeto do usuário autenticado são expostos (sem vazamento cross-user). Retorna lista vazia se não houver itens pendentes de revisão.
+         */
+        get: operations["projects_disease_axis_queue_list"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1147,6 +1243,73 @@ export interface components {
          */
         ContextStatusEnum: "ready" | "computing";
         /**
+         * @description Item da fila de curadoria: ProjectDataset com has_control_group indeterminado.
+         *
+         *     Campos expostos são suficientes para o curador decidir sem vazar metadados sensíveis.
+         *     dataset_id é o PK de OmicDataset (necessário para o endpoint de resolução).
+         */
+        CurationQueueItem: {
+            readonly id: number;
+            readonly dataset_id: number;
+            readonly accession: string;
+            readonly source_db: string;
+            readonly title: string;
+            readonly summary: string;
+            readonly omic_type: string;
+            readonly organism: string;
+            readonly n_samples: number | null;
+            readonly has_control_group: string;
+            /** Format: float */
+            readonly has_control_group_score: number | null;
+            readonly curation_status: components["schemas"]["DatasetCurationStatusEnum"];
+            readonly notes: string;
+            /** Format: date-time */
+            readonly added_at: string;
+            /** Format: date-time */
+            readonly curated_at: string | null;
+        };
+        /**
+         * @description Body da ação de resolução manual (POST /curation-queue/{id}/resolve/).
+         *
+         *     has_control_group: 'yes' ou 'no' (obrigatório — curador não pode resolver como unknown).
+         *     notes: notas do curador (opcional, auditável).
+         */
+        CurationQueueResolve: {
+            /**
+             * @description Classificação manual do curador. Aceita apenas "yes" ou "no" (not "unknown").
+             *
+             *     * `yes` - yes
+             *     * `no` - no
+             */
+            has_control_group: components["schemas"]["CurationQueueResolveHasControlGroupEnum"];
+            /**
+             * @description Notas do curador sobre a decisão (auditável).
+             * @default
+             */
+            notes: string;
+        };
+        /**
+         * @description * `yes` - yes
+         *     * `no` - no
+         * @enum {string}
+         */
+        CurationQueueResolveHasControlGroupEnum: "yes" | "no";
+        /**
+         * @description Resposta após resolução bem-sucedida.
+         *     Reflete o estado atualizado do ProjectDataset.
+         */
+        CurationQueueResolveResponse: {
+            readonly id: number;
+            readonly dataset_id: number;
+            readonly accession: string;
+            readonly has_control_group: string;
+            /** Format: float */
+            readonly has_control_group_score: number | null;
+            readonly notes: string;
+            /** Format: date-time */
+            readonly curated_at: string | null;
+        };
+        /**
          * @description * `pending` - Pendente
          *     * `included` - Incluído
          *     * `excluded` - Excluído
@@ -1299,6 +1462,7 @@ export interface components {
              *
              *     * `monogenic` - Monogênica
              *     * `multifactorial` - Multifatorial
+             *     * `mixed` - Mista
              *     * `indeterminate` - Indeterminado
              */
             disease_axis?: components["schemas"]["DiseaseAxisEnum"];
@@ -1392,21 +1556,90 @@ export interface components {
          */
         DatasetFileDownloadStatusEnum: "pending" | "queued" | "downloading" | "downloaded" | "failed";
         /**
+         * @description * `server` - server
+         *     * `client` - client
+         * @enum {string}
+         */
+        DestinationEnum: "server" | "client";
+        /**
          * @description * `monogenic` - Monogênica
          *     * `multifactorial` - Multifatorial
+         *     * `mixed` - Mista
          *     * `indeterminate` - Indeterminado
          * @enum {string}
          */
-        DiseaseAxisEnum: "monogenic" | "multifactorial" | "indeterminate";
+        DiseaseAxisEnum: "monogenic" | "multifactorial" | "mixed" | "indeterminate";
+        /**
+         * @description Item da fila de curadoria de alto valor: ProjectDataset com disease_axis
+         *     'mixed' ou com discordância (monogenic_gene_hit presente e axis divergente).
+         *
+         *     O campo `queue_reason` é sintético: alimentado pela view a partir do atributo
+         *     `_queue_reason` que high_value_queue_queryset() anota em cada instância.
+         */
+        DiseaseAxisQueueItem: {
+            readonly id: number;
+            readonly dataset_id: number;
+            readonly accession: string;
+            readonly source_db: string;
+            readonly title: string;
+            readonly disease_axis: string;
+            /** @description Sub-dict de contract_confidence[disease_axis]: score (float), method (str), n_candidates (int), axis_hits {monogenic, multifactorial} com matched_name, matched_source, score, method. */
+            readonly disease_axis_confidence: {
+                score?: number;
+                method?: string;
+                n_candidates?: number;
+                axis_hits?: {
+                    monogenic?: {
+                        score?: number;
+                        method?: string;
+                        matched_name?: string;
+                        matched_source?: string;
+                    };
+                    multifactorial?: {
+                        score?: number;
+                        method?: string;
+                        matched_name?: string;
+                        matched_source?: string;
+                    };
+                };
+            } | null;
+            /** @description Sinal de gene monogênico de extra_metadata[contract][monogenic_gene_hit]. Contém: genes (list[str]), confidence (float), gene_details (list[dict]). None se o dataset não passou pelo classificador de gene hit ou não houve hit. */
+            readonly monogenic_gene_hit: {
+                genes?: string[];
+                confidence?: number;
+                gene_details?: {
+                    gene_symbol?: string;
+                    score?: number;
+                    sources?: string[];
+                    mendelian_confidence?: string;
+                }[];
+            } | null;
+            /** @description 'mixed': disease_axis == 'mixed' (âncora mono + multi detectadas). 'discordance': monogenic_gene_hit presente mas disease_axis fora de {monogenic, mixed} — sinal de gene sugere monogênico mas texto não confirmou. */
+            readonly queue_reason: components["schemas"]["QueueReasonEnum"];
+            readonly curation_status: components["schemas"]["DatasetCurationStatusEnum"];
+            readonly notes: string;
+            /** Format: date-time */
+            readonly added_at: string;
+            /** Format: date-time */
+            readonly curated_at: string | null;
+        };
         /**
          * @description Body do POST .../download/.
          *
-         *     Ambos os campos são opcionais:
-         *     - `file_kind`: se omitido, a view deriva por source_db do dataset
-         *       (geo → geo_supplementary; sra → fastq).
+         *     Campos obrigatórios/opcionais:
+         *     - `file_kind`: se omitido, derivado de source_db do dataset.
          *     - `confirm`: obrigatório apenas para file_kind='fastq' (F2, GB–TB).
-         *       Sem confirm=true, o serviço retorna HTTP 400 com prévia de quota.
-         *       Ignorado para GEO supplementary (F1).
+         *     - `scope`: escopo de amostras a baixar (MVP-A):
+         *         - 'all' (padrão): todas as runs do dataset (comportamento original).
+         *         - 'included': apenas amostras com ProjectSample.curation_status='included'
+         *           no projeto do usuário autenticado.
+         *         - 'manual': exatamente os OmicSample ids informados em sample_ids.
+         *         ('filter' é Inc-2 — não implementado neste MVP.)
+         *     - `sample_ids`: lista de OmicSample.id; obrigatório se scope='manual'.
+         *       Cada id é validado contra ProjectSample do projeto do user
+         *       (firebase-auth-guard / Regra #3 — ids de outro projeto → 403/404).
+         *     - `destination`: destino do download; 'server' (padrão) já implementado;
+         *       'client' será implementado no Inc-1 — retorna 400 neste MVP.
          *
          *     Campos NUNCA expostos: nenhum dado sensível — só intenção do usuário.
          */
@@ -1423,6 +1656,25 @@ export interface components {
              * @default false
              */
             confirm: boolean;
+            /**
+             * @description Escopo de amostras a baixar: 'all' (padrão) = todas as runs do dataset; 'included' = só amostras com curation_status='included' no projeto; 'manual' = exatamente os ids em sample_ids.
+             *
+             *     * `all` - all
+             *     * `included` - included
+             *     * `manual` - manual
+             * @default all
+             */
+            scope: components["schemas"]["ScopeEnum"];
+            /** @description Lista de ProjectSample.id para scope='manual' — mesmo padrão de id exposto por ProjectSampleListSerializer e usado em bulk_curate de samples. Obrigatório quando scope='manual'. A view valida pertencimento ao projeto/dataset do usuário autenticado e resolve internamente para OmicSample.id antes de repassar ao Rust — ids de outro projeto resultam em 404 (firebase-auth-guard, Regra #3). */
+            sample_ids?: number[] | null;
+            /**
+             * @description Destino do download: 'server' (padrão) = enfileira job Celery, salva no object storage. 'client' = Inc-1, não implementado neste MVP (retorna HTTP 400).
+             *
+             *     * `server` - server
+             *     * `client` - client
+             * @default server
+             */
+            destination: components["schemas"]["DestinationEnum"];
         };
         /** @description Resposta do POST .../download/ — retorna o IngestionJob criado/ativo. */
         DownloadDispatchResponse: {
@@ -1599,6 +1851,7 @@ export interface components {
          *     * `geo_search` - Busca GEO
          *     * `sra_search` - Busca SRA
          *     * `gwas_search` - Busca GWAS Catalog
+         *     * `pride_search` - Busca PRIDE
          *     * `sample_fetch` - Fetch de Amostras
          *     * `variant_annotation` - Anotação de Variantes
          *     * `gene_ner` - Extração de Genes
@@ -1606,9 +1859,10 @@ export interface components {
          *     * `context_extraction` - Extração de Contextos
          *     * `geo_supplementary_download` - Download Suplementar GEO
          *     * `fastq_download` - Download FASTQ
+         *     * `sra_resolution` - Resolução GSM→SRR (GEO→SRA)
          * @enum {string}
          */
-        JobTypeEnum: "pubmed_search" | "pubmed_fetch" | "geo_search" | "sra_search" | "gwas_search" | "sample_fetch" | "variant_annotation" | "gene_ner" | "drug_ner" | "context_extraction" | "geo_supplementary_download" | "fastq_download";
+        JobTypeEnum: "pubmed_search" | "pubmed_fetch" | "geo_search" | "sra_search" | "gwas_search" | "pride_search" | "sample_fetch" | "variant_annotation" | "gene_ner" | "drug_ner" | "context_extraction" | "geo_supplementary_download" | "fastq_download" | "sra_resolution";
         /**
          * @description Resumo de um vínculo ProjectPaperDataset para exibir no detalhe de um paper.
          *
@@ -1879,6 +2133,21 @@ export interface components {
             previous?: string | null;
             results: components["schemas"]["ClinicalCategory"][];
         };
+        PaginatedCurationQueueItemList: {
+            /** @example 123 */
+            count: number;
+            /**
+             * Format: uri
+             * @example http://api.example.org/accounts/?page=4
+             */
+            next?: string | null;
+            /**
+             * Format: uri
+             * @example http://api.example.org/accounts/?page=2
+             */
+            previous?: string | null;
+            results: components["schemas"]["CurationQueueItem"][];
+        };
         PaginatedDaVinciProjectList: {
             /** @example 123 */
             count: number;
@@ -1908,6 +2177,21 @@ export interface components {
              */
             previous?: string | null;
             results: components["schemas"]["DatasetFile"][];
+        };
+        PaginatedDiseaseAxisQueueItemList: {
+            /** @example 123 */
+            count: number;
+            /**
+             * Format: uri
+             * @example http://api.example.org/accounts/?page=4
+             */
+            next?: string | null;
+            /**
+             * Format: uri
+             * @example http://api.example.org/accounts/?page=2
+             */
+            previous?: string | null;
+            results: components["schemas"]["DiseaseAxisQueueItem"][];
         };
         PaginatedIngestionJobList: {
             /** @example 123 */
@@ -2410,6 +2694,7 @@ export interface components {
             /** Format: date-time */
             readonly curated_at: string | null;
             readonly linked_papers: components["schemas"]["LinkedPaperBrief"][];
+            readonly sra_resolved: boolean;
         };
         /** @description Compact list — includes summary and platform for the detail panel. */
         ProjectDatasetList: {
@@ -2441,6 +2726,7 @@ export interface components {
             readonly access_type: string;
             readonly data_format: string;
             readonly omics_layers: string[];
+            readonly sra_resolved: boolean;
         };
         /**
          * @description Detalhe de um medicamento no projeto: métricas agregadas + referências com snippets.
@@ -2839,6 +3125,8 @@ export interface components {
                 maf: number | null;
             } | null;
         };
+        /** @enum {string} */
+        QueueReasonEnum: "mixed" | "discordance";
         /** @description Body de bulk_curate de samples. */
         SampleBulkCurateRequest: {
             /** @description Lista de IDs de ProjectSample a atualizar. */
@@ -2858,6 +3146,13 @@ export interface components {
              */
             exclusion_reason: string;
         };
+        /**
+         * @description * `all` - all
+         *     * `included` - included
+         *     * `manual` - manual
+         * @enum {string}
+         */
+        ScopeEnum: "all" | "included" | "manual";
         /** @description Body de POST /projects/{id}/search/preview/ */
         SearchPreviewRequest: {
             /** @description Lista de descritores MeSH para calcular o preview. Se ausente, usa selected_mesh do projeto. */
@@ -2890,6 +3185,23 @@ export interface components {
          * @enum {string}
          */
         SourceEnum: "geo_ftp" | "ena_ftp" | "sra_tools";
+        /**
+         * @description Resposta do POST .../resolve-sra/ — retorna o IngestionJob de resolução GSM→SRR.
+         *
+         *     O job pode ser monitorado via GET /projects/{project_pk}/jobs/{id}/.
+         *     Campos NUNCA expostos: db_url, ncbi_api_key (sensitive-data-handling).
+         */
+        SraResolutionResponse: {
+            /** Format: uuid */
+            readonly id: string;
+            readonly job_type: components["schemas"]["JobTypeEnum"];
+            readonly status: components["schemas"]["IngestionJobStatusEnum"];
+            readonly records_processed: number;
+            readonly records_inserted: number;
+            readonly error_message: string;
+            /** Format: date-time */
+            readonly created_at: string;
+        };
         /**
          * @description * `dataset_missing` - dataset_missing
          *     * `paper_missing` - paper_missing
@@ -3475,6 +3787,62 @@ export interface operations {
             };
         };
     };
+    projects_curation_queue_list: {
+        parameters: {
+            query?: {
+                /** @description Which field to use when ordering the results. */
+                ordering?: string;
+                /** @description A page number within the paginated result set. */
+                page?: number;
+                /** @description A search term. */
+                search?: string;
+            };
+            header?: never;
+            path: {
+                project_pk: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PaginatedCurationQueueItemList"];
+                };
+            };
+        };
+    };
+    projects_curation_queue_resolve_create: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+                project_pk: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CurationQueueResolve"];
+                "application/x-www-form-urlencoded": components["schemas"]["CurationQueueResolve"];
+                "multipart/form-data": components["schemas"]["CurationQueueResolve"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationQueueResolveResponse"];
+                };
+            };
+        };
+    };
     projects_datasets_list: {
         parameters: {
             query?: {
@@ -3684,6 +4052,42 @@ export interface operations {
             };
         };
     };
+    projects_datasets_resolve_sra_create: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+                project_pk: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SraResolutionResponse"];
+                };
+            };
+            /** @description No response body */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No response body */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     projects_datasets_add_from_suggestion_create: {
         parameters: {
             query?: never;
@@ -3770,6 +4174,34 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PaginatedProjectDatasetListList"];
+                };
+            };
+        };
+    };
+    projects_disease_axis_queue_list: {
+        parameters: {
+            query?: {
+                /** @description Which field to use when ordering the results. */
+                ordering?: string;
+                /** @description A page number within the paginated result set. */
+                page?: number;
+                /** @description A search term. */
+                search?: string;
+            };
+            header?: never;
+            path: {
+                project_pk: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PaginatedDiseaseAxisQueueItemList"];
                 };
             };
         };

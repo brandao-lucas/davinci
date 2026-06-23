@@ -8,6 +8,7 @@ import type {
   PaginatedDatasetFileList,
   BulkCurateDatasetByFilterInput,
   BulkCurateResponse,
+  SraResolutionResponse,
 } from '@/lib/types/dataset';
 import type { PaginatedResponse } from '@/lib/types/api';
 
@@ -51,15 +52,27 @@ export const datasetsApi = {
 
   // POST /projects/{project_pk}/datasets/{id}/download/
   // Dispara o download dos arquivos do dataset. Retorna 202 com o IngestionJob criado.
-  // Para SRA: aceita { file_kind?: 'fastq', confirm?: boolean }
-  //   - sem confirm (ou confirm=false): retorna 400 com DownloadQuotaPreview (prévia de quota)
-  //   - com confirm=true: enfileira o job (202)
-  //   - quota esgotada: 409 com DownloadQuotaPreview (confirm_required=false)
-  // Para GEO: body pode ser vazio; sem gate de confirm ou quota.
+  // Para SRA/GEO com sra_runs: aceita scope, sample_ids, confirm, file_kind.
+  //   - scope='all' (padrão): todas as runs do dataset.
+  //   - scope='included': só samples com curation_status='included'.
+  //   - scope='manual': exatamente os sample_ids informados.
+  //   - sem confirm (ou confirm=false): retorna 400 com DownloadQuotaPreview (prévia de quota).
+  //   - com confirm=true: enfileira o job (202).
+  //   - quota esgotada: 409 com DownloadQuotaPreview (confirm_required=false).
+  // destination: 'server' (padrão, único implementado no MVP); 'client' retorna 400 (Inc-1).
   triggerDownload: (projectId: string, datasetId: number, body?: Partial<DownloadDispatchRequest>) =>
     apiClient.post<DownloadDispatchResponse>(
       `/projects/${projectId}/datasets/${datasetId}/download/`,
       body ?? {},
+    ),
+
+  // POST /projects/{project_pk}/datasets/{id}/resolve-sra/
+  // Dispara resolução GEO→SRA: para cada GSM do dataset, lê extra_metadata['relation'],
+  // extrai SRX e resolve SRX→SRR via ENA. Grava sra_runs nos GSMs. Retorna 202 com IngestionJob.
+  // Usado em datasets GEO antes de permitir download FASTQ.
+  resolveSra: (projectId: string, datasetId: number) =>
+    apiClient.post<SraResolutionResponse>(
+      `/projects/${projectId}/datasets/${datasetId}/resolve-sra/`,
     ),
 
   // GET /projects/{project_pk}/datasets/{id}/files/

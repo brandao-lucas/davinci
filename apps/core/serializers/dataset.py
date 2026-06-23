@@ -1,6 +1,6 @@
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
-from apps.core.models import OmicDataset, ProjectDataset, ProjectPaperDataset
+from apps.core.models import OmicDataset, OmicSample, ProjectDataset, ProjectPaperDataset
 
 
 class OmicDatasetSerializer(serializers.ModelSerializer):
@@ -57,6 +57,26 @@ class ProjectDatasetListSerializer(serializers.ModelSerializer):
         read_only=True,
     )
 
+    @extend_schema_field({'type': 'boolean'})
+    def get_sra_resolved(self, obj) -> bool:
+        """
+        True quando o dataset GEO tem ao menos um OmicSample com sra_runs resolvidos
+        (extra_metadata['sra_runs'] existe — MVP-B, ligação GEO→SRA).
+
+        Lê a anotação 'sra_resolved' injetada pelo get_queryset() da view (Exists subquery)
+        para evitar N+1 em listas. Se a anotação estiver ausente (serializer instanciado
+        fora da view, ex: testes unitários diretos), executa a query de fallback.
+        """
+        annotated = getattr(obj, 'sra_resolved', None)
+        if annotated is not None:
+            return bool(annotated)
+        return OmicSample.objects.filter(
+            dataset_id=obj.dataset_id,
+            extra_metadata__has_key='sra_runs',
+        ).exists()
+
+    sra_resolved = serializers.SerializerMethodField()
+
     class Meta:
         model = ProjectDataset
         fields = [
@@ -68,6 +88,8 @@ class ProjectDatasetListSerializer(serializers.ModelSerializer):
             # Eixos OmnisPathway para UI de curadoria
             'has_control_group', 'disease_axis', 'omics_count',
             'is_single_cell', 'access_type', 'data_format', 'omics_layers',
+            # MVP-B: indica se a resolução GSM→SRR já foi executada para este dataset GEO
+            'sra_resolved',
         ]
 
 
@@ -122,6 +144,24 @@ class ProjectDatasetDetailSerializer(serializers.ModelSerializer):
 
     linked_papers = serializers.SerializerMethodField()
 
+    @extend_schema_field({'type': 'boolean'})
+    def get_sra_resolved(self, obj) -> bool:
+        """
+        True quando o dataset GEO tem ao menos um OmicSample com sra_runs resolvidos.
+
+        Lê a anotação 'sra_resolved' injetada pelo get_queryset() da view (Exists subquery).
+        Fallback para query direta quando instanciado fora da view (ex: testes).
+        """
+        annotated = getattr(obj, 'sra_resolved', None)
+        if annotated is not None:
+            return bool(annotated)
+        return OmicSample.objects.filter(
+            dataset_id=obj.dataset_id,
+            extra_metadata__has_key='sra_runs',
+        ).exists()
+
+    sra_resolved = serializers.SerializerMethodField()
+
     class Meta:
         model = ProjectDataset
         fields = [
@@ -129,6 +169,8 @@ class ProjectDatasetDetailSerializer(serializers.ModelSerializer):
             'curation_status', 'exclusion_reason', 'notes',
             'relevance_score', 'added_at', 'curated_at',
             'linked_papers',
+            # MVP-B: indica se a resolução GSM→SRR já foi executada para este dataset GEO
+            'sra_resolved',
         ]
         read_only_fields = ['id', 'dataset', 'added_at', 'curated_at']
 

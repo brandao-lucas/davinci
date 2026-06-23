@@ -624,7 +624,7 @@ def run_pride_ingestion(self, job_id: str):
     # crash do worker — o broker reenfileira a mensagem para retry.
     acks_late=True,
 )
-def run_omics_download(self, project_id: str, dataset_id: int, file_kind: str = 'geo_supplementary'):
+def run_omics_download(self, project_id: str, dataset_id: int, file_kind: str = 'geo_supplementary', sample_ids: list[int] | None = None):
     """
     Orquestra o download de arquivos ômicos para um dataset já curado.
 
@@ -656,6 +656,11 @@ def run_omics_download(self, project_id: str, dataset_id: int, file_kind: str = 
       - File(f) não bufferiza em memória: o boto3 lê em chunks e faz upload
         parte a parte, mantendo footprint de memória constante.
       - O arquivo local temporário é removido apenas após upload bem-sucedido.
+
+    Seleção de amostras (MVP-A):
+      - sample_ids=None → Rust baixa todas as runs do dataset (scope='all').
+      - sample_ids=[...] → Rust filtra por OmicSample.id (scope='included'/'manual').
+        A validação de isolamento cross-project já foi feita na view antes do dispatch.
 
     Regra #1: a task apenas orquestra — não faz HTTP nem parse de dados.
     Upload via default_storage é I/O de orquestração aceito no Django.
@@ -759,6 +764,9 @@ def run_omics_download(self, project_id: str, dataset_id: int, file_kind: str = 
                 dest_dir=dest_dir,
                 db_url=db_url,
                 ncbi_api_key=ncbi_api_key,
+                # sample_ids=None → Rust baixa todas as runs (scope='all')
+                # sample_ids=[...] → Rust filtra por OmicSample.id (scope='included'/'manual')
+                sample_ids=sample_ids,
             )
 
             upload_errors = []
@@ -920,6 +928,163 @@ def run_omics_download(self, project_id: str, dataset_id: int, file_kind: str = 
             job = IngestionJob.objects.filter(
                 project_id=project_id,
                 parameters__dataset_id=dataset_id,
+                status__in=[IngestionJob.JobStatus.PENDING, IngestionJob.JobStatus.RUNNING],
+            ).order_by('-created_at').first()
+            if job:
+                IngestionJob.objects.filter(id=job.id).update(
+                    status=IngestionJob.JobStatus.FAILED,
+                    error_message=str(exc),
+                )
+        except Exception:
+            pass
+        raise self.retry(exc=exc, countdown=60)
+
+
+@shared_task(
+    bind=True,
+    max_retries=3,
+    # Resolução SRX→SRR é HTTP + parse — tipicamente segundos a poucos minutos.
+    # Limites generosos para datasets grandes com muitos GSM.
+    time_limit=2 * 3600,
+    soft_time_limit=1 * 3600 + 50 * 60,
+    acks_late=True,
+)
+def run_sra_resolution(self, project_id: str, dataset_id: int):
+    """
+    Resolve GSM→SRR para um dataset GEO via rust_engine.resolve_sra_runs_for_dataset.
+
+    Fluxo (MVP-B — passo 4):
+      1. Localiza o IngestionJob SRA_RESOLUTION criado pelo SraResolutionService.
+      2. Monta db_url; obtém ncbi_api_key — NUNCA logado (sensitive-data-handling).
+      3. Chama rust_engine.resolve_sra_runs_for_dataset(dataset_id, db_url, ncbi_api_key).
+         O Rust:
+           a. Lê OmicSample.extra_metadata['relation'] de cada GSM do dataset.
+           b. Extrai SRX* da string de relation GEO SOFT.
+           c. Resolve SRX*→SRR* via ENA filereport API.
+           d. Grava extra_metadata['sra_runs'] = ["SRR..."] no GSM (UPDATE sem migration).
+      4. Atualiza IngestionJob com contadores e status final.
+
+    Regra #1: task apenas orquestra — Rust faz HTTP e UPDATE.
+    Auditoria (curation-audit-trail): resolução não é curadoria —
+    curated_at/exclusion_reason/notes não são tocados.
+    Sensitive-data-handling: ncbi_api_key NUNCA em log nem em IngestionJob.parameters.
+    """
+    from apps.core.models import DaVinciProject
+
+    try:
+        import rust_engine
+
+        try:
+            project = DaVinciProject.objects.select_related('user').get(id=project_id)
+        except DaVinciProject.DoesNotExist:
+            logger.warning('DaVinciProject %s not found — SRA resolution aborted', project_id)
+            return {'samples_updated': 0, 'errors': []}
+
+        try:
+            dataset = OmicDataset.objects.get(id=dataset_id)
+        except OmicDataset.DoesNotExist:
+            logger.warning('OmicDataset %s not found — SRA resolution aborted', dataset_id)
+            return {'samples_updated': 0, 'errors': []}
+
+        job_type = IngestionJob.JobType.SRA_RESOLUTION
+
+        job = IngestionJob.objects.filter(
+            project=project,
+            job_type=job_type,
+            parameters__dataset_id=dataset_id,
+            status__in=[IngestionJob.JobStatus.PENDING, IngestionJob.JobStatus.RUNNING],
+        ).order_by('-created_at').first()
+
+        if job is None:
+            # Fallback: cria job se chamado sem service (testes / retries)
+            job = IngestionJob.objects.create(
+                project=project,
+                job_type=job_type,
+                status=IngestionJob.JobStatus.RUNNING,
+                parameters={
+                    'dataset_id': dataset_id,
+                    'dataset_accession': dataset.accession,
+                    'source_db': dataset.source_db,
+                },
+            )
+        else:
+            IngestionJob.objects.filter(id=job.id).update(
+                status=IngestionJob.JobStatus.RUNNING,
+            )
+
+        # Monta db_url — NUNCA logar (sensitive-data-handling)
+        db = settings.DATABASES['default']
+        db_url = f"postgresql://{db['USER']}:{db['PASSWORD']}@{db['HOST']}:{db['PORT']}/{db['NAME']}"
+
+        # Obtém ncbi_api_key — NUNCA logar (sensitive-data-handling)
+        user = project.user
+        ncbi_api_key = getattr(settings, 'NCBI_API_KEY', None)
+        try:
+            ncbi_api_key = user.profile.ncbi_api_key or ncbi_api_key
+        except Exception:
+            pass
+
+        result = rust_engine.resolve_sra_runs_for_dataset(
+            dataset_id=dataset.id,
+            db_url=db_url,
+            ncbi_api_key=ncbi_api_key,
+        )
+
+        error_msg = '; '.join(result.errors) if result.errors else ''
+        final_status = (
+            IngestionJob.JobStatus.FAILED
+            if error_msg and result.samples_updated == 0
+            else IngestionJob.JobStatus.COMPLETED
+        )
+
+        IngestionJob.objects.filter(id=job.id).update(
+            status=final_status,
+            records_processed=result.samples_updated,
+            records_inserted=result.samples_updated,
+            error_message=error_msg,
+        )
+
+        logger.info(
+            'SRA resolution concluída para dataset %s: %d amostras atualizadas, %d erro(s)',
+            dataset.accession,
+            result.samples_updated,
+            len(result.errors or []),
+        )
+
+        return {
+            'samples_updated': result.samples_updated,
+            'errors': list(result.errors or []),
+        }
+
+    except ImportError:
+        logger.error('rust_engine não instalado — compile com `maturin develop --release`')
+        try:
+            job = IngestionJob.objects.filter(
+                project_id=project_id,
+                parameters__dataset_id=dataset_id,
+                status__in=[IngestionJob.JobStatus.PENDING, IngestionJob.JobStatus.RUNNING],
+            ).order_by('-created_at').first()
+            if job:
+                IngestionJob.objects.filter(id=job.id).update(
+                    status=IngestionJob.JobStatus.FAILED,
+                    error_message='rust_engine not installed — compile with `maturin develop --release`',
+                )
+        except Exception:
+            pass
+        return {'samples_updated': 0, 'errors': ['rust_engine not installed']}
+
+    except Exception as exc:
+        logger.error(
+            'run_sra_resolution falhou para projeto %s / dataset %s: %s',
+            project_id,
+            dataset_id,
+            exc,
+        )
+        try:
+            job = IngestionJob.objects.filter(
+                project_id=project_id,
+                parameters__dataset_id=dataset_id,
+                job_type=IngestionJob.JobType.SRA_RESOLUTION,
                 status__in=[IngestionJob.JobStatus.PENDING, IngestionJob.JobStatus.RUNNING],
             ).order_by('-created_at').first()
             if job:

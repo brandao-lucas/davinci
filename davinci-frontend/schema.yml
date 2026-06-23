@@ -629,6 +629,95 @@ paths:
       responses:
         '204':
           description: No response body
+  /api/v1/projects/{project_pk}/curation-queue/:
+    get:
+      operationId: projects_curation_queue_list
+      description: Lista datasets do projeto com has_control_group classificado-indeterminado
+        (score < 0.5 pelo classificador automático). Apenas datasets do projeto do
+        usuário autenticado são expostos (sem vazamento cross-user). Retorna lista
+        vazia se não houver itens pendentes de revisão.
+      summary: Listar fila de curadoria manual
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedCurationQueueItemList'
+          description: ''
+  /api/v1/projects/{project_pk}/curation-queue/{id}/resolve/:
+    post:
+      operationId: projects_curation_queue_resolve_create
+      description: 'Curador define has_control_group como "yes" ou "no" manualmente.
+        Preserva auditoria: grava curated_at e notes no ProjectDataset; marca origem
+        manual em contract_confidence do OmicDataset (score=1.0, is_manual=True).
+        Nunca deleta. HTTP 403 se o ProjectDataset não pertencer ao projeto do usuário.'
+      summary: Resolver item da fila de curadoria manualmente
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CurationQueueResolve'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/CurationQueueResolve'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/CurationQueueResolve'
+        required: true
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationQueueResolveResponse'
+          description: ''
   /api/v1/projects/{project_pk}/datasets/:
     get:
       operationId: projects_datasets_list
@@ -825,16 +914,23 @@ paths:
         **Derivação de file_kind por source_db:**
         - `source_db='geo'` → `file_kind='geo_supplementary'` (padrão F1, MB).
           Body pode ser vazio ou omitir `file_kind`.
-        - `source_db='sra'` → `file_kind='fastq'` (F2, GB–TB). Exige   `confirm=true` no body; sem confirm retorna HTTP 400 com prévia de quota.
+        - `source_db='sra'` ou `source_db='geo'` com `sra_runs` resolvidos →   `file_kind='fastq'` (F2, GB–TB). Exige `confirm=true`.
+
+        **Seleção de amostras (MVP-A):**
+        - `scope='all'` (padrão): todas as runs do dataset.
+        - `scope='included'`: só amostras com `curation_status='included'` no projeto.
+        - `scope='manual'`: exatamente os `sample_ids` fornecidos (validados contra   o projeto do usuário — ids de outro projeto → 403/404).
+
+        **GEO → FASTQ (MVP-B):** requer resolução SRA prévia via `POST .../resolve-sra/`. Sem resolução retorna HTTP 400 orientativo.
 
         **Quota (apenas FASTQ):**
         - Soma `DatasetFile.size_bytes` já baixados (`status='downloaded'`) do   projeto e compara com `DOWNLOAD_QUOTA_BYTES` (padrão: 200 GB).
         - Se excedida: HTTP 409 com `used_bytes` / `quota_bytes`.
-        - Se `confirm=false`/ausente: HTTP 400 com prévia de quota (mesmo payload).
+        - Se `confirm=false`/ausente: HTTP 400 com prévia de quota.
 
         **GEO supplementary (F1):** sem gate de confirm ou quota — fluxo simples.
 
-        Idempotente: job ativo para o mesmo dataset retorna o existente (202).
+        Idempotente: job ativo para o mesmo dataset+scope+sample_ids retorna o existente (202).
         Progresso monitorável via GET /projects/{project_pk}/jobs/ com filtro ?job_type=geo_supplementary_download ou ?job_type=fastq_download.
       summary: Iniciar download de arquivos do dataset
       parameters:
@@ -971,6 +1067,49 @@ paths:
       responses:
         '200':
           description: No response body
+  /api/v1/projects/{project_pk}/datasets/{id}/resolve-sra/:
+    post:
+      operationId: projects_datasets_resolve_sra_create
+      description: |-
+        Enfileira a resolução SRA para um dataset GEO (MVP-B).
+
+        O Rust lê `OmicSample.extra_metadata['relation']` de cada GSM, extrai o SRX correspondente, resolve SRX→SRR via ENA filereport API e grava os runs em `extra_metadata['sra_runs']` de cada GSM — sem migration nova (usa JSONField existente, D1 aprovado).
+
+        Após a resolução, o download FASTQ via `POST .../download/` passa a ser disponível para o dataset GEO.
+
+        Apenas datasets com `source_db='geo'` são aceitos; outros retornam HTTP 400.
+
+        Idempotente: job ativo para o mesmo dataset retorna o existente (202).
+        Progresso monitorável via GET /projects/{project_pk}/jobs/{id}/.
+      summary: Disparar resolução GSM→SRR para dataset GEO
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SraResolutionResponse'
+          description: ''
+        '400':
+          description: No response body
+        '404':
+          description: No response body
   /api/v1/projects/{project_pk}/datasets/add_from_suggestion/:
     post:
       operationId: projects_datasets_add_from_suggestion_create
@@ -1097,6 +1236,55 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PaginatedProjectDatasetListList'
+          description: ''
+  /api/v1/projects/{project_pk}/disease-axis-queue/:
+    get:
+      operationId: projects_disease_axis_queue_list
+      description: Lista ProjectDatasets do projeto com disease_axis classificado
+        como "mixed" (âncora monogênica + multifatorial detectadas) ou com discordância
+        (monogenic_gene_hit presente mas disease_axis fora de {monogenic, mixed}).
+        "indeterminate" puro (sem gene hit) é terminal e NÃO aparece aqui. Cada item
+        inclui o campo queue_reason ("mixed" ou "discordance") para a UI saber por
+        que o dataset entrou na fila. Apenas datasets do projeto do usuário autenticado
+        são expostos (sem vazamento cross-user). Retorna lista vazia se não houver
+        itens pendentes de revisão.
+      summary: Listar fila de curadoria de alto valor (disease_axis)
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedDiseaseAxisQueueItemList'
           description: ''
   /api/v1/projects/{project_pk}/drugs/:
     get:
@@ -2390,6 +2578,152 @@ components:
       description: |-
         * `ready` - ready
         * `computing` - computing
+    CurationQueueItem:
+      type: object
+      description: |-
+        Item da fila de curadoria: ProjectDataset com has_control_group indeterminado.
+
+        Campos expostos são suficientes para o curador decidir sem vazar metadados sensíveis.
+        dataset_id é o PK de OmicDataset (necessário para o endpoint de resolução).
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        dataset_id:
+          type: integer
+          readOnly: true
+        accession:
+          type: string
+          readOnly: true
+        source_db:
+          type: string
+          readOnly: true
+        title:
+          type: string
+          readOnly: true
+        summary:
+          type: string
+          readOnly: true
+        omic_type:
+          type: string
+          readOnly: true
+        organism:
+          type: string
+          readOnly: true
+        n_samples:
+          type: integer
+          readOnly: true
+          nullable: true
+        has_control_group:
+          type: string
+          readOnly: true
+        has_control_group_score:
+          type: number
+          format: float
+          nullable: true
+          readOnly: true
+        curation_status:
+          allOf:
+          - $ref: '#/components/schemas/DatasetCurationStatusEnum'
+          readOnly: true
+        notes:
+          type: string
+          readOnly: true
+        added_at:
+          type: string
+          format: date-time
+          readOnly: true
+        curated_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+      required:
+      - accession
+      - added_at
+      - curated_at
+      - curation_status
+      - dataset_id
+      - has_control_group
+      - has_control_group_score
+      - id
+      - n_samples
+      - notes
+      - omic_type
+      - organism
+      - source_db
+      - summary
+      - title
+    CurationQueueResolve:
+      type: object
+      description: |-
+        Body da ação de resolução manual (POST /curation-queue/{id}/resolve/).
+
+        has_control_group: 'yes' ou 'no' (obrigatório — curador não pode resolver como unknown).
+        notes: notas do curador (opcional, auditável).
+      properties:
+        has_control_group:
+          allOf:
+          - $ref: '#/components/schemas/CurationQueueResolveHasControlGroupEnum'
+          description: |-
+            Classificação manual do curador. Aceita apenas "yes" ou "no" (not "unknown").
+
+            * `yes` - yes
+            * `no` - no
+        notes:
+          type: string
+          default: ''
+          description: Notas do curador sobre a decisão (auditável).
+          maxLength: 2000
+      required:
+      - has_control_group
+    CurationQueueResolveHasControlGroupEnum:
+      enum:
+      - 'yes'
+      - 'no'
+      type: string
+      description: |-
+        * `yes` - yes
+        * `no` - no
+    CurationQueueResolveResponse:
+      type: object
+      description: |-
+        Resposta após resolução bem-sucedida.
+        Reflete o estado atualizado do ProjectDataset.
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        dataset_id:
+          type: integer
+          readOnly: true
+        accession:
+          type: string
+          readOnly: true
+        has_control_group:
+          type: string
+          readOnly: true
+        has_control_group_score:
+          type: number
+          format: float
+          nullable: true
+          readOnly: true
+        notes:
+          type: string
+          readOnly: true
+        curated_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+      required:
+      - accession
+      - curated_at
+      - dataset_id
+      - has_control_group
+      - has_control_group_score
+      - id
+      - notes
     CurationStatusEnum:
       enum:
       - pending
@@ -2619,6 +2953,7 @@ components:
 
             * `monogenic` - Monogênica
             * `multifactorial` - Multifatorial
+            * `mixed` - Mista
             * `indeterminate` - Indeterminado
         is_single_cell:
           allOf:
@@ -2762,27 +3097,179 @@ components:
         * `downloading` - Baixando
         * `downloaded` - Baixado
         * `failed` - Falhou
+    DestinationEnum:
+      enum:
+      - server
+      - client
+      type: string
+      description: |-
+        * `server` - server
+        * `client` - client
     DiseaseAxisEnum:
       enum:
       - monogenic
       - multifactorial
+      - mixed
       - indeterminate
       type: string
       description: |-
         * `monogenic` - Monogênica
         * `multifactorial` - Multifatorial
+        * `mixed` - Mista
         * `indeterminate` - Indeterminado
+    DiseaseAxisQueueItem:
+      type: object
+      description: |-
+        Item da fila de curadoria de alto valor: ProjectDataset com disease_axis
+        'mixed' ou com discordância (monogenic_gene_hit presente e axis divergente).
+
+        O campo `queue_reason` é sintético: alimentado pela view a partir do atributo
+        `_queue_reason` que high_value_queue_queryset() anota em cada instância.
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        dataset_id:
+          type: integer
+          readOnly: true
+        accession:
+          type: string
+          readOnly: true
+        source_db:
+          type: string
+          readOnly: true
+        title:
+          type: string
+          readOnly: true
+        disease_axis:
+          type: string
+          readOnly: true
+        disease_axis_confidence:
+          type: object
+          nullable: true
+          description: 'Sub-dict de contract_confidence[disease_axis]: score (float),
+            method (str), n_candidates (int), axis_hits {monogenic, multifactorial}
+            com matched_name, matched_source, score, method.'
+          properties:
+            score:
+              type: number
+            method:
+              type: string
+            n_candidates:
+              type: integer
+            axis_hits:
+              type: object
+              properties:
+                monogenic:
+                  type: object
+                  properties:
+                    score:
+                      type: number
+                    method:
+                      type: string
+                    matched_name:
+                      type: string
+                    matched_source:
+                      type: string
+                multifactorial:
+                  type: object
+                  properties:
+                    score:
+                      type: number
+                    method:
+                      type: string
+                    matched_name:
+                      type: string
+                    matched_source:
+                      type: string
+          readOnly: true
+        monogenic_gene_hit:
+          type: object
+          nullable: true
+          description: 'Sinal de gene monogênico de extra_metadata[contract][monogenic_gene_hit].
+            Contém: genes (list[str]), confidence (float), gene_details (list[dict]).
+            None se o dataset não passou pelo classificador de gene hit ou não houve
+            hit.'
+          properties:
+            genes:
+              type: array
+              items:
+                type: string
+            confidence:
+              type: number
+            gene_details:
+              type: array
+              items:
+                type: object
+                properties:
+                  gene_symbol:
+                    type: string
+                  score:
+                    type: number
+                  sources:
+                    type: array
+                    items:
+                      type: string
+                  mendelian_confidence:
+                    type: string
+          readOnly: true
+        queue_reason:
+          allOf:
+          - $ref: '#/components/schemas/QueueReasonEnum'
+          description: '''mixed'': disease_axis == ''mixed'' (âncora mono + multi
+            detectadas). ''discordance'': monogenic_gene_hit presente mas disease_axis
+            fora de {monogenic, mixed} — sinal de gene sugere monogênico mas texto
+            não confirmou.'
+          readOnly: true
+        curation_status:
+          allOf:
+          - $ref: '#/components/schemas/DatasetCurationStatusEnum'
+          readOnly: true
+        notes:
+          type: string
+          readOnly: true
+        added_at:
+          type: string
+          format: date-time
+          readOnly: true
+        curated_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+      required:
+      - accession
+      - added_at
+      - curated_at
+      - curation_status
+      - dataset_id
+      - disease_axis
+      - disease_axis_confidence
+      - id
+      - monogenic_gene_hit
+      - notes
+      - queue_reason
+      - source_db
+      - title
     DownloadDispatchRequest:
       type: object
       description: |-
         Body do POST .../download/.
 
-        Ambos os campos são opcionais:
-        - `file_kind`: se omitido, a view deriva por source_db do dataset
-          (geo → geo_supplementary; sra → fastq).
+        Campos obrigatórios/opcionais:
+        - `file_kind`: se omitido, derivado de source_db do dataset.
         - `confirm`: obrigatório apenas para file_kind='fastq' (F2, GB–TB).
-          Sem confirm=true, o serviço retorna HTTP 400 com prévia de quota.
-          Ignorado para GEO supplementary (F1).
+        - `scope`: escopo de amostras a baixar (MVP-A):
+            - 'all' (padrão): todas as runs do dataset (comportamento original).
+            - 'included': apenas amostras com ProjectSample.curation_status='included'
+              no projeto do usuário autenticado.
+            - 'manual': exatamente os OmicSample ids informados em sample_ids.
+            ('filter' é Inc-2 — não implementado neste MVP.)
+        - `sample_ids`: lista de OmicSample.id; obrigatório se scope='manual'.
+          Cada id é validado contra ProjectSample do projeto do user
+          (firebase-auth-guard / Regra #3 — ids de outro projeto → 403/404).
+        - `destination`: destino do download; 'server' (padrão) já implementado;
+          'client' será implementado no Inc-1 — retorna 400 neste MVP.
 
         Campos NUNCA expostos: nenhum dado sensível — só intenção do usuário.
       properties:
@@ -2802,6 +3289,37 @@ components:
           description: Confirmação explícita obrigatória para file_kind='fastq' (F2).
             Sem confirm=true, retorna HTTP 400 com prévia de uso da quota. Ignorado
             para GEO supplementary.
+        scope:
+          allOf:
+          - $ref: '#/components/schemas/ScopeEnum'
+          default: all
+          description: |-
+            Escopo de amostras a baixar: 'all' (padrão) = todas as runs do dataset; 'included' = só amostras com curation_status='included' no projeto; 'manual' = exatamente os ids em sample_ids.
+
+            * `all` - all
+            * `included` - included
+            * `manual` - manual
+        sample_ids:
+          type: array
+          items:
+            type: integer
+            minimum: 1
+          nullable: true
+          description: 'Lista de ProjectSample.id para scope=''manual'' — mesmo padrão
+            de id exposto por ProjectSampleListSerializer e usado em bulk_curate de
+            samples. Obrigatório quando scope=''manual''. A view valida pertencimento
+            ao projeto/dataset do usuário autenticado e resolve internamente para
+            OmicSample.id antes de repassar ao Rust — ids de outro projeto resultam
+            em 404 (firebase-auth-guard, Regra #3).'
+        destination:
+          allOf:
+          - $ref: '#/components/schemas/DestinationEnum'
+          default: server
+          description: |-
+            Destino do download: 'server' (padrão) = enfileira job Celery, salva no object storage. 'client' = Inc-1, não implementado neste MVP (retorna HTTP 400).
+
+            * `server` - server
+            * `client` - client
     DownloadDispatchResponse:
       type: object
       description: Resposta do POST .../download/ — retorna o IngestionJob criado/ativo.
@@ -3155,6 +3673,7 @@ components:
       - geo_search
       - sra_search
       - gwas_search
+      - pride_search
       - sample_fetch
       - variant_annotation
       - gene_ner
@@ -3162,6 +3681,7 @@ components:
       - context_extraction
       - geo_supplementary_download
       - fastq_download
+      - sra_resolution
       type: string
       description: |-
         * `pubmed_search` - Busca PubMed
@@ -3169,6 +3689,7 @@ components:
         * `geo_search` - Busca GEO
         * `sra_search` - Busca SRA
         * `gwas_search` - Busca GWAS Catalog
+        * `pride_search` - Busca PRIDE
         * `sample_fetch` - Fetch de Amostras
         * `variant_annotation` - Anotação de Variantes
         * `gene_ner` - Extração de Genes
@@ -3176,6 +3697,7 @@ components:
         * `context_extraction` - Extração de Contextos
         * `geo_supplementary_download` - Download Suplementar GEO
         * `fastq_download` - Download FASTQ
+        * `sra_resolution` - Resolução GSM→SRR (GEO→SRA)
     LinkedDatasetBrief:
       type: object
       description: |-
@@ -3713,6 +4235,29 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ClinicalCategory'
+    PaginatedCurationQueueItemList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/CurationQueueItem'
     PaginatedDaVinciProjectList:
       type: object
       required:
@@ -3759,6 +4304,29 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/DatasetFile'
+    PaginatedDiseaseAxisQueueItemList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/DiseaseAxisQueueItem'
     PaginatedIngestionJobList:
       type: object
       required:
@@ -4604,12 +5172,16 @@ components:
           items:
             $ref: '#/components/schemas/LinkedPaperBrief'
           readOnly: true
+        sra_resolved:
+          type: boolean
+          readOnly: true
       required:
       - added_at
       - curated_at
       - dataset
       - id
       - linked_papers
+      - sra_resolved
     ProjectDatasetList:
       type: object
       description: Compact list — includes summary and platform for the detail panel.
@@ -4694,6 +5266,9 @@ components:
           items:
             type: string
           readOnly: true
+        sra_resolved:
+          type: boolean
+          readOnly: true
       required:
       - access_type
       - accession
@@ -4713,6 +5288,7 @@ components:
       - organism
       - platform
       - source_db
+      - sra_resolved
       - summary
       - title
     ProjectDrugDetail:
@@ -5564,6 +6140,11 @@ components:
       - rs_number
       - unique_citations_included
       - unique_citations_total
+    QueueReasonEnum:
+      type: string
+      enum:
+      - mixed
+      - discordance
     SampleBulkCurateRequest:
       type: object
       description: Body de bulk_curate de samples.
@@ -5590,6 +6171,16 @@ components:
       required:
       - curation_status
       - sample_ids
+    ScopeEnum:
+      enum:
+      - all
+      - included
+      - manual
+      type: string
+      description: |-
+        * `all` - all
+        * `included` - included
+        * `manual` - manual
     SearchPreviewRequest:
       type: object
       description: Body de POST /projects/{id}/search/preview/
@@ -5636,6 +6227,47 @@ components:
         * `geo_ftp` - GEO FTP (NCBI)
         * `ena_ftp` - ENA FTP
         * `sra_tools` - sra-tools
+    SraResolutionResponse:
+      type: object
+      description: |-
+        Resposta do POST .../resolve-sra/ — retorna o IngestionJob de resolução GSM→SRR.
+
+        O job pode ser monitorado via GET /projects/{project_pk}/jobs/{id}/.
+        Campos NUNCA expostos: db_url, ncbi_api_key (sensitive-data-handling).
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        job_type:
+          allOf:
+          - $ref: '#/components/schemas/JobTypeEnum'
+          readOnly: true
+        status:
+          allOf:
+          - $ref: '#/components/schemas/IngestionJobStatusEnum'
+          readOnly: true
+        records_processed:
+          type: integer
+          readOnly: true
+        records_inserted:
+          type: integer
+          readOnly: true
+        error_message:
+          type: string
+          readOnly: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - created_at
+      - error_message
+      - id
+      - job_type
+      - records_inserted
+      - records_processed
+      - status
     SuggestionTypeEnum:
       enum:
       - dataset_missing

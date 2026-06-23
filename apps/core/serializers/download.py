@@ -89,17 +89,27 @@ class DownloadDispatchRequestSerializer(serializers.Serializer):
     """
     Body do POST .../download/.
 
-    Ambos os campos são opcionais:
-    - `file_kind`: se omitido, a view deriva por source_db do dataset
-      (geo → geo_supplementary; sra → fastq).
+    Campos obrigatórios/opcionais:
+    - `file_kind`: se omitido, derivado de source_db do dataset.
     - `confirm`: obrigatório apenas para file_kind='fastq' (F2, GB–TB).
-      Sem confirm=true, o serviço retorna HTTP 400 com prévia de quota.
-      Ignorado para GEO supplementary (F1).
+    - `scope`: escopo de amostras a baixar (MVP-A):
+        - 'all' (padrão): todas as runs do dataset (comportamento original).
+        - 'included': apenas amostras com ProjectSample.curation_status='included'
+          no projeto do usuário autenticado.
+        - 'manual': exatamente os OmicSample ids informados em sample_ids.
+        ('filter' é Inc-2 — não implementado neste MVP.)
+    - `sample_ids`: lista de OmicSample.id; obrigatório se scope='manual'.
+      Cada id é validado contra ProjectSample do projeto do user
+      (firebase-auth-guard / Regra #3 — ids de outro projeto → 403/404).
+    - `destination`: destino do download; 'server' (padrão) já implementado;
+      'client' será implementado no Inc-1 — retorna 400 neste MVP.
 
     Campos NUNCA expostos: nenhum dado sensível — só intenção do usuário.
     """
 
     FILE_KIND_CHOICES = ['geo_supplementary', 'fastq']
+    SCOPE_CHOICES = ['all', 'included', 'manual']
+    DESTINATION_CHOICES = ['server', 'client']
 
     file_kind = serializers.ChoiceField(
         choices=FILE_KIND_CHOICES,
@@ -120,6 +130,59 @@ class DownloadDispatchRequestSerializer(serializers.Serializer):
             "Ignorado para GEO supplementary."
         ),
     )
+    scope = serializers.ChoiceField(
+        choices=SCOPE_CHOICES,
+        required=False,
+        default='all',
+        help_text=(
+            "Escopo de amostras a baixar: "
+            "'all' (padrão) = todas as runs do dataset; "
+            "'included' = só amostras com curation_status='included' no projeto; "
+            "'manual' = exatamente os ids em sample_ids."
+        ),
+    )
+    sample_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        required=False,
+        allow_null=True,
+        default=None,
+        help_text=(
+            "Lista de ProjectSample.id para scope='manual' — mesmo padrão de id "
+            "exposto por ProjectSampleListSerializer e usado em bulk_curate de samples. "
+            "Obrigatório quando scope='manual'. "
+            "A view valida pertencimento ao projeto/dataset do usuário autenticado e "
+            "resolve internamente para OmicSample.id antes de repassar ao Rust — "
+            "ids de outro projeto resultam em 404 (firebase-auth-guard, Regra #3)."
+        ),
+    )
+    destination = serializers.ChoiceField(
+        choices=DESTINATION_CHOICES,
+        required=False,
+        default='server',
+        help_text=(
+            "Destino do download: "
+            "'server' (padrão) = enfileira job Celery, salva no object storage. "
+            "'client' = Inc-1, não implementado neste MVP (retorna HTTP 400)."
+        ),
+    )
+
+    def validate(self, attrs):
+        """Validações cross-field do body de download."""
+        scope = attrs.get('scope', 'all')
+        sample_ids = attrs.get('sample_ids')
+        destination = attrs.get('destination', 'server')
+
+        if scope == 'manual' and not sample_ids:
+            raise serializers.ValidationError(
+                {'sample_ids': "sample_ids é obrigatório quando scope='manual'."}
+            )
+
+        if destination == 'client':
+            raise serializers.ValidationError(
+                {'destination': "destination='client' não está implementado neste MVP (Inc-1)."}
+            )
+
+        return attrs
 
 
 class DownloadQuotaPreviewSerializer(serializers.Serializer):
@@ -146,6 +209,28 @@ class DownloadQuotaPreviewSerializer(serializers.Serializer):
 
 class DownloadDispatchResponseSerializer(serializers.ModelSerializer):
     """Resposta do POST .../download/ — retorna o IngestionJob criado/ativo."""
+
+    class Meta:
+        model = IngestionJob
+        fields = [
+            'id',
+            'job_type',
+            'status',
+            'records_processed',
+            'records_inserted',
+            'error_message',
+            'created_at',
+        ]
+        read_only_fields = fields
+
+
+class SraResolutionResponseSerializer(serializers.ModelSerializer):
+    """
+    Resposta do POST .../resolve-sra/ — retorna o IngestionJob de resolução GSM→SRR.
+
+    O job pode ser monitorado via GET /projects/{project_pk}/jobs/{id}/.
+    Campos NUNCA expostos: db_url, ncbi_api_key (sensitive-data-handling).
+    """
 
     class Meta:
         model = IngestionJob

@@ -37,6 +37,15 @@ export type DownloadQuotaPreview = components['schemas']['DownloadQuotaPreview']
 // PaginatedDatasetFileList: lista paginada de DatasetFile
 export type PaginatedDatasetFileList = components['schemas']['PaginatedDatasetFileList'];
 
+// SraResolutionResponse: resposta do POST .../resolve-sra/ (202 com IngestionJob criado)
+export type SraResolutionResponse = components['schemas']['SraResolutionResponse'];
+
+// ScopeEnum: escopo de amostras para download ('all' | 'included' | 'manual')
+export type ScopeEnum = components['schemas']['ScopeEnum'];
+
+// DestinationEnum: destino do download ('server' | 'client')
+export type DestinationEnum = components['schemas']['DestinationEnum'];
+
 // Filtros de listagem (parâmetros de query — não gerados pelo OpenAPI)
 export interface DatasetFilters {
   curation_status?: string;

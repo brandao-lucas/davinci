@@ -201,6 +201,9 @@ SPECTACULAR_SETTINGS = {
         # (pending, failed) → sem override drf-spectacular gera "Status2faEnum".
         'IngestionJobStatusEnum': 'apps.core.models.IngestionJob.JobStatus',
         'DatasetFileDownloadStatusEnum': 'apps.core.models.DatasetFile.DownloadStatus',
+        # OmicDataset.has_control_group aparece em múltiplos serializers com choices
+        # idênticas (yes/no/unknown) → colisão de hash → override para nome canônico.
+        'HasControlGroupEnum': 'apps.core.models.OmicDataset.ControlGroup',
     },
 }
 

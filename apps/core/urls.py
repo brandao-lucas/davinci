@@ -34,6 +34,7 @@ dataset_bulk_curate = ProjectDatasetViewSet.as_view({'post': 'bulk_curate'})
 dataset_search = ProjectDatasetViewSet.as_view({'get': 'search'})
 dataset_add_from_suggestion = ProjectDatasetViewSet.as_view({'post': 'add_from_suggestion'})
 dataset_download = ProjectDatasetViewSet.as_view({'post': 'download'})
+dataset_resolve_sra = ProjectDatasetViewSet.as_view({'post': 'resolve_sra'})
 dataset_files = ProjectDatasetViewSet.as_view({'get': 'files'})
 dataset_file_content = ProjectDatasetViewSet.as_view({'get': 'file_content'})
 
@@ -102,6 +103,7 @@ urlpatterns = [
     path(f'{PROJECT_PREFIX}datasets/<int:pk>/files/<int:file_id>/content/', dataset_file_content, name='project-dataset-file-content'),
     path(f'{PROJECT_PREFIX}datasets/<int:pk>/files/', dataset_files, name='project-dataset-files'),
     path(f'{PROJECT_PREFIX}datasets/<int:pk>/download/', dataset_download, name='project-dataset-download'),
+    path(f'{PROJECT_PREFIX}datasets/<int:pk>/resolve-sra/', dataset_resolve_sra, name='project-dataset-resolve-sra'),
 
     # Samples por dataset — para a página de samples de um dataset específico (Op 4.4)
     path(

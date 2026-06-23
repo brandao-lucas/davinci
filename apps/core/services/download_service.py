@@ -17,8 +17,20 @@ Confirmação explícita (passo 7 — F2):
   - Sem confirm, dispatch levanta FastqConfirmRequiredError com prévia de uso.
   - GEO não precisa de confirm.
 
+Seleção de amostras (MVP-A — passo 2):
+  - scope='all'     → sample_ids=None  → Rust filtra por dataset_id (comportamento original).
+  - scope='included'→ view resolve ProjectSample included → passa lista de OmicSample.id.
+  - scope='manual'  → view valida cada id contra ProjectSample do projeto → passa a lista.
+  - sample_ids é registrado em IngestionJob.parameters para auditoria do job.
+  - Idempotência: job ativo com mesmo dataset+kind+scope+sample_ids retorna existente.
+    Se escopo diferir (mesmo dataset, escopo maior/menor), um novo job é criado
+    — a escolha mais simples e rastreável; jobs duplicados de escopos diferentes
+    ficam visíveis no histórico de jobs.
+
 Isolamento (firebase-auth-guard / Regra #3):
   - A soma de quota é calculada sobre DatasetFile do projeto do usuário.
+  - sample_ids são validados na VIEW contra ProjectSample do projeto — nunca resolve
+    ids fora do escopo do projeto autenticado.
   - Jamais cruzar projetos de usuários distintos.
   - NUNCA logar os valores de credenciais (sensitive-data-handling).
 """
@@ -31,7 +43,7 @@ from django.conf import settings
 from django.db import transaction
 from django.db.models import Q, Sum
 
-from apps.core.models import DatasetFile, DaVinciProject, IngestionJob, OmicDataset, ProjectDataset
+from apps.core.models import DatasetFile, DaVinciProject, IngestionJob, OmicDataset
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +102,15 @@ class DownloadService:
         file_kind: str = 'geo_supplementary',
         user=None,
         confirm: bool = False,
+        scope: str = 'all',
+        sample_ids: list[int] | None = None,
     ) -> IngestionJob:
         """
         Enfileira download de arquivos para um dataset ômico.
 
-        Guarda de idempotência: não cria job se já houver job do tipo
-        correspondente em status pending/running para o mesmo dataset+projeto.
+        Idempotência (D3): verifica job ativo com mesmo dataset+projeto+kind+scope+sample_ids.
+        Escopos diferentes do mesmo dataset geram jobs distintos e ficam rastreáveis
+        no histórico — escolha mais simples e auditável que bloquear qualquer job ativo.
 
         Args:
             project: DaVinciProject do usuário autenticado.
@@ -107,6 +122,12 @@ class DownloadService:
             confirm: Confirmação explícita obrigatória para file_kind='fastq'.
                      Sem confirm=True, lança FastqConfirmRequiredError com
                      prévia de uso da quota.  Ignorado para GEO.
+            scope: Escopo de amostras — 'all' (padrão), 'included' ou 'manual'.
+                   Registrado em IngestionJob.parameters para auditoria.
+            sample_ids: Lista de OmicSample.id a baixar (scope='included'/'manual').
+                        None significa todas as runs (scope='all').
+                        Validação de isolamento cross-project feita na VIEW antes
+                        de chegar aqui (firebase-auth-guard / Regra #3).
 
         Returns:
             IngestionJob criado (ou job ativo existente, se idempotência ativa).
@@ -144,18 +165,33 @@ class DownloadService:
                     quota_bytes=quota_bytes,
                 )
 
-        # ── Idempotência: não duplicar job ativo para mesmo dataset+projeto+kind ──
-        existing = IngestionJob.objects.filter(
+        # ── Idempotência: não duplicar job ativo para mesmo dataset+projeto+kind+scope ──
+        # sample_ids normalizados para comparação: None para 'all', lista ordenada para
+        # 'included'/'manual'. Isso garante que a mesma seleção não dispara dois jobs.
+        normalized_ids = sorted(sample_ids) if sample_ids is not None else None
+        existing_filter = IngestionJob.objects.filter(
             project=project,
             job_type=job_type,
             status__in=[IngestionJob.JobStatus.PENDING, IngestionJob.JobStatus.RUNNING],
             parameters__dataset_id=dataset.id,
-        ).first()
+            parameters__scope=scope,
+        )
+        # Para scope='all' (sample_ids=None) o job é gravado com {"sample_ids": null} no JSONB.
+        # parameters__sample_ids=None gera `= 'null'::jsonb` — compara com o literal JSON null,
+        # que é o valor correto. NÃO usar __isnull=True: o operador `->' devolve o literal
+        # JSON `null` (não SQL NULL), então IS NULL seria sempre FALSE → idempotência quebrada.
+        if normalized_ids is None:
+            existing_filter = existing_filter.filter(parameters__sample_ids=None)
+        else:
+            existing_filter = existing_filter.filter(parameters__sample_ids=normalized_ids)
+
+        existing = existing_filter.first()
         if existing:
             logger.info(
-                '%s já ativo (job %s) para projeto %s / dataset %s — dispatch ignorado (idempotência)',
+                '%s já ativo (job %s, scope=%s) para projeto %s / dataset %s — dispatch ignorado (idempotência)',
                 job_type,
                 existing.id,
+                scope,
                 project.id,
                 dataset.accession,
             )
@@ -171,16 +207,122 @@ class DownloadService:
                     'dataset_accession': dataset.accession,
                     'source_db': dataset.source_db,
                     'file_kind': file_kind,
+                    'scope': scope,
+                    # sample_ids registrado para auditoria; None = todas as runs
+                    'sample_ids': normalized_ids,
                     # ncbi_api_key NÃO é armazenado aqui — obtido pela task
                     # a partir de user.profile e settings (sensitive-data-handling)
                 },
             )
 
         try:
-            run_omics_download.delay(str(project.id), dataset.id, file_kind)
+            run_omics_download.delay(
+                str(project.id),
+                dataset.id,
+                file_kind,
+                sample_ids=normalized_ids,
+            )
             logger.info(
-                '%s disparado (job %s) para projeto %s / dataset %s',
+                '%s disparado (job %s, scope=%s) para projeto %s / dataset %s',
                 job_type,
+                job.id,
+                scope,
+                project.id,
+                dataset.accession,
+            )
+        except Exception as exc:
+            IngestionJob.objects.filter(id=job.id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=f'Failed to dispatch Celery task: {exc}',
+            )
+            raise
+
+        return job
+
+
+class SraResolutionService:
+    """
+    Serviço de dispatch para resolução GSM→SRR em datasets GEO (MVP-B).
+
+    Orquestra a task `run_sra_resolution` que chama
+    `rust_engine.resolve_sra_runs_for_dataset`.
+
+    A resolução lê `OmicSample.extra_metadata['relation']` de cada GSM do
+    dataset, extrai o SRX correspondente, resolve SRX→SRR via ENA e grava
+    os SRR em `OmicSample.extra_metadata['sra_runs']`.
+
+    Sem migration nova (D1 aprovado): usa extra_metadata (JSONField existente).
+
+    Isolamento (firebase-auth-guard / Regra #3):
+      - dataset validado via ProjectDataset do projeto do usuário na view.
+      - ncbi_api_key NUNCA armazenado em IngestionJob.parameters.
+    """
+
+    @staticmethod
+    def dispatch_resolution(
+        project: DaVinciProject,
+        dataset: OmicDataset,
+        user=None,  # noqa: ARG002 — reservado; a task obtém ncbi_api_key via project.user
+    ) -> IngestionJob:
+        """
+        Enfileira resolução SRA para um dataset GEO.
+
+        Idempotência: não cria job se já houver SRA_RESOLUTION pending/running
+        para o mesmo dataset+projeto.
+
+        Args:
+            project: DaVinciProject do usuário autenticado.
+            dataset: OmicDataset GEO alvo (source_db='geo').
+            user: User autenticado (para log; ncbi_api_key obtido pela task).
+
+        Returns:
+            IngestionJob criado (ou existente ativo).
+
+        Raises:
+            ValueError: dataset não é GEO.
+        """
+        from apps.core.tasks.ingestion_tasks import run_sra_resolution
+
+        if dataset.source_db != 'geo':
+            raise ValueError(
+                f"Resolução SRA é válida apenas para source_db='geo'; "
+                f"dataset {dataset.accession!r} é source_db={dataset.source_db!r}."
+            )
+
+        job_type = IngestionJob.JobType.SRA_RESOLUTION
+
+        existing = IngestionJob.objects.filter(
+            project=project,
+            job_type=job_type,
+            status__in=[IngestionJob.JobStatus.PENDING, IngestionJob.JobStatus.RUNNING],
+            parameters__dataset_id=dataset.id,
+        ).first()
+        if existing:
+            logger.info(
+                'SRA_RESOLUTION já ativo (job %s) para projeto %s / dataset %s — dispatch ignorado (idempotência)',
+                existing.id,
+                project.id,
+                dataset.accession,
+            )
+            return existing
+
+        with transaction.atomic():
+            job = IngestionJob.objects.create(
+                project=project,
+                job_type=job_type,
+                status=IngestionJob.JobStatus.PENDING,
+                parameters={
+                    'dataset_id': dataset.id,
+                    'dataset_accession': dataset.accession,
+                    'source_db': dataset.source_db,
+                    # ncbi_api_key NÃO é armazenado aqui (sensitive-data-handling)
+                },
+            )
+
+        try:
+            run_sra_resolution.delay(str(project.id), dataset.id)
+            logger.info(
+                'SRA_RESOLUTION disparado (job %s) para projeto %s / dataset %s',
                 job.id,
                 project.id,
                 dataset.accession,
