@@ -36,6 +36,7 @@ dataset_add_from_suggestion = ProjectDatasetViewSet.as_view({'post': 'add_from_s
 dataset_download = ProjectDatasetViewSet.as_view({'post': 'download'})
 dataset_download_batch = ProjectDatasetViewSet.as_view({'post': 'download_batch'})
 dataset_resolve_sra = ProjectDatasetViewSet.as_view({'post': 'resolve_sra'})
+dataset_export = ProjectDatasetViewSet.as_view({'get': 'export'})
 dataset_files = ProjectDatasetViewSet.as_view({'get': 'files'})
 dataset_file_content = ProjectDatasetViewSet.as_view({'get': 'file_content'})
 
@@ -96,8 +97,10 @@ urlpatterns = [
     path(f'{PROJECT_PREFIX}datasets/', dataset_list, name='project-dataset-list'),
     path(f'{PROJECT_PREFIX}datasets/search/', dataset_search, name='project-dataset-search'),
     path(f'{PROJECT_PREFIX}datasets/bulk_curate/', dataset_bulk_curate, name='project-dataset-bulk-curate'),
-    # add_from_suggestion deve vir antes de <int:pk>/ para não ser capturada como pk
+    # add_from_suggestion e export devem vir antes de <int:pk>/ para não serem capturadas como pk
     path(f'{PROJECT_PREFIX}datasets/add_from_suggestion/', dataset_add_from_suggestion, name='project-dataset-add-from-suggestion'),
+    # Export — Fase 4 OmnisPathway; detail=False, antes de <int:pk>/ (R7 do plano)
+    path(f'{PROJECT_PREFIX}datasets/export/', dataset_export, name='project-dataset-export'),
     path(f'{PROJECT_PREFIX}datasets/<int:pk>/', dataset_detail, name='project-dataset-detail'),
     # Download — ações sob um dataset específico; rotas de arquivo antes de <int:pk>/
     # file_content deve vir antes de files/ para que o regex não fique ambíguo

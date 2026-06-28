@@ -1280,6 +1280,151 @@ paths:
           description: ''
         '404':
           description: No response body
+  /api/v1/projects/{project_pk}/datasets/export/:
+    get:
+      operationId: projects_datasets_export_list
+      description: |-
+        Entrega ponteiros + metadados + filtros do contrato §2 para todos os datasets do projeto que passam nos filtros especificados. **Nunca entrega matriz numérica** — matrix_pointer é sempre um ponteiro (URL/path/accession).
+
+        Datasets com access_type='controlled' são marcados via access_controlled=True.
+
+        **Formatos:**
+        - `?export_format=json` (default): paginado (page_size=50, max=200), envelope DRF {count, next, previous, results} + bloco de proveniência no campo `provenance`.
+        - `?export_format=csv`: StreamingHttpResponse sem paginação (dump completo), ordem de colunas fixa, campos multi-valor achatados com ';'.
+
+        **Determinismo:** ordenado por accession. Mesma entrada → mesmo corpo.
+
+        **Proveniência (JSON):** timestamp UTC, snapshot_version (?version=, default 'live'), versão das regras de classificação (Fases 2/3 OmnisPathway).
+
+        Isolamento por usuário: apenas datasets do projeto do usuário autenticado (404 se projeto não pertence ao user).
+      summary: Exportar catálogo de datasets do projeto (JSON paginado ou CSV stream)
+      parameters:
+      - in: query
+        name: access_type
+        schema:
+          type: string
+        description: public/controlled/unknown
+      - in: query
+        name: data_format
+        schema:
+          type: string
+        description: raw/processed/unknown — match exato em dataset__data_format.
+      - in: query
+        name: disease_axis
+        schema:
+          type: string
+        description: monogenic/multifactorial/mixed/indeterminate
+      - in: query
+        name: disease_axis_confidence_min
+        schema:
+          type: number
+          format: float
+        description: Score mínimo de confiança para disease_axis.
+      - in: query
+        name: export_format
+        schema:
+          type: string
+        description: '''json'' (default, paginado) ou ''csv'' (stream completo). Não
+          use ''format'' — é reservado pelo DRF para negociação de conteúdo.'
+      - in: query
+        name: gene
+        schema:
+          type: string
+        description: Filtrar por gene_symbol (case-insensitive).
+      - in: query
+        name: has_control_group
+        schema:
+          type: string
+        description: yes/no/unknown
+      - in: query
+        name: has_control_group_confidence_min
+        schema:
+          type: number
+          format: float
+        description: Score mínimo de confiança para has_control_group.
+      - in: query
+        name: has_sample_join_key
+        schema:
+          type: boolean
+        description: True para datasets com sample_join_key preenchido.
+      - in: query
+        name: is_single_cell
+        schema:
+          type: string
+        description: single_cell/bulk/unknown — match exato em dataset__is_single_cell.
+      - in: query
+        name: is_single_cell_confidence_min
+        schema:
+          type: number
+          format: float
+        description: Score mínimo de confiança para is_single_cell.
+      - in: query
+        name: monogenic_gene_hit
+        schema:
+          type: boolean
+        description: True para datasets com monogenic_gene_hit presente.
+      - in: query
+        name: omics_count_max
+        schema:
+          type: integer
+        description: Número máximo de camadas ômicas.
+      - in: query
+        name: omics_count_min
+        schema:
+          type: integer
+        description: Número mínimo de camadas ômicas.
+      - in: query
+        name: omics_layer
+        schema:
+          type: string
+        description: Camada ômica (containment).
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - in: path
+        name: project_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: query
+        name: sample_join_key_confidence_min
+        schema:
+          type: number
+          format: float
+        description: Score mínimo de confiança para sample_join_key.
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      - in: query
+        name: version
+        schema:
+          type: string
+        description: 'Versão do snapshot (default: ''live'').'
+      tags:
+      - projects
+      security:
+      - FirebaseAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedDatasetExportItemList'
+          description: ''
   /api/v1/projects/{project_pk}/datasets/search/:
     get:
       operationId: projects_datasets_search_list
@@ -3297,6 +3442,34 @@ components:
         has_sample_join_key:
           type: boolean
           description: True para retornar apenas datasets com sample_join_key preenchido.
+        disease_axis_confidence_min:
+          type: number
+          format: double
+          description: Score mínimo de confiança para disease_axis (0.0–1.0). Datasets
+            sem a chave em contract_confidence não passam.
+        has_control_group_confidence_min:
+          type: number
+          format: double
+          description: Score mínimo de confiança para has_control_group (0.0–1.0).
+            Datasets sem a chave em contract_confidence não passam.
+        is_single_cell_confidence_min:
+          type: number
+          format: double
+          description: Score mínimo de confiança para is_single_cell (0.0–1.0). Datasets
+            sem a chave em contract_confidence não passam.
+        sample_join_key_confidence_min:
+          type: number
+          format: double
+          description: Score mínimo de confiança para sample_join_key (0.0–1.0). Datasets
+            sem a chave em contract_confidence não passam.
+        gene:
+          type: string
+          description: 'Filtrar datasets que possuem DatasetGene com gene_symbol igual
+            ao valor fornecido (case-insensitive). Ex: ''BRCA1''.'
+        monogenic_gene_hit:
+          type: boolean
+          description: True para retornar apenas datasets com monogenic_gene_hit presente
+            em extra_metadata['contract'] (calculado pela Fase 3).
     DatasetCurationStatusEnum:
       enum:
       - pending
@@ -3311,6 +3484,151 @@ components:
         * `excluded` - Excluído
         * `queued` - Na Fila de Download
         * `downloaded` - Baixado
+    DatasetExportItem:
+      type: object
+      description: |-
+        Item do export de descoberta: ProjectDataset com campos do contrato §2.
+
+        Shape entregue:
+          Estruturais: accession, source_db, omics_layers, omics_count, is_single_cell,
+                       has_control_group, disease_axis, data_format, access_type, sample_join_key.
+          Confiança: contract_confidence (dict por eixo).
+          Sub-objeto contract (allowlist): matrix_pointer, proteomics_modality, tissue_raw,
+                       disease_raw, ref_pmids, ref_dois, monogenic_gene_hit.
+          Derivados: access_controlled (bool), snapshot_version (str de context).
+      properties:
+        accession:
+          type: string
+          readOnly: true
+        source_db:
+          type: string
+          readOnly: true
+        omics_layers:
+          type: array
+          items:
+            type: string
+          readOnly: true
+        omics_count:
+          type: integer
+          readOnly: true
+          nullable: true
+        is_single_cell:
+          type: string
+          readOnly: true
+        has_control_group:
+          type: string
+          readOnly: true
+        disease_axis:
+          type: string
+          readOnly: true
+        data_format:
+          type: string
+          readOnly: true
+        access_type:
+          type: string
+          readOnly: true
+        sample_join_key:
+          type: array
+          items:
+            type: string
+          readOnly: true
+        contract_confidence:
+          type: object
+          nullable: true
+          description: 'Dict de confiança por eixo do contrato. Chaves possíveis:
+            disease_axis, has_control_group, is_single_cell, sample_join_key. Ausência
+            de chave = classificador ainda não rodou para o eixo. Valores são float
+            0.0–1.0 (exceto disease_axis que pode ser sub-objeto).'
+          additionalProperties: true
+          readOnly: true
+        contract:
+          type: object
+          nullable: true
+          description: 'Sub-objeto de extra_metadata["contract"] com allowlist explícita
+            de campos. Chaves expostas: matrix_pointer (ponteiro, nunca conteúdo),
+            proteomics_modality, tissue_raw (list), disease_raw (list), ref_pmids
+            (list[int]), ref_dois (list[str]), monogenic_gene_hit (objeto com genes/confidence/gene_details).
+            Ausência de extra_metadata["contract"] retorna null.'
+          properties:
+            matrix_pointer:
+              type: string
+              nullable: true
+              description: Ponteiro (URL FTP, path S3 ou accession) — nunca conteúdo
+                numérico.
+            proteomics_modality:
+              type: string
+              nullable: true
+              enum:
+              - phospho
+              - global
+              - null
+            tissue_raw:
+              type: array
+              items:
+                type: string
+              nullable: true
+              description: Nomes brutos de tecidos declarados na fonte (PRIDE).
+            disease_raw:
+              type: array
+              items:
+                type: string
+              nullable: true
+              description: Nomes brutos de doenças declarados na fonte (PRIDE). Insumo
+                da Fase 3.
+            ref_pmids:
+              type: array
+              items:
+                type: integer
+              nullable: true
+            ref_dois:
+              type: array
+              items:
+                type: string
+              nullable: true
+            monogenic_gene_hit:
+              type: object
+              nullable: true
+              properties:
+                genes:
+                  type: array
+                  items:
+                    type: string
+                confidence:
+                  type: number
+                gene_details:
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: true
+          readOnly: true
+        access_controlled:
+          type: boolean
+          description: 'True quando access_type == "controlled" (ex: dbGaP, EGA).
+            matrix_pointer presente nestes datasets é ponteiro de acesso controlado
+            — o carregamento real requer credenciais/aprovação de acesso (Objetivo
+            2).'
+          readOnly: true
+        snapshot_version:
+          type: string
+          description: Versão do snapshot em que este item foi incluído. "live" indica
+            consulta ao vivo sem versionamento. Injetado via context["snapshot_version"]
+            pela view ou command.
+          readOnly: true
+      required:
+      - access_controlled
+      - access_type
+      - accession
+      - contract
+      - contract_confidence
+      - data_format
+      - disease_axis
+      - has_control_group
+      - is_single_cell
+      - omics_count
+      - omics_layers
+      - sample_join_key
+      - snapshot_version
+      - source_db
     DatasetFile:
       type: object
       description: |-
@@ -4709,6 +5027,29 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/DaVinciProject'
+    PaginatedDatasetExportItemList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/DatasetExportItem'
     PaginatedDatasetFileList:
       type: object
       required:

@@ -1,12 +1,15 @@
+import csv
+import io
 import logging
 
 from django.contrib.postgres.search import SearchQuery
 from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiTypes
 from rest_framework import mixins, viewsets, status
 from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 
 from apps.core.models import (
@@ -46,6 +49,19 @@ def apply_dataset_filters(queryset, params):
       omics_count_max    — dataset__omics_count <= valor (int)
       omics_layer        — dataset__omics_layers contains [valor] (containment)
       has_sample_join_key — 'true' → dataset__sample_join_key não vazio
+      --- Filtros de descoberta (Fase 4 OmnisPathway) ---
+      disease_axis_confidence_min       — contract_confidence['disease_axis'] >= float
+      has_control_group_confidence_min  — contract_confidence['has_control_group'] >= float
+      is_single_cell_confidence_min     — contract_confidence['is_single_cell'] >= float
+      sample_join_key_confidence_min    — contract_confidence['sample_join_key'] >= float
+        Semântica: chave PRESENTE no JSON e score >= limiar.
+        Datasets sem a chave NÃO passam (coerente com "não classificado" do contrato).
+        Implementação: lookup ORM __<eixo>__gte sobre JSONField (transform numérico JSONB).
+        Confirmado empiricamente que Django JSONB __<key>__gte faz cast para numeric no Postgres.
+      gene                              — dataset__genes__gene_symbol__iexact + .distinct()
+      monogenic_gene_hit                — 'true'/'True'/True → chave presente em
+                                          extra_metadata['contract'] via
+                                          __extra_metadata__contract__has_key='monogenic_gene_hit'
     """
     curation_status = params.get('curation_status')
     if curation_status:
@@ -122,6 +138,55 @@ def apply_dataset_filters(queryset, params):
     if has_sample_join_key == 'true' or has_sample_join_key is True:
         queryset = queryset.filter(dataset__sample_join_key__len__gt=0)
 
+    # ── Filtros de descoberta (Fase 4 OmnisPathway) ───────────────────────────
+    # Filtros de confiança mínima via contract_confidence (JSONField).
+    # Lookup __<eixo>__gte usa o transform numérico JSONB do Django/Postgres:
+    # equivale a (contract_confidence->>'eixo')::numeric >= valor.
+    # Semântica travada: chave AUSENTE → não passa (NOT NULL implícito pelo JSONB
+    # que retorna NULL quando a chave não existe, e NULL >= valor é false no Postgres).
+    _CONFIDENCE_AXES = {
+        'disease_axis_confidence_min': 'disease_axis',
+        'has_control_group_confidence_min': 'has_control_group',
+        'is_single_cell_confidence_min': 'is_single_cell',
+        'sample_join_key_confidence_min': 'sample_join_key',
+    }
+    for param_name, axis_key in _CONFIDENCE_AXES.items():
+        min_val = params.get(param_name)
+        if min_val is not None:
+            try:
+                threshold = float(min_val)
+            except (ValueError, TypeError):
+                continue
+            # Filtra: chave presente E score >= threshold.
+            # O lookup __<axis_key>__gte funciona sobre JSONField pois o Postgres
+            # trata o valor JSONB numérico como numeric nas comparações.
+            # Datasets sem a chave retornam NULL → não passam (comportamento correto).
+            queryset = queryset.filter(
+                **{f'dataset__contract_confidence__{axis_key}__gte': threshold}
+            )
+
+    # Filtro por gene: datasets que possuem DatasetGene com gene_symbol correspondente.
+    # .distinct() evita duplicação quando múltiplas fontes (paper_link + dataset_metadata)
+    # referenciam o mesmo gene no mesmo dataset.
+    gene = params.get('gene')
+    if gene:
+        queryset = queryset.filter(
+            dataset__genes__gene_symbol__iexact=gene
+        ).distinct()
+
+    # Filtro monogenic_gene_hit: 'true' → presença da chave em extra_metadata['contract'].
+    # Usa lookup __has_key aninhado via path JSONB. O Postgres suporta:
+    #   extra_metadata -> 'contract' @? '$.monogenic_gene_hit'  (alternativa interna)
+    # porém o Django JSONField mapeia __<key>__has_key via KeyTransform + HasKey.
+    # O lookup aninhado __<key1>__<key2> exige JSON path; usamos
+    # __contract__has_key que o Django JSONField resolve como:
+    #   (extra_metadata -> 'contract') ? 'monogenic_gene_hit'
+    monogenic_gene_hit = params.get('monogenic_gene_hit')
+    if monogenic_gene_hit == 'true' or monogenic_gene_hit is True:
+        queryset = queryset.filter(
+            dataset__extra_metadata__contract__has_key='monogenic_gene_hit'
+        )
+
     return queryset
 from apps.core.serializers.dataset import (
     ProjectDatasetListSerializer,
@@ -130,6 +195,7 @@ from apps.core.serializers.dataset import (
     DatasetBulkCurateRequestSerializer,
     BulkCurateResponseSerializer,
 )
+from apps.core.serializers.dataset_export import DatasetExportItemSerializer
 from apps.core.serializers.download import (
     BatchDownloadQuotaPreviewSerializer,
     BatchDownloadRequestSerializer,
@@ -316,6 +382,16 @@ def _resolve_fastq_urls_client(request, dataset, resolved_sample_ids):
 
     serializer = FastqUrlListResponseSerializer(response_data)
     return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class _ExportPagination(PageNumberPagination):
+    """
+    Paginação para o endpoint de export de datasets (Fase 4 OmnisPathway).
+    Espelha DiseaseAxisQueuePagination: page_size=50, max=200.
+    """
+    page_size = 50
+    page_size_query_param = 'page_size'
+    max_page_size = 200
 
 
 class ProjectDatasetViewSet(
@@ -961,6 +1037,189 @@ class ProjectDatasetViewSet(
         if dataset_file.size_bytes:
             response['Content-Length'] = str(dataset_file.size_bytes)
         return response
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter('export_format', OpenApiTypes.STR, description="'json' (default, paginado) ou 'csv' (stream completo). Não use 'format' — é reservado pelo DRF para negociação de conteúdo."),
+            OpenApiParameter('version', OpenApiTypes.STR, description="Versão do snapshot (default: 'live')."),
+            OpenApiParameter('disease_axis_confidence_min', OpenApiTypes.FLOAT, description="Score mínimo de confiança para disease_axis."),
+            OpenApiParameter('has_control_group_confidence_min', OpenApiTypes.FLOAT, description="Score mínimo de confiança para has_control_group."),
+            OpenApiParameter('is_single_cell_confidence_min', OpenApiTypes.FLOAT, description="Score mínimo de confiança para is_single_cell."),
+            OpenApiParameter('sample_join_key_confidence_min', OpenApiTypes.FLOAT, description="Score mínimo de confiança para sample_join_key."),
+            OpenApiParameter('gene', OpenApiTypes.STR, description="Filtrar por gene_symbol (case-insensitive)."),
+            OpenApiParameter('monogenic_gene_hit', OpenApiTypes.BOOL, description="True para datasets com monogenic_gene_hit presente."),
+            OpenApiParameter('has_control_group', OpenApiTypes.STR, description="yes/no/unknown"),
+            OpenApiParameter('disease_axis', OpenApiTypes.STR, description="monogenic/multifactorial/mixed/indeterminate"),
+            OpenApiParameter('is_single_cell', OpenApiTypes.STR, description="single_cell/bulk/unknown — match exato em dataset__is_single_cell."),
+            OpenApiParameter('data_format', OpenApiTypes.STR, description="raw/processed/unknown — match exato em dataset__data_format."),
+            OpenApiParameter('omics_layer', OpenApiTypes.STR, description="Camada ômica (containment)."),
+            OpenApiParameter('omics_count_min', OpenApiTypes.INT, description="Número mínimo de camadas ômicas."),
+            OpenApiParameter('omics_count_max', OpenApiTypes.INT, description="Número máximo de camadas ômicas."),
+            OpenApiParameter('has_sample_join_key', OpenApiTypes.BOOL, description="True para datasets com sample_join_key preenchido."),
+            OpenApiParameter('access_type', OpenApiTypes.STR, description="public/controlled/unknown"),
+        ],
+        responses={200: DatasetExportItemSerializer(many=True)},
+        summary="Exportar catálogo de datasets do projeto (JSON paginado ou CSV stream)",
+        description=(
+            "Entrega ponteiros + metadados + filtros do contrato §2 para todos os datasets "
+            "do projeto que passam nos filtros especificados. **Nunca entrega matriz numérica** "
+            "— matrix_pointer é sempre um ponteiro (URL/path/accession).\n\n"
+            "Datasets com access_type='controlled' são marcados via access_controlled=True.\n\n"
+            "**Formatos:**\n"
+            "- `?export_format=json` (default): paginado (page_size=50, max=200), envelope DRF "
+            "{count, next, previous, results} + bloco de proveniência no campo `provenance`.\n"
+            "- `?export_format=csv`: StreamingHttpResponse sem paginação (dump completo), "
+            "ordem de colunas fixa, campos multi-valor achatados com ';'.\n\n"
+            "**Determinismo:** ordenado por accession. Mesma entrada → mesmo corpo.\n\n"
+            "**Proveniência (JSON):** timestamp UTC, snapshot_version (?version=, default 'live'), "
+            "versão das regras de classificação (Fases 2/3 OmnisPathway).\n\n"
+            "Isolamento por usuário: apenas datasets do projeto do usuário autenticado "
+            "(404 se projeto não pertence ao user)."
+        ),
+    )
+    @action(detail=False, methods=['get'], url_path='export', throttle_scope='download_content')
+    def export(self, request, project_pk=None):
+        """
+        GET /projects/{project_pk}/datasets/export/
+
+        Exporta o catálogo de datasets do projeto com filtragem via apply_dataset_filters.
+        Formatos: json (paginado) ou csv (stream completo).
+        Determinismo: order_by('dataset__accession').
+        Isolamento: _get_project() garante 404 cross-user (Regra #3).
+        """
+        from datetime import datetime as _datetime, timezone as _timezone
+
+        project = self._get_project()  # 404 se projeto não pertence ao user
+
+        snapshot_version = request.query_params.get('version', 'live')
+        # Usa 'export_format' em vez de 'format': ?format= é o URL_FORMAT_OVERRIDE
+        # do DRF e é interceptado na negociação de conteúdo antes de a view rodar.
+        fmt = request.query_params.get('export_format', 'json').lower()
+
+        # Queryset base: escopado ao projeto do usuário, com prefetch para evitar N+1 (R5).
+        qs = (
+            ProjectDataset.objects.filter(project=project)
+            .select_related('dataset')
+            .prefetch_related('dataset__genes')
+        )
+
+        # Aplica filtros de descoberta (reutiliza motor único — sem lógica paralela).
+        qs = apply_dataset_filters(qs, request.query_params)
+
+        # Ordenação determinística por accession (R4 — reprodutibilidade).
+        qs = qs.order_by('dataset__accession')
+
+        serializer_context = {
+            'request': request,
+            'snapshot_version': snapshot_version,
+        }
+
+        if fmt == 'csv':
+            # ── Saída CSV: StreamingHttpResponse + .iterator() (R6 — sem carga em memória) ──
+            # Sem paginação — dump completo do queryset filtrado.
+            # Ordem de colunas fixa; campos multi-valor achatados com ';'.
+
+            def _csv_rows():
+                # Colunas fixas — ordem estável entre execuções
+                COLUMNS = [
+                    'accession', 'source_db', 'omics_layers', 'omics_count',
+                    'is_single_cell', 'has_control_group', 'disease_axis',
+                    'data_format', 'access_type', 'access_controlled',
+                    'sample_join_key',
+                    'contract_confidence',
+                    # contract.* achatados
+                    'contract.matrix_pointer', 'contract.proteomics_modality',
+                    'contract.tissue_raw', 'contract.disease_raw',
+                    'contract.ref_pmids', 'contract.ref_dois',
+                    'contract.monogenic_gene_hit',
+                    'snapshot_version',
+                ]
+
+                buf = io.StringIO()
+                writer = csv.writer(buf)
+                writer.writerow(COLUMNS)
+                yield buf.getvalue()
+
+                for pd in qs.iterator(chunk_size=200):
+                    s = DatasetExportItemSerializer(pd, context=serializer_context)
+                    d = s.data
+                    contract = d.get('contract') or {}
+                    cc = d.get('contract_confidence') or {}
+
+                    def _join(val):
+                        """Achata lista/dict para string com ';'."""
+                        if val is None:
+                            return ''
+                        if isinstance(val, list):
+                            return ';'.join(str(v) for v in val)
+                        if isinstance(val, dict):
+                            return ';'.join(f"{k}={v}" for k, v in val.items())
+                        return str(val)
+
+                    row = [
+                        d.get('accession', ''),
+                        d.get('source_db', ''),
+                        _join(d.get('omics_layers')),
+                        d.get('omics_count', ''),
+                        d.get('is_single_cell', ''),
+                        d.get('has_control_group', ''),
+                        d.get('disease_axis', ''),
+                        d.get('data_format', ''),
+                        d.get('access_type', ''),
+                        d.get('access_controlled', ''),
+                        _join(d.get('sample_join_key')),
+                        _join(cc),
+                        contract.get('matrix_pointer', ''),
+                        contract.get('proteomics_modality', ''),
+                        _join(contract.get('tissue_raw')),
+                        _join(contract.get('disease_raw')),
+                        _join(contract.get('ref_pmids')),
+                        _join(contract.get('ref_dois')),
+                        _join(contract.get('monogenic_gene_hit')),
+                        d.get('snapshot_version', ''),
+                    ]
+                    buf = io.StringIO()
+                    writer = csv.writer(buf)
+                    writer.writerow(row)
+                    yield buf.getvalue()
+
+            response = StreamingHttpResponse(
+                _csv_rows(),
+                content_type='text/csv; charset=utf-8',
+            )
+            response['Content-Disposition'] = (
+                f'attachment; filename="dataset_export_{snapshot_version}.csv"'
+            )
+            return response
+
+        # ── Saída JSON: paginado com envelope DRF + bloco de proveniência ────
+        paginator = _ExportPagination()
+        page = paginator.paginate_queryset(qs, request, view=self)
+
+        if page is not None:
+            serializer = DatasetExportItemSerializer(
+                page, many=True, context=serializer_context
+            )
+            paginated_response = paginator.get_paginated_response(serializer.data)
+            # Injeta bloco de proveniência no envelope paginado
+            paginated_response.data['provenance'] = {
+                'timestamp_utc': _datetime.now(_timezone.utc).isoformat(),
+                'snapshot_version': snapshot_version,
+                'classifier_rules_version': 'omnispathway-fase2-fase3',
+            }
+            return paginated_response
+
+        serializer = DatasetExportItemSerializer(
+            qs, many=True, context=serializer_context
+        )
+        return Response({
+            'provenance': {
+                'timestamp_utc': _datetime.now(_timezone.utc).isoformat(),
+                'snapshot_version': snapshot_version,
+                'classifier_rules_version': 'omnispathway-fase2-fase3',
+            },
+            'results': serializer.data,
+        })
 
     @extend_schema(
         request=AddDatasetToProjectRequestSerializer,

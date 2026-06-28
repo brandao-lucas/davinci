@@ -264,6 +264,52 @@ class DatasetBulkFiltersSerializer(serializers.Serializer):
         required=False,
         help_text="True para retornar apenas datasets com sample_join_key preenchido.",
     )
+    # ── Filtros de descoberta (Fase 4 OmnisPathway) ───────────────────────────
+    # Correspondem exatamente aos parâmetros adicionados a apply_dataset_filters().
+    # Semântica travada: chave PRESENTE no contrato E score >= limiar.
+    # Datasets sem a chave (nunca classificados) NÃO passam.
+    disease_axis_confidence_min = serializers.FloatField(
+        required=False,
+        help_text=(
+            "Score mínimo de confiança para disease_axis (0.0–1.0). "
+            "Datasets sem a chave em contract_confidence não passam."
+        ),
+    )
+    has_control_group_confidence_min = serializers.FloatField(
+        required=False,
+        help_text=(
+            "Score mínimo de confiança para has_control_group (0.0–1.0). "
+            "Datasets sem a chave em contract_confidence não passam."
+        ),
+    )
+    is_single_cell_confidence_min = serializers.FloatField(
+        required=False,
+        help_text=(
+            "Score mínimo de confiança para is_single_cell (0.0–1.0). "
+            "Datasets sem a chave em contract_confidence não passam."
+        ),
+    )
+    sample_join_key_confidence_min = serializers.FloatField(
+        required=False,
+        help_text=(
+            "Score mínimo de confiança para sample_join_key (0.0–1.0). "
+            "Datasets sem a chave em contract_confidence não passam."
+        ),
+    )
+    gene = serializers.CharField(
+        required=False,
+        help_text=(
+            "Filtrar datasets que possuem DatasetGene com gene_symbol igual "
+            "ao valor fornecido (case-insensitive). Ex: 'BRCA1'."
+        ),
+    )
+    monogenic_gene_hit = serializers.BooleanField(
+        required=False,
+        help_text=(
+            "True para retornar apenas datasets com monogenic_gene_hit presente "
+            "em extra_metadata['contract'] (calculado pela Fase 3)."
+        ),
+    )
 
 
 class DatasetBulkCurateRequestSerializer(serializers.Serializer):
