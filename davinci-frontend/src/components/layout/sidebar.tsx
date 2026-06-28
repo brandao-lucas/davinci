@@ -16,6 +16,7 @@ import {
   Settings,
   Dna,
   ClipboardCheck,
+  Telescope,
 } from 'lucide-react';
 
 interface NavItem {
@@ -33,6 +34,7 @@ const projectNavItems: NavItem[] = [
   { label: 'Overview', href: '', icon: BarChart2, projectScoped: true },
   { label: 'Papers', href: '/papers', icon: FileText, projectScoped: true },
   { label: 'Datasets', href: '/datasets', icon: Database, projectScoped: true },
+  { label: 'Descoberta', href: '/discovery', icon: Telescope, projectScoped: true },
   { label: 'Samples', href: '/samples', icon: FlaskConical, projectScoped: true },
   { label: 'Links', href: '/links', icon: Link2, projectScoped: true },
   { label: 'Analysis', href: '/analysis', icon: BarChart2, projectScoped: true },
