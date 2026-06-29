@@ -103,6 +103,7 @@ Idempotência
 
 import difflib
 import logging
+import re
 from collections import defaultdict
 from typing import NamedTuple
 
@@ -142,6 +143,125 @@ FUZZY_MONO_THRESHOLD = 0.82
 FUZZY_MULTI_THRESHOLD = 0.70
 TOKEN_MIN_LEN = 5
 FUZZY_MAX_CANDIDATES = 200
+
+# ---------------------------------------------------------------------------
+# Extração de n-grams de título para candidatos de doença
+# ---------------------------------------------------------------------------
+#
+# Motivação: _collect_disease_candidates() passava o TÍTULO COMPLETO como
+# candidato único. O SequenceMatcher compara frases longas contra nomes curtos
+# de doenças e falha (ratio ~0.22 < 0.70). Títulos como "Glaucoma is a
+# neurodegenerative disease..." têm "glaucoma" como n-gram de 1 palavra que
+# dá exact hit se extraído isoladamente.
+#
+# Estratégia: extrair todos os n-grams de 1..NGRAM_MAX_N palavras do título
+# (e até 200 chars do summary) e adicioná-los como candidatos com fonte
+# 'title_ngram'. Deduplicação por normalized form garante que o mesmo texto
+# não seja testado duas vezes.
+#
+# NGRAM_MAX_N = 4: captura "heart failure", "type 2 diabetes", "hidradenitis
+# suppurativa" (3 palavras). 5+ palavras raramente são nomes de doença no GWAS.
+#
+# Blocklist (NGRAM_BLOCKLIST): termos genéricos que dão falso positivo quando
+# aparecem como unigrams ou n-grams isolados. A distinção crucial é entre
+# "Stress" (doença psiquiátrica GWAS) e "oxidative stress" (processo celular).
+# Exigir n-gram >= 2 palavras para termos ambíguos é insuficiente sozinho porque
+# "oxidative stress" também existe no GWAS. A blocklist bloqueia os termos
+# problemáticos detectados no diagnóstico + termos estruturalmente genéricos.
+#
+# Regra adicional: n-grams de 1 palavra com < NGRAM_UNIGRAM_MIN_CHARS caracteres
+# são bloqueados — evita que tokens curtos ambíguos ("pain", "age", "fat", "bmi")
+# passem. 6 chars preserva "autism", "cancer", "asthma", "lupus" (todos 6+).
+
+NGRAM_MAX_N = 4
+NGRAM_UNIGRAM_MIN_CHARS = 6
+
+# Blocklist de tokens/n-grams normalizados que NÃO devem ser candidatos isolados.
+# Critérios de inclusão:
+#   - Frequentes em títulos de estudos mas raramente como sujeito/doença principal.
+#   - Alta taxa de FP no diagnóstico do laudo (stress: ~70%, death: ~90%, lifespan: ~90%).
+#   - Palavras de processo/método/estrutura que aparecem no GWAS como doença mas
+#     são ambíguas fora de contexto.
+# NÃO incluir termos específicos de doença mesmo que ambíguos (ex: "aging" é legítimo).
+NGRAM_BLOCKLIST: frozenset[str] = frozenset({
+    # Termos de processo celular/molecular identificados no laudo
+    'stress',
+    'death',
+    'lifespan',
+    # Termos de método/estudo
+    'study',
+    'analysis',
+    'expression',
+    'function',
+    'response',
+    'regulation',
+    'activity',
+    'pathway',
+    'network',
+    'mechanism',
+    'outcome',
+    'survival',
+    'progression',
+    'resistance',
+    'sensitivity',
+    'exposure',
+    'measurement',
+    # Termos biológicos estruturais (não doenças isolados)
+    'cell',
+    'cells',
+    'tissue',
+    'organ',
+    'protein',
+    'gene',
+    'genes',
+    'genome',
+    'snp',
+    'locus',
+    'variant',
+    'mutation',
+    'allele',
+    'marker',
+    'phenotype',
+    'trait',
+    'risk',
+    # Palavras de estrutura de frase
+    'disease',       # genérico demais; "heart disease" tem 2 tokens e não é bloqueado
+    'disorder',
+    'syndrome',      # sozinho é vago; "down syndrome" (2 tokens) não é bloqueado
+    'condition',
+    'infection',     # ambíguo fora de contexto; "hiv infection" (2 tokens) não bloqueado
+    'inflammation',
+    'deficiency',
+    # Numerais e descritores comuns
+    'type',
+    'form',
+    'level',
+    'rate',
+    'ratio',
+    'score',
+    'index',
+    'model',
+    'group',
+    'case',
+    'control',
+    'human',
+    'mouse',
+    'patient',
+    'cohort',
+    'sample',
+    'data',
+    # Termos temporais/epidemiológicos
+    'onset',
+    'age',
+    'sex',
+    'body',
+    'blood',
+    'serum',
+    'plasma',
+})
+
+# Regex para tokenizar texto em palavras (preserva hífens internos como "covid-19")
+_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9]|[A-Za-z0-9]")
 
 # ---------------------------------------------------------------------------
 # Pesos de confiança do MendelianGene
@@ -260,6 +380,49 @@ def _fuzzy_hit(axis: str, norm_term: str, threshold: float) -> tuple[str, str, f
     return None
 
 
+def _match_term_exact_only(norm_term: str) -> AxisHits:
+    """
+    Versão exact-only de _match_term — sem fuzzy.
+
+    Usada para candidatos de fonte 'title_ngram': n-grams de título são curtos
+    e numerosos; fuzzy sobre eles gera FP sistemáticos (FP #2 — ratio 0.70–0.79
+    casa termos não relacionados como 'Brain development' para dataset cardíaco).
+    Curadoria corrigida: n-gram de título → exact hit apenas; fuzzy exclusivo
+    para fontes curadas (disease_raw, MeSH) e para o título completo (title_summary).
+    """
+    mono_score = 0.0
+    multi_score = 0.0
+    mono_method = ''
+    multi_method = ''
+    mono_matched = ''
+    multi_matched = ''
+    mono_source = ''
+    multi_source = ''
+
+    hit = _exact_hit('monogenic', norm_term)
+    if hit:
+        mono_score = 1.0
+        mono_method = 'exact'
+        mono_matched, mono_source = hit
+
+    hit = _exact_hit('multifactorial', norm_term)
+    if hit:
+        multi_score = 1.0
+        multi_method = 'exact'
+        multi_matched, multi_source = hit
+
+    return AxisHits(
+        monogenic_score=mono_score,
+        multifactorial_score=multi_score,
+        mono_method=mono_method,
+        multi_method=multi_method,
+        mono_matched=mono_matched,
+        multi_matched=multi_matched,
+        mono_source=mono_source,
+        multi_source=multi_source,
+    )
+
+
 def _match_term(norm_term: str) -> AxisHits:
     """
     Tenta exact + fuzzy para ambos os eixos dado um termo normalizado.
@@ -308,6 +471,76 @@ def _match_term(norm_term: str) -> AxisHits:
         mono_source=mono_source,
         multi_source=multi_source,
     )
+
+
+# ---------------------------------------------------------------------------
+# Extração de n-grams de texto para candidatos de doença
+# ---------------------------------------------------------------------------
+
+def _extract_ngram_candidates(text: str, source: str, max_n: int = NGRAM_MAX_N) -> list[tuple[str, str]]:
+    """
+    Extrai n-grams de 1..max_n palavras de `text` como candidatos de doença.
+
+    Filtragem aplicada:
+      1. Blocklist: n-gram normalizado presente em NGRAM_BLOCKLIST → descartado.
+      2. Unigrama com < NGRAM_UNIGRAM_MIN_CHARS caracteres → descartado (evita
+         tokens curtos ambíguos como "pain", "age", "fat").
+      3. N-gram composto inteiramente por tokens da blocklist → descartado
+         (ex: "cell death", "gene expression" não devem virar candidatos).
+      4. Longest-match-wins: n-grams cuja forma normalizada é substring da forma
+         normalizada de outro n-gram na mesma lista são removidos. Previne que
+         sub-spans ("fibrosis") contradigam o span mais longo já aceito
+         ("cystic fibrosis") e causem um hit de eixo oposto (FP #1).
+
+    Retorna lista de (ngram_raw, source) sem normalização adicional — a
+    normalização e deduplicação por seen_norm ocorrem em
+    _collect_disease_candidates() via add().
+
+    Nota de performance: texto de título (30-150 tokens) gera no máximo
+    ~max_n × n_tokens n-grams — ordem de centenas, custo desprezível.
+    """
+    tokens = _WORD_RE.findall(text)
+    if not tokens:
+        return []
+
+    raw_candidates: list[tuple[str, str]] = []  # (raw, norm)
+
+    for start in range(len(tokens)):
+        for n in range(1, max_n + 1):
+            end = start + n
+            if end > len(tokens):
+                break
+            ngram_tokens = tokens[start:end]
+            ngram_raw = ' '.join(ngram_tokens)
+            ngram_norm = normalize_trait_name(ngram_raw)
+
+            # Filtro 1: n-gram completo na blocklist
+            if ngram_norm in NGRAM_BLOCKLIST:
+                continue
+
+            # Filtro 2: unigrama muito curto
+            if n == 1 and len(ngram_norm) < NGRAM_UNIGRAM_MIN_CHARS:
+                continue
+
+            # Filtro 3: n-gram composto apenas por tokens da blocklist
+            all_blocked = all(
+                normalize_trait_name(t) in NGRAM_BLOCKLIST
+                for t in ngram_tokens
+            )
+            if all_blocked:
+                continue
+
+            raw_candidates.append((ngram_raw, ngram_norm))
+
+    if not raw_candidates:
+        return []
+
+    # Retorna todos os candidatos que passaram nos filtros 1-3.
+    # O deconflito de sub-span (FP #1 — "fibrosis" vs "cystic fibrosis")
+    # é resolvido em classify_disease_axis_for_dataset, após o match,
+    # onde sabemos quais n-grams efetivamente casaram e em qual eixo.
+    # Filtrar aqui seria prematuro: não sabemos quais vão dar hit.
+    return [(raw, source) for raw, _norm in raw_candidates]
 
 
 # ---------------------------------------------------------------------------
@@ -362,15 +595,38 @@ def _collect_disease_candidates(dataset) -> list[tuple[str, str]]:
         src = 'mesh_major' if row['is_major_topic'] else 'mesh_minor'
         add(row['descriptor'], src)
 
-    # C) Fallback: title e summary (palavras-chave, não o texto inteiro)
-    # Para evitar ruído, usamos title como um único candidato e summary APENAS
-    # se não houver candidatos melhores já — verificamos ao final.
-    if not result:
-        if dataset.title:
-            add(dataset.title.strip(), 'title_summary')
-        if dataset.summary:
-            # Tomar só os primeiros 200 chars do summary para evitar ruído
-            add(dataset.summary.strip()[:200], 'title_summary')
+    # C) Fallback: title + summary — dois níveis de extração:
+    #
+    #   C1) N-grams de 1..4 palavras do título (e de até 200 chars do summary).
+    #       Fonte: 'title_ngram'. Alta recall — "glaucoma", "heart failure",
+    #       "hidradenitis suppurativa" são testados isoladamente e dão exact hit.
+    #       Filtrados por NGRAM_BLOCKLIST e NGRAM_UNIGRAM_MIN_CHARS.
+    #
+    #   C2) Título completo e summary[:200] como candidato único (comportamento
+    #       anterior). Mantido para capturar casos onde o título é curto e direto
+    #       (ex: "Autism", "Glaucoma" — já capturado por C1 também, mas inofensivo).
+    #       Fonte: 'title_summary'.
+    #
+    # Ambos os níveis ativos independentemente de A/B terem retornado candidatos.
+    # Justificativa: mesmo datasets com disease_raw ou MeSH podem ter candidatos
+    # adicionais via título que complementam (ex: dataset PRIDE com disease_raw
+    # vazio mas título informativo).
+
+    if dataset.title:
+        title_text = dataset.title.strip()
+        # C1: n-grams do título
+        for ngram_raw, src in _extract_ngram_candidates(title_text, 'title_ngram'):
+            add(ngram_raw, src)
+        # C2: título completo (fallback SequenceMatcher para casos fuzzy)
+        add(title_text, 'title_summary')
+
+    if dataset.summary:
+        summary_text = dataset.summary.strip()[:200]
+        # C1: n-grams do summary (truncado)
+        for ngram_raw, src in _extract_ngram_candidates(summary_text, 'title_ngram'):
+            add(ngram_raw, src)
+        # C2: summary completo truncado
+        add(summary_text, 'title_summary')
 
     return result
 
@@ -411,7 +667,15 @@ def classify_disease_axis_for_dataset(dataset, *, dry_run: bool = False) -> dict
         if not norm:
             continue
 
-        hits = _match_term(norm)
+        # N-grams de título: apenas exact match (FP #2).
+        # Fuzzy sobre n-grams curtos de título produz hits espúrios com
+        # ratio 0.70–0.79 (ex: 'Brain development' para dataset cardíaco).
+        # Fontes curadas (disease_raw, MeSH) e título completo (title_summary)
+        # mantêm fuzzy — são strings mais longas e específicas.
+        if cand_source == 'title_ngram':
+            hits = _match_term_exact_only(norm)
+        else:
+            hits = _match_term(norm)
 
         if hits.monogenic_score > best_mono_score:
             best_mono_score = hits.monogenic_score
@@ -426,6 +690,34 @@ def classify_disease_axis_for_dataset(dataset, *, dry_run: bool = False) -> dict
             best_multi_matched = hits.multi_matched
             best_multi_source = hits.multi_source
             best_multi_candidate = f'{raw_text!r} [{cand_source}]'
+
+    # --- Deconflito de sub-span (FP #1) ---
+    # Quando ambos os eixos têm hits via 'title_ngram', verificar se o candidato
+    # de um eixo é substring normalizada do candidato do outro eixo.
+    # Se sim, o sub-span é um artefato de sobreposição (ex: "fibrosis" dentro de
+    # "cystic fibrosis") e perde seu hit — o span mais longo (específico) prevalece.
+    # Aplica-se apenas quando AMBOS os hits vieram de title_ngram; fontes curadas
+    # (disease_raw, MeSH) e título completo (title_summary) não são tocados.
+    if best_mono_score > 0.0 and best_multi_score > 0.0:
+        mono_from_ngram = '[title_ngram]' in best_mono_candidate
+        multi_from_ngram = '[title_ngram]' in best_multi_candidate
+        if mono_from_ngram and multi_from_ngram:
+            mono_norm = normalize_trait_name(best_mono_matched)
+            multi_norm = normalize_trait_name(best_multi_matched)
+            # Se o nome do eixo mono está contido no nome do eixo multi → mono é sub-span
+            if mono_norm and multi_norm and mono_norm in multi_norm:
+                best_mono_score = 0.0
+                best_mono_method = ''
+                best_mono_matched = ''
+                best_mono_source = ''
+                best_mono_candidate = ''
+            # Inverso: nome multi contido no nome mono → multi é sub-span
+            elif mono_norm and multi_norm and multi_norm in mono_norm:
+                best_multi_score = 0.0
+                best_multi_method = ''
+                best_multi_matched = ''
+                best_multi_source = ''
+                best_multi_candidate = ''
 
     # --- Decisão dos 4 estados ---
     has_mono = best_mono_score > 0.0
