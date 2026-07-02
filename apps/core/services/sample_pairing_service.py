@@ -129,9 +129,20 @@ class SamplePairingService:
         Raises:
             MatrixNotFoundError: não encontrada ou não pertence ao projeto.
         """
-        # Datasets vinculados ao projeto (isolamento por ProjectDataset)
+        # Datasets vinculados ao projeto com status ativo (finding A1).
+        # Exclui 'excluded' para que datasets descartados pelo pesquisador
+        # não sejam elegíveis a pareamento.
+        # O matrix_load_service grava ProjectDataset com curation_status='included',
+        # portanto o happy path load → pair não é afetado por este filtro.
+        _ACTIVE_STATUSES = (
+            ProjectDataset.CurationStatus.INCLUDED,
+            ProjectDataset.CurationStatus.QUEUED_DOWNLOAD,
+            ProjectDataset.CurationStatus.DOWNLOADED,
+            ProjectDataset.CurationStatus.PENDING,
+        )
         dataset_ids = ProjectDataset.objects.filter(
             project=project,
+            curation_status__in=_ACTIVE_STATUSES,
         ).values_list('dataset_id', flat=True)
 
         qs = OmicMatrix.objects.select_related('dataset').filter(

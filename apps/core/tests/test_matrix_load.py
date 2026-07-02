@@ -420,8 +420,19 @@ class MatrixLoadStorageKeyTests(_TmpStorageTestCase):
                 f'storage_key não deve conter caminho físico "{prefix}": {storage_key!r}',
             )
 
-    def test_storage_key_contains_user_project_and_accession(self):
-        """storage_key contém user_id, project_id e accession do dataset."""
+    def test_storage_key_uses_shared_public_namespace(self):
+        """
+        storage_key usa namespace compartilhado para dataset PÚBLICO (finding M4).
+
+        O padrão correto é 'omics/_shared/{accession}/{filename}' — sem user_id
+        nem project_id. Isso garante que múltiplos projetos que carregam o mesmo
+        dataset público (ex.: CPTAC-CCRCC) não duplicam o Parquet no storage.
+
+        Verificações:
+          - Contém o prefixo '_shared' (não project-scoped).
+          - Contém o accession do dataset.
+          - NÃO contém user_id nem project_id como segmentos de caminho.
+        """
         svc = MatrixLoadService(self.project)
         with tempfile.TemporaryDirectory() as dest_dir:
             parquet_path = _create_dummy_parquet(dest_dir)
@@ -438,13 +449,30 @@ class MatrixLoadStorageKeyTests(_TmpStorageTestCase):
             result = svc._execute(dataset=dataset, job=job, rust_engine=fake_rust)
 
         storage_key = result['storage_key']
-        expected_fragment = (
-            f'omics/{self.user.id}/{self.project.id}/{CPTAC_CCRCC_ACCESSION}/'
-        )
+
+        # Deve usar namespace compartilhado público (M4)
+        expected_shared_prefix = f'omics/_shared/{CPTAC_CCRCC_ACCESSION}/'
         self.assertIn(
-            expected_fragment,
+            expected_shared_prefix,
             storage_key,
-            f'storage_key deve conter "{expected_fragment}", obteve: {storage_key!r}',
+            f'storage_key deve usar namespace _shared para dataset público; '
+            f'esperava conter "{expected_shared_prefix}", obteve: {storage_key!r}',
+        )
+
+        # NÃO deve embutir user_id nem project_id (regressão M4)
+        user_id_str = str(self.user.id)
+        project_id_str = str(self.project.id)
+        self.assertNotIn(
+            f'omics/{user_id_str}/',
+            storage_key,
+            f'storage_key NÃO deve conter user_id no namespace público '
+            f'(regressão M4): {storage_key!r}',
+        )
+        self.assertNotIn(
+            f'/{project_id_str}/',
+            storage_key,
+            f'storage_key NÃO deve conter project_id no namespace público '
+            f'(regressão M4): {storage_key!r}',
         )
 
     def test_upload_reaches_default_storage(self):
@@ -803,9 +831,9 @@ class RunMatrixLoadTaskTests(_TmpStorageTestCase):
         fake_rust_mod = MagicMock()
         expected_result = {
             'job_id': str(job.id),
+            # Namespace compartilhado público (M4): sem user_id nem project_id
             'storage_key': (
-                f'omics/{self.user.id}/{self.project.id}/'
-                f'{CPTAC_CCRCC_ACCESSION}/{CPTAC_PARQUET_NAME}'
+                f'omics/_shared/{CPTAC_CCRCC_ACCESSION}/{CPTAC_PARQUET_NAME}'
             ),
             'n_features': 3,
             'n_samples': 3,
@@ -1234,3 +1262,178 @@ class GetOrCreateDatasetTests(TestCase):
             project=self.project, dataset=dataset
         ).count()
         self.assertEqual(count, 1)
+
+
+# =============================================================================
+# 10. Testes do ramo não-público de _upload_parquet (Hardening M4)
+# =============================================================================
+
+class MatrixLoadNonPublicStorageKeyTests(_TmpStorageTestCase):
+    """
+    Verifica que _upload_parquet usa namespace PROJECT-SCOPED quando
+    dataset.access_type != 'public'.
+
+    Prova que dados não-públicos (controlled / unknown) NUNCA vazam para o
+    namespace omics/_shared/, que é compartilhado entre todos os projetos.
+
+    Estratégia: instanciar OmicDataset diretamente com access_type desejado e
+    chamar _upload_parquet() explicitamente, sem passar por _get_or_create_dataset()
+    (que fixaria access_type=PUBLIC para o dataset CPTAC).  Isso isola o teste ao
+    ramo de branching do upload sem alterar código de produção.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.user = make_user('nonpub_user')
+        self.project = make_project(self.user, 'NonPublic Storage Project')
+
+    def _make_controlled_dataset(self, accession: str = 'CONTROLLED-DATASET-001') -> OmicDataset:
+        """Cria OmicDataset com access_type='controlled' para exercitar ramo não-público."""
+        return OmicDataset.objects.create(
+            accession=accession,
+            source_db=OmicDataset.SourceDB.GEO,
+            title='Controlled dataset para teste de storage_key',
+            access_type=OmicDataset.AccessType.CONTROLLED,
+        )
+
+    def _make_unknown_access_dataset(self, accession: str = 'UNKNOWN-DATASET-001') -> OmicDataset:
+        """Cria OmicDataset com access_type='unknown' para exercitar ramo não-público."""
+        return OmicDataset.objects.create(
+            accession=accession,
+            source_db=OmicDataset.SourceDB.GEO,
+            title='Unknown access dataset para teste de storage_key',
+            access_type=OmicDataset.AccessType.UNKNOWN,
+        )
+
+    def _run_upload(self, dataset: OmicDataset) -> str:
+        """
+        Exercita _upload_parquet com o dataset fornecido.
+
+        Cria um arquivo Parquet dummy, um IngestionJob RUNNING e chama
+        _upload_parquet() diretamente no MatrixLoadService.  Retorna a
+        storage_key produzida.
+        """
+        svc = MatrixLoadService(self.project)
+        job = IngestionJob.objects.create(
+            project=self.project,
+            job_type=IngestionJob.JobType.MATRIX_LOAD,
+            status=IngestionJob.JobStatus.RUNNING,
+            parameters={},
+        )
+        with tempfile.TemporaryDirectory(prefix='davinci_nonpub_') as dest_dir:
+            parquet_path = _create_dummy_parquet(dest_dir)
+            storage_key = svc._upload_parquet(parquet_path, dataset, job)
+        return storage_key
+
+    # ── controlled ────────────────────────────────────────────────────────────
+
+    def test_controlled_dataset_uses_project_scoped_namespace(self):
+        """
+        access_type='controlled' → storage_key contém omics/{user_id}/{project_id}/.
+        Prova que dado controlado não vaza para o namespace _shared.
+        """
+        dataset = self._make_controlled_dataset()
+        storage_key = self._run_upload(dataset)
+
+        expected_prefix = f'omics/{self.user.id}/{self.project.id}/'
+        self.assertIn(
+            expected_prefix,
+            storage_key,
+            f'storage_key de dado controlado deve conter "{expected_prefix}"; '
+            f'obteve: {storage_key!r}',
+        )
+
+    def test_controlled_dataset_does_not_use_shared_namespace(self):
+        """
+        access_type='controlled' → storage_key NÃO contém 'omics/_shared/'.
+        Garante que dado controlado NUNCA vaza para namespace público.
+        """
+        dataset = self._make_controlled_dataset()
+        storage_key = self._run_upload(dataset)
+
+        self.assertNotIn(
+            'omics/_shared/',
+            storage_key,
+            f'Dado controlado NÃO deve usar namespace _shared: {storage_key!r}',
+        )
+
+    def test_controlled_dataset_storage_key_contains_accession(self):
+        """storage_key do dado controlado contém o accession do dataset."""
+        accession = 'CONTROLLED-DATASET-001'
+        dataset = self._make_controlled_dataset(accession=accession)
+        storage_key = self._run_upload(dataset)
+
+        self.assertIn(
+            accession,
+            storage_key,
+            f'storage_key deve conter accession "{accession}": {storage_key!r}',
+        )
+
+    # ── unknown ───────────────────────────────────────────────────────────────
+
+    def test_unknown_access_dataset_uses_project_scoped_namespace(self):
+        """
+        access_type='unknown' → storage_key contém omics/{user_id}/{project_id}/.
+        Qualquer tipo diferente de PUBLIC cai no ramo project-scoped.
+        """
+        dataset = self._make_unknown_access_dataset()
+        storage_key = self._run_upload(dataset)
+
+        expected_prefix = f'omics/{self.user.id}/{self.project.id}/'
+        self.assertIn(
+            expected_prefix,
+            storage_key,
+            f'storage_key de dado com access_type=unknown deve ser project-scoped; '
+            f'obteve: {storage_key!r}',
+        )
+
+    def test_unknown_access_dataset_does_not_use_shared_namespace(self):
+        """
+        access_type='unknown' → storage_key NÃO contém 'omics/_shared/'.
+        """
+        dataset = self._make_unknown_access_dataset()
+        storage_key = self._run_upload(dataset)
+
+        self.assertNotIn(
+            'omics/_shared/',
+            storage_key,
+            f'Dado com access_type=unknown NÃO deve usar namespace _shared: '
+            f'{storage_key!r}',
+        )
+
+    # ── regressão cruzada: PUBLIC ainda usa _shared ────────────────────────────
+
+    def test_public_dataset_still_uses_shared_namespace(self):
+        """
+        Regressão: ao mudar lógica de não-públicos, PUBLIC ainda usa _shared.
+
+        Confirma que o fix M4 não quebrou o ramo positivo: OmicDataset com
+        access_type=PUBLIC continua usando shared_omics_storage_key.
+        """
+        dataset = OmicDataset.objects.create(
+            accession='PUBLIC-DATASET-FOR-REGRESSION',
+            source_db=OmicDataset.SourceDB.GEO,
+            title='Public dataset — regressão ramo _shared',
+            access_type=OmicDataset.AccessType.PUBLIC,
+        )
+        svc = MatrixLoadService(self.project)
+        job = IngestionJob.objects.create(
+            project=self.project,
+            job_type=IngestionJob.JobType.MATRIX_LOAD,
+            status=IngestionJob.JobStatus.RUNNING,
+            parameters={},
+        )
+        with tempfile.TemporaryDirectory(prefix='davinci_pub_') as dest_dir:
+            parquet_path = _create_dummy_parquet(dest_dir)
+            storage_key = svc._upload_parquet(parquet_path, dataset, job)
+
+        self.assertIn(
+            'omics/_shared/',
+            storage_key,
+            f'Dataset PUBLIC deve continuar usando namespace _shared: {storage_key!r}',
+        )
+        self.assertNotIn(
+            f'omics/{self.user.id}/',
+            storage_key,
+            f'Dataset PUBLIC não deve ter user_id na chave: {storage_key!r}',
+        )

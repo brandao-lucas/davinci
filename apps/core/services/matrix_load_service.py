@@ -73,7 +73,7 @@ from apps.core.models import (
     OmicSample,
     ProjectDataset,
 )
-from apps.core.storage_utils import omics_storage_key
+from apps.core.storage_utils import omics_storage_key, shared_omics_storage_key
 
 logger = logging.getLogger(__name__)
 
@@ -446,17 +446,38 @@ class MatrixLoadService:
 
         Retorna a storage_key lógica (nunca caminho físico).
         Remove o arquivo local após upload bem-sucedido.
+
+        Namespace de storage (M4):
+          - access_type='public': namespace compartilhado agnóstico a user/project
+            → omics/_shared/{dataset_accession}/{filename}
+            Garante que o mesmo Parquet não é duplicado quando múltiplos projetos
+            carregam o mesmo dataset público.  Re-upload do mesmo accession
+            sobrescreve deterministicamente (chave idêntica = mesmo objeto).
+          - access_type!='public': mantém namespace project-scoped
+            → omics/{user_id}/{project_id}/{dataset_accession}/{filename}
+            Nota: carga de matriz com acesso controlado NÃO é suportada hoje
+            (nenhum loader controlado implementado).  O branch project-scoped
+            existe apenas para garantir que uma futura extensão não use o
+            namespace público inadvertidamente.
         """
         filename = os.path.basename(local_path)
 
-        # Convenção de path: omics/{user_id}/{project_id}/{dataset_accession}/{filename}
-        # Reutiliza omics_storage_key — mesmo namespace dos DatasetFile.
-        object_key = omics_storage_key(
-            user_id=self.user.id,
-            project_id=self.project.id,
-            dataset_accession=dataset.accession,
-            filename=filename,
-        )
+        if dataset.access_type == OmicDataset.AccessType.PUBLIC:
+            # Namespace compartilhado: dado público é o mesmo para todos os projetos.
+            # Elimina acoplamento cross-project de storage_key (finding M4).
+            object_key = shared_omics_storage_key(
+                dataset_accession=dataset.accession,
+                filename=filename,
+            )
+        else:
+            # Namespace project-scoped: dado controlado ou desconhecido é isolado.
+            # Carga de matriz controlada não é suportada — este branch é defensivo.
+            object_key = omics_storage_key(
+                user_id=self.user.id,
+                project_id=self.project.id,
+                dataset_accession=dataset.accession,
+                filename=filename,
+            )
 
         logger.info(
             'Fazendo upload do Parquet para default_storage '

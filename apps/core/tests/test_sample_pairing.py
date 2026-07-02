@@ -630,6 +630,32 @@ class SamplePairingIsolationTests(TestCase):
         resolved = SamplePairingService.resolve_matrix(project_ccrcc, matrix_id=None)
         self.assertEqual(resolved.id, matrix_ccrcc.id)
 
+    def test_resolve_matrix_excluded_dataset_raises(self):
+        """
+        Regressão A1: resolve_matrix NÃO resolve matrix de dataset com
+        curation_status=EXCLUDED no ProjectDataset — datasets descartados
+        pelo pesquisador não são elegíveis a pareamento.
+
+        Contraste: INCLUDED é resolvido (happy path load→pair intacto).
+        """
+        # Dataset A está vinculado com INCLUDED (setUp), matrix_a é resolvível
+        resolved = SamplePairingService.resolve_matrix(
+            self.project_a, matrix_id=self.matrix_a.id
+        )
+        self.assertEqual(resolved.id, self.matrix_a.id)
+
+        # Exclui o ProjectDataset do projeto A → dataset_a agora está EXCLUDED
+        ProjectDataset.objects.filter(
+            project=self.project_a,
+            dataset=self.dataset_a,
+        ).update(curation_status=ProjectDataset.CurationStatus.EXCLUDED)
+
+        # Após exclusão, resolve_matrix deve levantar MatrixNotFoundError
+        with self.assertRaises(MatrixNotFoundError):
+            SamplePairingService.resolve_matrix(
+                self.project_a, matrix_id=self.matrix_a.id
+            )
+
     def test_pairing_only_within_own_matrix(self):
         """
         run() na matrix_a não cria pares para matrix_b, mesmo que as amostras
