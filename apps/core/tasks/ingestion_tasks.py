@@ -942,6 +942,113 @@ def run_omics_download(self, project_id: str, dataset_id: int, file_kind: str = 
 
 @shared_task(
     bind=True,
+    max_retries=2,
+    # Carga de matriz CPTAC: download de dois arquivos CCT (~100–200 MB cada)
+    # + parse streaming + escrita de Parquet local + upload via default_storage.
+    # Estimativa conservadora: 2 horas para redes lentas / storage remoto.
+    time_limit=4 * 3600,
+    soft_time_limit=3 * 3600 + 50 * 60,
+    acks_late=True,
+)
+def run_matrix_load(self, job_id: str, project_id: str):
+    """
+    Orquestra a carga de matriz CPTAC (OmnisPathway Obj 2, Fase 0).
+
+    Wrapper fino que delega ao MatrixLoadService.run().  A task resolve
+    o projeto e o job pelo ID antes de processar, garantindo isolamento
+    (o job foi criado pelo MatrixLoadService.dispatch, que verificou que
+    o projeto pertence ao usuário autenticado).
+
+    Fluxo:
+      1. Resolve DaVinciProject e IngestionJob pelos IDs recebidos.
+      2. Resolve OmicDataset via MatrixLoadService._get_or_create_dataset().
+      3. Delega o corpo da carga a MatrixLoadService.run(job=job).
+         (Rust → manifest → upload → ORM set-based → job COMPLETED)
+
+    Regra #1: task apenas orquestra — não faz HTTP nem parse de dados.
+    Sensitive-data-handling: db_url nunca logada nem gravada em parameters.
+    """
+    from apps.core.models import DaVinciProject
+    from apps.core.services.matrix_load_service import MatrixLoadService
+
+    try:
+        import rust_engine  # noqa: F401 — valida disponibilidade antes de iniciar
+    except ImportError:
+        try:
+            job = IngestionJob.objects.get(id=job_id)
+            IngestionJob.objects.filter(id=job.id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=(
+                    'rust_engine not installed — compile with '
+                    '`maturin develop --release`'
+                ),
+            )
+        except IngestionJob.DoesNotExist:
+            pass
+        return {'n_features': 0, 'n_samples': 0, 'errors': ['rust_engine not installed']}
+
+    try:
+        try:
+            project = DaVinciProject.objects.select_related('user').get(id=project_id)
+        except DaVinciProject.DoesNotExist:
+            logger.warning(
+                'run_matrix_load: DaVinciProject %s não encontrado — task abortada',
+                project_id,
+            )
+            return {'n_features': 0, 'n_samples': 0, 'errors': ['project not found']}
+
+        try:
+            job = IngestionJob.objects.get(id=job_id)
+        except IngestionJob.DoesNotExist:
+            logger.warning(
+                'run_matrix_load: IngestionJob %s não encontrado — task abortada',
+                job_id,
+            )
+            return {'n_features': 0, 'n_samples': 0, 'errors': ['job not found']}
+
+        # Isolamento: confirma que o job pertence ao projeto recebido
+        if str(job.project_id) != str(project_id):
+            logger.error(
+                'run_matrix_load: job %s não pertence ao projeto %s — task abortada (isolamento)',
+                job_id,
+                project_id,
+            )
+            IngestionJob.objects.filter(id=job.id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message='Isolamento: job não pertence ao projeto informado.',
+            )
+            return {'n_features': 0, 'n_samples': 0, 'errors': ['isolation violation']}
+
+        service = MatrixLoadService(project)
+        result = service.run(job=job)
+
+        return {
+            'n_features': result['n_features'],
+            'n_samples': result['n_samples'],
+            'storage_key': result['storage_key'],
+            'roles': result['roles'],
+            'errors': [],
+        }
+
+    except Exception as exc:
+        logger.error(
+            'run_matrix_load falhou para projeto %s / job %s: %s',
+            project_id,
+            job_id,
+            exc,
+        )
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=str(exc),
+            )
+        except Exception:
+            pass
+        raise self.retry(exc=exc, countdown=120)
+
+
+@shared_task(
+    bind=True,
     max_retries=3,
     # Resolução SRX→SRR é HTTP + parse — tipicamente segundos a poucos minutos.
     # Limites generosos para datasets grandes com muitos GSM.

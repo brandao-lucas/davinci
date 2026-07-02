@@ -3,6 +3,7 @@ pub mod downloader;
 pub mod elink;
 pub mod geo_parser;
 pub mod gwas_parser;
+pub mod matrix_loader;
 pub mod models;
 pub mod pride_parser;
 pub mod sample_parser;

@@ -1399,6 +1399,170 @@ fn resolve_fastq_urls(
     }
 }
 
+// ─── CPTAC matrix loader (Obj 2 — Fase 0, passo 0.2) ────────────────────────
+
+/// Metadados de uma coluna de amostra no manifesto do Parquet.
+///
+/// Campos:
+/// - `case_id`: ID original da amostra (ex.: `C3L-00004`), sem prefixo de role.
+/// - `sample_role`: `"tumor"` ou `"normal"`.
+/// - `column_index`: posição 0-based da coluna no Parquet (col 0 = `feature`; amostras ≥ 1).
+#[pyclass]
+#[derive(Clone)]
+pub struct CptacSampleColumn {
+    #[pyo3(get)]
+    pub case_id: String,
+    #[pyo3(get)]
+    pub sample_role: String,
+    #[pyo3(get)]
+    pub column_index: usize,
+}
+
+#[pymethods]
+impl CptacSampleColumn {
+    #[new]
+    fn new() -> Self {
+        CptacSampleColumn {
+            case_id: String::new(),
+            sample_role: String::new(),
+            column_index: 0,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CptacSampleColumn(case_id={:?}, sample_role={:?}, column_index={})",
+            self.case_id, self.sample_role, self.column_index
+        )
+    }
+}
+
+/// Manifesto retornado por `load_cptac_matrix`.
+///
+/// Contrato de handoff para o vitruvio (passo 0.3):
+///
+/// | Campo | Tipo | Descrição |
+/// |---|---|---|
+/// | `parquet_path` | `str` | Caminho absoluto do Parquet gravado em `dest_dir`. |
+/// | `checksum_md5` | `str` | MD5 lowercase-hex do arquivo Parquet. |
+/// | `n_features` | `int` | Genes na interseção tumor ∩ normal. |
+/// | `n_samples` | `int` | Total de amostras (tumor + normal). |
+/// | `sample_columns` | `list[CptacSampleColumn]` | Colunas de amostra ordenadas: tumor primeiro, depois normal. |
+/// | `genes_discarded` | `int` | Genes presentes em apenas um arquivo (não na interseção). |
+///
+/// O vitruvio usa `parquet_path` para fazer upload via `default_storage` e
+/// `sample_columns` para criar os registros `OmicMatrixSample`.
+#[pyclass]
+pub struct CptacMatrixManifest {
+    #[pyo3(get)]
+    pub parquet_path: String,
+    #[pyo3(get)]
+    pub checksum_md5: String,
+    #[pyo3(get)]
+    pub n_features: usize,
+    #[pyo3(get)]
+    pub n_samples: usize,
+    #[pyo3(get)]
+    pub sample_columns: Vec<CptacSampleColumn>,
+    #[pyo3(get)]
+    pub genes_discarded: usize,
+}
+
+#[pymethods]
+impl CptacMatrixManifest {
+    fn __repr__(&self) -> String {
+        format!(
+            "CptacMatrixManifest(n_features={}, n_samples={}, genes_discarded={}, checksum_md5={:?})",
+            self.n_features, self.n_samples, self.genes_discarded, self.checksum_md5
+        )
+    }
+}
+
+/// Baixa a matriz proteômica CPTAC CCRCC do LinkedOmics, normaliza e grava Parquet.
+///
+/// # Fluxo
+///
+/// 1. Valida `tumor_url` e `normal_url` (devem ser `https://www.linkedomics.org/…`).
+/// 2. Baixa os dois arquivos `.cct` para `dest_dir` com `User-Agent` de browser
+///    (LinkedOmics bloqueia sem UA) via streaming chunked.
+/// 3. Parseia cada arquivo em streaming, uma passada, sem bufferizar em String:
+///    extrai cabeçalho (Case_IDs) e dados (gene symbol + valores float).
+///    Células vazias / `NA` / `NaN` → `null` no Parquet.
+/// 4. Alinha os dois arquivos por gene symbol (interseção), em ordem alfabética.
+///    Genes exclusivos de um arquivo são descartados e contados em `genes_discarded`.
+/// 5. Grava UM arquivo Parquet em `dest_dir/<parquet_name>`:
+///    - Coluna `feature` (Utf8): gene symbol.
+///    - Colunas `T_<case_id>` (Float32, nullable): amostras tumor.
+///    - Colunas `N_<case_id>` (Float32, nullable): amostras normal.
+/// 6. Retorna `CptacMatrixManifest` com caminho, MD5, `n_features`, `n_samples`
+///    e lista de `CptacSampleColumn` com `case_id`, `sample_role`, `column_index`.
+///
+/// # Segurança
+///
+/// URLs são validadas contra `https://www.linkedomics.org/` antes de qualquer
+/// fetch (proteção SSRF). Path traversal (`..`) é rejeitado.
+///
+/// # Idempotência
+///
+/// Re-rodar com o mesmo `dest_dir` regrava os arquivos de forma determinística.
+/// Mesmo conteúdo → mesmo MD5 do Parquet.
+///
+/// # Não faz
+///
+/// - Não toca o Postgres (nem COPY, nem ORM).
+/// - Não cria `OmicMatrix` / `OmicMatrixSample` — isso é responsabilidade do vitruvio (0.3).
+///
+/// # Argumentos
+///
+/// | Parâmetro | Tipo | Descrição |
+/// |---|---|---|
+/// | `tumor_url` | `str` | URL do `.cct` tumor (deve ser `https://www.linkedomics.org/…`). |
+/// | `normal_url` | `str` | URL do `.cct` normal (idem). |
+/// | `dest_dir` | `str` | Diretório local onde os arquivos e o Parquet serão gravados. |
+/// | `parquet_name` | `str` | Nome do arquivo Parquet de saída (ex.: `"cptac_ccrcc_proteome.parquet"`). |
+///
+/// # Retorno
+///
+/// `CptacMatrixManifest` — ver campos acima.
+/// Lança `PyRuntimeError` em caso de erro fatal (URL inválida, falha HTTP, falha de I/O).
+#[pyfunction]
+#[pyo3(signature = (tumor_url, normal_url, dest_dir, parquet_name = "cptac_ccrcc_proteome.parquet"))]
+fn load_cptac_matrix(
+    tumor_url: String,
+    normal_url: String,
+    dest_dir: String,
+    parquet_name: &str,
+) -> PyResult<CptacMatrixManifest> {
+    match crate::omics::matrix_loader::load_cptac_matrix(
+        &tumor_url,
+        &normal_url,
+        &dest_dir,
+        parquet_name,
+    ) {
+        Ok(manifest) => {
+            let sample_columns: Vec<CptacSampleColumn> = manifest
+                .sample_columns
+                .into_iter()
+                .map(|sc| CptacSampleColumn {
+                    case_id: sc.case_id,
+                    sample_role: sc.sample_role,
+                    column_index: sc.column_index,
+                })
+                .collect();
+
+            Ok(CptacMatrixManifest {
+                parquet_path: manifest.parquet_path,
+                checksum_md5: manifest.checksum_md5,
+                n_features: manifest.n_features,
+                n_samples: manifest.n_samples,
+                sample_columns,
+                genes_discarded: manifest.genes_discarded,
+            })
+        }
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
 // ─── NER bindings ─────────────────────────────────────────────────────────────
 
 /// Extrai genes mencionados em `text` usando o dicionário HGNC canônico.
@@ -1436,5 +1600,9 @@ fn rust_engine(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pubmed_magnitude_preview, m)?)?;
     m.add_function(wrap_pyfunction!(mesh_suggest, m)?)?;
     m.add_function(wrap_pyfunction!(extract_genes, m)?)?;
+    // CPTAC matrix loader (Obj 2 — Fase 0)
+    m.add_class::<CptacSampleColumn>()?;
+    m.add_class::<CptacMatrixManifest>()?;
+    m.add_function(wrap_pyfunction!(load_cptac_matrix, m)?)?;
     Ok(())
 }

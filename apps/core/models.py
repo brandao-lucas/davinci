@@ -446,6 +446,7 @@ class OmicDataset(models.Model):
         SRA = 'sra', 'Sequence Read Archive'
         ARRAYEXPRESS = 'arrayexpress', 'ArrayExpress'
         TCGA = 'tcga', 'TCGA'
+        CPTAC = 'cptac', 'CPTAC (Clinical Proteomic Tumor Analysis Consortium)'
         BIOPROJECT = 'bioproject', 'BioProject'
         GWAS_CATALOG = 'gwas_catalog', 'GWAS Catalog'
 
@@ -1072,6 +1073,386 @@ class DatasetPaperLinkPending(models.Model):
 
     def __str__(self):
         return f"Pending: {self.dataset_accession} ↔ PMID:{self.paper_pmid}"
+
+
+# =============================================================================
+# SEÇÃO 3b: MATRIZ MATERIALIZADA (OmnisPathway Objetivo 2, Fase 0)
+# =============================================================================
+
+class OmicMatrix(models.Model):
+    """
+    Matriz numérica densa carregada de um dataset ômico — METADADO/PONTEIRO.
+
+    OmnisPathway Objetivo 2, Fase 0 (schema "opção A", decisão travada
+    2026-06-28). O corpo numérico denso (features × amostras) vive como
+    artefato **Parquet** no object storage (`default_storage`), NUNCA como
+    células relacionais no Postgres. Este model guarda apenas
+    metadados/proveniência e o ponteiro lógico para o Parquet (`storage_key`).
+
+    Fronteira de camadas:
+      - Rust (ferris) baixa da fonte, parseia em streaming e escreve o Parquet
+        em disco local + faz COPY dos metadados desta tabela (Regra #1/#5).
+      - Django (vitruvio) faz upload do Parquet via `default_storage` e grava
+        `storage_key` (chave LÓGICA, jamais caminho físico absoluto).
+      - O DDL (esta tabela) é migration do cartografo — Rust nunca cria tabela.
+
+    Auditoria/proveniência (não é curadoria — matriz é derivada): `source_pointer`
+    (cópia textual do `matrix_pointer` consumido), `checksum_md5` (integridade do
+    artefato), `loaded_at` e `loader_version` (qual versão do loader produziu).
+
+    NOTA (escopo estrito): NÃO há `OmicMatrixFeature` aqui. A promoção A→C
+    (eixo de features indexado no PG, para consultar feature sem abrir o Parquet)
+    é migration aditiva FUTURA, com gatilho na Fase 3 — não construir agora.
+    """
+
+    class DataFormatLevel(models.TextChoices):
+        COUNTS = 'counts', 'Counts (contagens brutas)'
+        TPM = 'tpm', 'TPM'
+        INTENSITIES = 'intensities', 'Intensidades (proteoma/MS)'
+        BETAS = 'betas', 'Betas (metilação)'
+
+    class FeatureAxis(models.TextChoices):
+        GENE = 'gene', 'Gene'
+        PROTEIN = 'protein', 'Proteína'
+        PHOSPHO_SITE = 'phospho_site', 'Fosfo-sítio'
+        PROBE = 'probe', 'Probe'
+
+    dataset = models.ForeignKey(
+        OmicDataset,
+        on_delete=models.CASCADE,
+        related_name='matrices',
+        help_text='Dataset ômico de origem da matriz.'
+    )
+
+    # Camada ômica — REUSA o vocabulário canônico de OmicDataset (minúsculas).
+    omics_layer = models.CharField(
+        'Camada Ômica',
+        max_length=40,
+        help_text='Camada ômica canônica (genomic, transcriptomic, proteomic, '
+                  '...). Reusa OmicDataset.OMICS_LAYER_VOCAB.'
+    )
+    data_format_level = models.CharField(
+        'Nível do Formato',
+        max_length=20,
+        choices=DataFormatLevel.choices,
+        help_text='Granularidade quantitativa da matriz (counts/TPM/'
+                  'intensities/betas).'
+    )
+    feature_axis = models.CharField(
+        'Eixo de Features',
+        max_length=20,
+        choices=FeatureAxis.choices,
+        help_text='Entidade indexada nas linhas da matriz.'
+    )
+
+    # Proveniência e ponteiro lógico ao artefato Parquet.
+    source_pointer = models.TextField(
+        'Ponteiro de Origem',
+        blank=True,
+        default='',
+        help_text='Cópia textual do matrix_pointer consumido (proveniência).'
+    )
+    storage_key = models.TextField(
+        'Storage Key',
+        blank=True,
+        default='',
+        help_text='Chave LÓGICA do artefato Parquet em default_storage. '
+                  'NUNCA caminho físico absoluto. Vazio até o upload concluir.'
+    )
+
+    # Dimensões e integridade.
+    n_features = models.PositiveIntegerField(
+        'Nº de Features',
+        null=True,
+        blank=True,
+        help_text='Linhas da matriz (features). NULL até a carga concluir.'
+    )
+    n_samples = models.PositiveIntegerField(
+        'Nº de Amostras',
+        null=True,
+        blank=True,
+        help_text='Colunas da matriz (amostras). NULL até a carga concluir.'
+    )
+    checksum_md5 = models.CharField(
+        'Checksum MD5',
+        max_length=128,
+        blank=True,
+        default='',
+        help_text='MD5 do artefato Parquet (integridade).'
+    )
+
+    # Auditoria/proveniência.
+    loader_version = models.CharField(
+        'Versão do Loader',
+        max_length=50,
+        help_text='Versão do loader Rust que produziu a matriz — parte da '
+                  'chave natural (re-carga com loader novo coexiste).'
+    )
+    loaded_at = models.DateTimeField('Carregado em', auto_now=True)
+
+    class Meta:
+        constraints = [
+            # Chave natural: a MESMA matriz (dataset, camada, eixo, versão do
+            # loader) é uma linha só → ON CONFLICT DO UPDATE do COPY do Rust.
+            # loader_version na chave permite que uma re-carga com loader novo
+            # coexista com a antiga (auditoria), sem colidir.
+            models.UniqueConstraint(
+                fields=['dataset', 'omics_layer', 'feature_axis', 'loader_version'],
+                name='omicmatrix_natural_key_uniq',
+            ),
+            # omics_layer reusa o vocabulário canônico de OmicDataset (mesmo
+            # conjunto do CheckConstraint omicdataset_omics_layers_valid).
+            models.CheckConstraint(
+                name='omicmatrix_omics_layer_valid',
+                condition=models.Q(omics_layer__in=[
+                    'genomic', 'transcriptomic', 'proteomic', 'metabolomic',
+                    'epigenomic', 'metagenomic', 'microbiome',
+                ]),
+            ),
+            models.CheckConstraint(
+                name='omicmatrix_data_format_level_valid',
+                condition=models.Q(data_format_level__in=[
+                    'counts', 'tpm', 'intensities', 'betas',
+                ]),
+            ),
+            models.CheckConstraint(
+                name='omicmatrix_feature_axis_valid',
+                condition=models.Q(feature_axis__in=[
+                    'gene', 'protein', 'phospho_site', 'probe',
+                ]),
+            ),
+        ]
+        indexes = [
+            # Caminho quente: matrizes de um dataset por camada
+            # (ex.: "proteoma deste estudo CPTAC"). A UniqueConstraint cobre o
+            # prefixo (dataset) e (dataset, omics_layer), mas este índice
+            # dedicado serve consultas que filtram só por (dataset, camada)
+            # sem o eixo/versão, mantendo-as cobertas.
+            models.Index(
+                fields=['dataset', 'omics_layer'],
+                name='omicmatrix_dataset_layer_idx',
+            ),
+        ]
+        verbose_name = 'Omic matrix'
+        verbose_name_plural = 'Omic matrices'
+
+    def __str__(self):
+        return (
+            f"{self.dataset.accession} · {self.omics_layer}/{self.feature_axis} "
+            f"[{self.loader_version}]"
+        )
+
+
+class OmicMatrixSample(models.Model):
+    """
+    Mapeia uma COLUNA da matriz Parquet → uma `OmicSample` — TABELA-PONTE.
+
+    OmnisPathway Objetivo 2, Fase 0. Liga a posição da coluna no artefato
+    Parquet (`column_index`) à amostra canônica do banco, e carrega o papel da
+    amostra (`sample_role`) para o contraste tumor vs normal pareado que o PFS
+    consome nas fases seguintes.
+
+    Gravação é responsabilidade do ferris/Rust (COPY/UPSERT por
+    (matrix, sample) durante a carga), NÃO deste model — espelha o padrão de
+    SampleSraRun/DatasetFile.
+    """
+
+    class SampleRole(models.TextChoices):
+        TUMOR = 'tumor', 'Tumor'
+        NORMAL = 'normal', 'Normal'
+        UNKNOWN = 'unknown', 'Desconhecido'
+
+    matrix = models.ForeignKey(
+        OmicMatrix,
+        on_delete=models.CASCADE,
+        related_name='matrix_samples',
+        help_text='Matriz a que esta coluna pertence.'
+    )
+    sample = models.ForeignKey(
+        OmicSample,
+        on_delete=models.CASCADE,
+        related_name='matrix_columns',
+        help_text='Amostra canônica mapeada por esta coluna.'
+    )
+    column_index = models.PositiveIntegerField(
+        'Índice da Coluna',
+        help_text='Posição 0-based da coluna no artefato Parquet.'
+    )
+    sample_role = models.CharField(
+        'Papel da Amostra',
+        max_length=10,
+        choices=SampleRole.choices,
+        default=SampleRole.UNKNOWN,
+        help_text='Papel no contraste pareado (tumor/normal/unknown).'
+    )
+
+    class Meta:
+        constraints = [
+            # Chave natural: uma amostra aparece uma vez por matriz →
+            # ON CONFLICT DO UPDATE do COPY do Rust e idempotência da carga.
+            # Cobre também a query quente "amostras desta matriz" (prefixo
+            # matrix), dispensando índice extra no FK matrix.
+            models.UniqueConstraint(
+                fields=['matrix', 'sample'],
+                name='omicmatrixsample_matrix_sample_uniq',
+            ),
+            # Posição da coluna é única dentro de uma matriz (não há duas
+            # amostras na mesma coluna).
+            models.UniqueConstraint(
+                fields=['matrix', 'column_index'],
+                name='omicmatrixsample_matrix_column_uniq',
+            ),
+            models.CheckConstraint(
+                name='omicmatrixsample_sample_role_valid',
+                condition=models.Q(sample_role__in=['tumor', 'normal', 'unknown']),
+            ),
+        ]
+        # FK `sample` ganha B-tree automático (join `sample__dataset` e
+        # caminho "em quais matrizes esta amostra entra"). FK `matrix` fica
+        # coberto pelo prefixo das UniqueConstraints acima.
+
+    def __str__(self):
+        return (
+            f"{self.matrix_id} · col {self.column_index} → "
+            f"{self.sample.accession} [{self.sample_role}]"
+        )
+
+
+class OmicSamplePairing(models.Model):
+    """
+    Par amostral tumor↔normal materializado dentro de UMA matriz — catálogo
+    DERIVADO.
+
+    OmnisPathway Objetivo 2, Fase 1 (pareamento nível-amostra). Materializa o
+    contraste tumor vs normal pareado que o PFS consome na Fase 4. Um par liga
+    duas `OmicSample` (papéis `tumor` e `normal`) que compartilham o MESMO
+    `case_id` (paciente) DENTRO da mesma `matrix` — sobreposição real de
+    amostras no estudo, não coincidência de chave assumida.
+
+    Granularidade da Fase 0: um `OmicSample` por `(case_id, role)`
+    (`accession = f"{case_id}_{role}"`, único global) → no máximo 1 tumor + 1
+    normal por `case_id` por matriz. Logo a chave natural é
+    `(matrix, case_id)`: um par por paciente por matriz.
+
+    `case_id` é DENORMALIZADO aqui (cópia de `OmicSample.characteristics
+    ['case_id']`, fonte estruturada gravada pelo loader da Fase 0) para join e
+    auditoria sem reabrir o JSON — `OmicSample` NÃO ganha coluna própria nesta
+    fase.
+
+    Fronteira de camadas / curadoria:
+      - O DDL (esta tabela) é migration do cartografo.
+      - A lógica set-based de pareamento + validação de sobreposição real é do
+        vitruvio (service/command, Fase 1.2) — NÃO deste model, NÃO em Rust
+        (ORM puro sobre metadados; não abre o Parquet).
+      - É catálogo DERIVADO (não curadoria de usuário): delete/regeneração são
+        permitidos; a Regra #2 (rastreabilidade de curadoria) não se aplica.
+
+    Auditoria/proveniência (espelha `loader_version`/`loaded_at` de OmicMatrix):
+    `pairing_basis` (base da decisão), `confidence`, `validated_overlap`
+    (marca sobreposição real confirmada), `pairing_version` (versão do
+    algoritmo que produziu o par) e `paired_at`.
+    """
+
+    class PairingBasis(models.TextChoices):
+        SHARED_CASE_ID = 'shared_case_id', 'Case_ID compartilhado'
+        SAMPLE_JOIN_KEY = 'sample_join_key', 'sample_join_key do export'
+        MANUAL = 'manual', 'Curadoria manual'
+
+    matrix = models.ForeignKey(
+        OmicMatrix,
+        on_delete=models.CASCADE,
+        related_name='sample_pairings',
+        help_text='Matriz (estudo+camada+versão do loader) que ancora o par.'
+    )
+    tumor_sample = models.ForeignKey(
+        OmicSample,
+        on_delete=models.CASCADE,
+        related_name='as_tumor_in_pairings',
+        help_text='Amostra com papel tumor do par.'
+    )
+    normal_sample = models.ForeignKey(
+        OmicSample,
+        on_delete=models.CASCADE,
+        related_name='as_normal_in_pairings',
+        help_text='Amostra com papel normal do par.'
+    )
+
+    # case_id denormalizado (cópia de OmicSample.characteristics['case_id']).
+    case_id = models.CharField(
+        'Case ID',
+        max_length=64,
+        help_text='Paciente (case_id) que fundamenta o par. Denormalizado de '
+                  'OmicSample.characteristics["case_id"] para join/auditoria.'
+    )
+
+    # Proveniência da decisão de pareamento.
+    pairing_basis = models.CharField(
+        'Base do Pareamento',
+        max_length=20,
+        choices=PairingBasis.choices,
+        default=PairingBasis.SHARED_CASE_ID,
+        help_text='Critério que fundamentou o par (shared_case_id nesta fase).'
+    )
+    confidence = models.FloatField(
+        'Confiança',
+        default=1.0,
+        help_text='Confiança do par (1.0 para shared_case_id validado contra '
+                  'sobreposição real na mesma matriz).'
+    )
+    validated_overlap = models.BooleanField(
+        'Sobreposição Validada',
+        default=False,
+        help_text='True quando tumor E normal existem para o case_id na MESMA '
+                  'matriz (sobreposição real confirmada, não assumida).'
+    )
+
+    # Auditoria/proveniência (espelha loader_version/loaded_at de OmicMatrix).
+    pairing_version = models.CharField(
+        'Versão do Pareamento',
+        max_length=50,
+        blank=True,
+        default='',
+        help_text='Versão do algoritmo de pareamento que produziu o par.'
+    )
+    paired_at = models.DateTimeField('Pareado em', auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            # Chave natural: um par por paciente por matriz. A granularidade da
+            # Fase 0 (1 OmicSample por (case_id, role)) garante no máximo 1
+            # tumor + 1 normal por case_id na matriz → idempotência da geração
+            # (bulk_create ignore_conflicts). Cobre também a query quente
+            # "pares deste estudo" (prefixo matrix), dispensando índice extra
+            # no FK matrix.
+            models.UniqueConstraint(
+                fields=['matrix', 'case_id'],
+                name='omicsamplepairing_natural_key_uniq',
+            ),
+            models.CheckConstraint(
+                name='omicsamplepairing_pairing_basis_valid',
+                condition=models.Q(pairing_basis__in=[
+                    'shared_case_id', 'sample_join_key', 'manual',
+                ]),
+            ),
+        ]
+        indexes = [
+            # FKs tumor_sample/normal_sample ganham B-tree automático (caminho
+            # "em quais pares esta amostra entra"). FK matrix fica coberto pelo
+            # prefixo da UniqueConstraint. Índice dedicado por case_id para a
+            # query "pares deste paciente" cross-matriz (sem o prefixo matrix).
+            models.Index(
+                fields=['case_id'],
+                name='omicsamplepairing_case_id_idx',
+            ),
+        ]
+        verbose_name = 'Omic sample pairing'
+        verbose_name_plural = 'Omic sample pairings'
+
+    def __str__(self):
+        return (
+            f"{self.matrix_id} · {self.case_id}: "
+            f"{self.tumor_sample.accession} ↔ {self.normal_sample.accession}"
+        )
 
 
 # =============================================================================
@@ -1873,6 +2254,7 @@ class IngestionJob(models.Model):
         GEO_SUPPLEMENTARY_DOWNLOAD = 'geo_supplementary_download', 'Download Suplementar GEO'
         FASTQ_DOWNLOAD = 'fastq_download', 'Download FASTQ'
         SRA_RESOLUTION = 'sra_resolution', 'Resolução GSM→SRR (GEO→SRA)'
+        MATRIX_LOAD = 'matrix_load', 'Carga de Matriz (OmnisPathway Obj 2)'
 
     class JobStatus(models.TextChoices):
         PENDING = 'pending', 'Pendente'

@@ -26,3 +26,6 @@ chrono = "0.4"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 bytes = "1"
 aho-corasick = "1.1"
+arrow = { version = "53", default-features = false, features = ["csv"] }
+parquet = { version = "53", default-features = false, features = ["arrow"] }
+tempfile = "3"
