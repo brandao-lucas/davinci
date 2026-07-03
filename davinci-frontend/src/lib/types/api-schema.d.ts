@@ -626,7 +626,7 @@ export interface paths {
          *
          *     Isolamento por usuário: apenas datasets do projeto do usuário autenticado (404 se projeto não pertence ao user).
          */
-        get: operations["projects_datasets_export_list"];
+        get: operations["projects_datasets_export_retrieve"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1775,6 +1775,22 @@ export interface components {
             readonly snapshot_version: string;
         };
         /**
+         * @description Bloco de proveniência injetado no envelope JSON do export.
+         *
+         *     Campos:
+         *       timestamp_utc            — ISO 8601 UTC do momento da consulta.
+         *       snapshot_version         — valor de ?version= (default 'live').
+         *       classifier_rules_version — versão das regras de classificação aplicadas.
+         */
+        DatasetExportProvenance: {
+            /** @description ISO 8601 UTC do momento da consulta (ex.: '2024-06-01T12:00:00+00:00'). */
+            timestamp_utc: string;
+            /** @description Versão do snapshot solicitado (?version=). 'live' indica consulta ao vivo. */
+            snapshot_version: string;
+            /** @description Versão das regras de classificação OmnisPathway aplicadas (Fases 2/3). */
+            classifier_rules_version: string;
+        };
+        /**
          * @description Serializer read-only de DatasetFile.
          *
          *     Campos expostos:
@@ -2194,9 +2210,10 @@ export interface components {
          *     * `geo_supplementary_download` - Download Suplementar GEO
          *     * `fastq_download` - Download FASTQ
          *     * `sra_resolution` - Resolução GSM→SRR (GEO→SRA)
+         *     * `matrix_load` - Carga de Matriz (OmnisPathway Obj 2)
          * @enum {string}
          */
-        JobTypeEnum: "pubmed_search" | "pubmed_fetch" | "geo_search" | "sra_search" | "gwas_search" | "pride_search" | "sample_fetch" | "variant_annotation" | "gene_ner" | "drug_ner" | "context_extraction" | "geo_supplementary_download" | "fastq_download" | "sra_resolution";
+        JobTypeEnum: "pubmed_search" | "pubmed_fetch" | "geo_search" | "sra_search" | "gwas_search" | "pride_search" | "sample_fetch" | "variant_annotation" | "gene_ner" | "drug_ner" | "context_extraction" | "geo_supplementary_download" | "fastq_download" | "sra_resolution" | "matrix_load";
         /**
          * @description Resumo de um vínculo ProjectPaperDataset para exibir no detalhe de um paper.
          *
@@ -2497,20 +2514,27 @@ export interface components {
             previous?: string | null;
             results: components["schemas"]["DaVinciProject"][];
         };
-        PaginatedDatasetExportItemList: {
-            /** @example 123 */
+        /**
+         * @description Envelope completo da resposta JSON paginada do export.
+         *
+         *     Espelha o shape real entregue em runtime:
+         *       {count, next, previous, results, provenance}
+         *
+         *     Usado exclusivamente para anotação OpenAPI (@extend_schema responses=).
+         *     Não é instanciado para serializar dados em runtime — o paginator.get_paginated_response()
+         *     + injeção manual de provenance continuam sendo a fonte de verdade.
+         */
+        PaginatedDatasetExport: {
+            /** @description Total de itens (sem paginação). */
             count: number;
-            /**
-             * Format: uri
-             * @example http://api.example.org/accounts/?page=4
-             */
-            next?: string | null;
-            /**
-             * Format: uri
-             * @example http://api.example.org/accounts/?page=2
-             */
-            previous?: string | null;
-            results: components["schemas"]["DatasetExportItem"][];
+            /** @description URL da próxima página, ou null se for a última. */
+            next: string | null;
+            /** @description URL da página anterior, ou null se for a primeira. */
+            previous: string | null;
+            /** @description Lista de itens da página atual. */
+            readonly results: components["schemas"]["DatasetExportItem"][];
+            /** @description Bloco de proveniência: timestamp, snapshot_version e versão das regras. */
+            provenance: components["schemas"]["DatasetExportProvenance"];
         };
         PaginatedDatasetFileList: {
             /** @example 123 */
@@ -3536,11 +3560,12 @@ export interface components {
          *     * `sra` - Sequence Read Archive
          *     * `arrayexpress` - ArrayExpress
          *     * `tcga` - TCGA
+         *     * `cptac` - CPTAC (Clinical Proteomic Tumor Analysis Consortium)
          *     * `bioproject` - BioProject
          *     * `gwas_catalog` - GWAS Catalog
          * @enum {string}
          */
-        SourceDbEnum: "geo" | "sra" | "arrayexpress" | "tcga" | "bioproject" | "gwas_catalog";
+        SourceDbEnum: "geo" | "sra" | "arrayexpress" | "tcga" | "cptac" | "bioproject" | "gwas_catalog";
         /**
          * @description * `geo_ftp` - GEO FTP (NCBI)
          *     * `ena_ftp` - ENA FTP
@@ -4579,7 +4604,7 @@ export interface operations {
             };
         };
     };
-    projects_datasets_export_list: {
+    projects_datasets_export_retrieve: {
         parameters: {
             query?: {
                 /** @description public/controlled/unknown */
@@ -4612,14 +4637,8 @@ export interface operations {
                 omics_count_min?: number;
                 /** @description Camada ômica (containment). */
                 omics_layer?: string;
-                /** @description Which field to use when ordering the results. */
-                ordering?: string;
-                /** @description A page number within the paginated result set. */
-                page?: number;
                 /** @description Score mínimo de confiança para sample_join_key. */
                 sample_join_key_confidence_min?: number;
-                /** @description A search term. */
-                search?: string;
                 /** @description Versão do snapshot (default: 'live'). */
                 version?: string;
             };
@@ -4636,7 +4655,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["PaginatedDatasetExportItemList"];
+                    "application/json": components["schemas"]["PaginatedDatasetExport"];
                 };
             };
         };

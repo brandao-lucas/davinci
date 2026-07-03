@@ -195,7 +195,10 @@ from apps.core.serializers.dataset import (
     DatasetBulkCurateRequestSerializer,
     BulkCurateResponseSerializer,
 )
-from apps.core.serializers.dataset_export import DatasetExportItemSerializer
+from apps.core.serializers.dataset_export import (
+    DatasetExportItemSerializer,
+    PaginatedDatasetExportSerializer,
+)
 from apps.core.serializers.download import (
     BatchDownloadQuotaPreviewSerializer,
     BatchDownloadRequestSerializer,
@@ -1058,7 +1061,7 @@ class ProjectDatasetViewSet(
             OpenApiParameter('has_sample_join_key', OpenApiTypes.BOOL, description="True para datasets com sample_join_key preenchido."),
             OpenApiParameter('access_type', OpenApiTypes.STR, description="public/controlled/unknown"),
         ],
-        responses={200: DatasetExportItemSerializer(many=True)},
+        responses={200: PaginatedDatasetExportSerializer},
         summary="Exportar catálogo de datasets do projeto (JSON paginado ou CSV stream)",
         description=(
             "Entrega ponteiros + metadados + filtros do contrato §2 para todos os datasets "

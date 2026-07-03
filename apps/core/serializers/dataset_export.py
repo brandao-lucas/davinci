@@ -16,6 +16,14 @@ DatasetExportItemSerializer:
 
     snapshot_version: injetado via context (chave 'snapshot_version').
     Se ausente no context, retorna 'live'.
+
+DatasetExportProvenanceSerializer:
+    Bloco de proveniência injetado no envelope JSON do export.
+    Expõe timestamp_utc, snapshot_version e classifier_rules_version.
+
+PaginatedDatasetExportSerializer:
+    Envelope completo da resposta JSON paginada (count/next/previous/results/provenance).
+    Usado exclusivamente para anotação OpenAPI — não é instanciado em runtime.
 """
 
 from drf_spectacular.utils import extend_schema_field
@@ -225,3 +233,57 @@ class DatasetExportItemSerializer(serializers.ModelSerializer):
             'snapshot_version',
         ]
         read_only_fields = fields
+
+
+class DatasetExportProvenanceSerializer(serializers.Serializer):
+    """
+    Bloco de proveniência injetado no envelope JSON do export.
+
+    Campos:
+      timestamp_utc            — ISO 8601 UTC do momento da consulta.
+      snapshot_version         — valor de ?version= (default 'live').
+      classifier_rules_version — versão das regras de classificação aplicadas.
+    """
+
+    timestamp_utc = serializers.CharField(
+        help_text="ISO 8601 UTC do momento da consulta (ex.: '2024-06-01T12:00:00+00:00').",
+    )
+    snapshot_version = serializers.CharField(
+        help_text="Versão do snapshot solicitado (?version=). 'live' indica consulta ao vivo.",
+    )
+    classifier_rules_version = serializers.CharField(
+        help_text="Versão das regras de classificação OmnisPathway aplicadas (Fases 2/3).",
+    )
+
+
+class PaginatedDatasetExportSerializer(serializers.Serializer):
+    """
+    Envelope completo da resposta JSON paginada do export.
+
+    Espelha o shape real entregue em runtime:
+      {count, next, previous, results, provenance}
+
+    Usado exclusivamente para anotação OpenAPI (@extend_schema responses=).
+    Não é instanciado para serializar dados em runtime — o paginator.get_paginated_response()
+    + injeção manual de provenance continuam sendo a fonte de verdade.
+    """
+
+    count = serializers.IntegerField(
+        help_text="Total de itens (sem paginação).",
+    )
+    next = serializers.CharField(
+        allow_null=True,
+        help_text="URL da próxima página, ou null se for a última.",
+    )
+    previous = serializers.CharField(
+        allow_null=True,
+        help_text="URL da página anterior, ou null se for a primeira.",
+    )
+    results = DatasetExportItemSerializer(
+        many=True,
+        read_only=True,
+        help_text="Lista de itens da página atual.",
+    )
+    provenance = DatasetExportProvenanceSerializer(
+        help_text="Bloco de proveniência: timestamp, snapshot_version e versão das regras.",
+    )

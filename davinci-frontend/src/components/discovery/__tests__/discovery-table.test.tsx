@@ -137,12 +137,16 @@ describe('DiscoveryTable — matrix_pointer', () => {
     expect(link).toHaveAttribute('rel', 'noopener noreferrer');
   });
 
-  it('renderiza ponteiro FTP como link', () => {
+  it('renderiza ponteiro FTP como texto puro (não como link) — M8 007', () => {
+    // ftp:// não recebe link clicável: apenas http/https são navegáveis pelo browser;
+    // ftp é texto puro para evitar convidar navegação a protocolo não suportado.
     const pointer = 'ftp://ftp.pride.ebi.ac.uk/pride/data/archive/2021/03/PXD012345/file.tsv';
     const item = makeItem({ contract: { matrix_pointer: pointer } });
     render(<DiscoveryTable items={[item]} />);
-    const link = screen.getByRole('link');
-    expect(link).toHaveAttribute('href', pointer);
+    // Não deve haver elemento <a> clicável
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    // O texto truncado (40 chars) deve aparecer como span
+    expect(screen.getByText(/ftp:\/\/ftp\.pride\.ebi\.ac\.uk\/pride\/data\/ar/)).toBeInTheDocument();
   });
 
   it('renderiza ponteiro não-URL como texto monospace (não como link)', () => {
@@ -181,6 +185,18 @@ describe('DiscoveryTable — matrix_pointer', () => {
     // Texto visível é truncado (máx 40 chars + '…')
     expect(link.textContent).toContain('…');
     expect(link.textContent!.length).toBeLessThan(longPointer.length);
+  });
+
+  it('renderiza URL https como texto puro quando access_controlled=true — M8 007', () => {
+    // Mesmo com https://, se access_controlled=true, NÃO deve haver link clicável.
+    // Não convida navegação a recurso restrito.
+    const pointer = 'https://dbgap.ncbi.nlm.nih.gov/protected/phs001234';
+    const item = makeItem({
+      access_controlled: true,
+      contract: { matrix_pointer: pointer },
+    });
+    render(<DiscoveryTable items={[item]} />);
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
   });
 });
 

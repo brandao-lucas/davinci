@@ -8,7 +8,6 @@ import { QueryErrorState } from '@/components/ui/query-error-state';
 import { Button } from '@/components/ui/button';
 import { useDiscovery, useDownloadDiscovery } from '@/lib/hooks/use-discovery';
 import { useFilterStore } from '@/lib/stores/filter-store';
-import { useDebounce } from '@/lib/hooks/use-debounce';
 import { Loader2, Download, FileJson } from 'lucide-react';
 import type { DiscoveryFilters as DiscoveryFiltersType } from '@/lib/types/discovery';
 
@@ -21,13 +20,7 @@ function DiscoveryPageContent({ projectId }: { projectId: string }) {
 
   const { discoveryFilters, setDiscoveryFilters, clearDiscoveryFilters } = useFilterStore();
   const filters = discoveryFilters[projectId] ?? EMPTY_FILTERS;
-
-  // Debounce aplicado ao campo `search` internamente ao filtrar
-  const debouncedSearch = useDebounce(filters.search, 300);
-  const activeFilters: DiscoveryFiltersType = {
-    ...filters,
-    search: debouncedSearch || undefined,
-  };
+  const activeFilters: DiscoveryFiltersType = { ...filters };
 
   function handleFiltersChange(next: DiscoveryFiltersType) {
     setDiscoveryFilters(projectId, next);
@@ -48,9 +41,8 @@ function DiscoveryPageContent({ projectId }: { projectId: string }) {
   const hasNext = !!data?.next;
   const hasPrev = !!data?.previous;
 
-  // Snapshot/provenance: DatasetExportItem tem snapshot_version por item.
-  // Exibimos a versão do primeiro item como representativa da página (todos devem ser iguais).
-  const snapshotVersion = items[0]?.snapshot_version ?? null;
+  // Provenance: bloco no envelope (fonte correta — data.provenance, não item.snapshot_version)
+  const provenance = data?.provenance ?? null;
 
   return (
     <div className="space-y-4">
@@ -142,11 +134,26 @@ function DiscoveryPageContent({ projectId }: { projectId: string }) {
             </div>
           )}
 
-          {/* Rodapé de proveniência */}
-          {snapshotVersion && (
-            <p className="text-xs text-muted-foreground text-right pt-1">
-              Snapshot: <span className="font-mono">{snapshotVersion}</span>
-            </p>
+          {/* Rodapé de proveniência — fonte: envelope data.provenance */}
+          {provenance && (
+            <div className="text-xs text-muted-foreground text-right pt-1 space-y-0.5">
+              <p>
+                Snapshot:{' '}
+                <span className="font-mono">{provenance.snapshot_version}</span>
+                {' · '}
+                Regras:{' '}
+                <span className="font-mono">{provenance.classifier_rules_version}</span>
+              </p>
+              <p>
+                Gerado em:{' '}
+                <span className="font-mono">
+                  {new Date(provenance.timestamp_utc).toLocaleString('pt-BR', {
+                    dateStyle: 'short',
+                    timeStyle: 'short',
+                  })}
+                </span>
+              </p>
+            </div>
           )}
         </div>
       </div>

@@ -9,6 +9,8 @@
  *  - Select de data_format chama onChange com o valor correto
  *  - "Limpar filtros" chama onClear
  *  - Selecionar "Todos" em qualquer Select remove o campo dos filtros (clearSelect)
+ *  - omics_layer repetível serializa como array
+ *  Nota: campo `search` foi removido (não é param da operação projects_datasets_export_retrieve).
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -21,10 +23,18 @@ import type { DiscoveryFilters as FiltersType } from '@/lib/types/discovery';
 
 const EMPTY_FILTERS: FiltersType = {};
 
+// Mock tipado compatível com (filters: FiltersType) => void e com .mock.calls
+function makeMockChange() {
+  return vi.fn<(filters: FiltersType) => void>();
+}
+function makeMockClear() {
+  return vi.fn<() => void>();
+}
+
 function renderFilters(
   filters: FiltersType = EMPTY_FILTERS,
-  onChange = vi.fn(),
-  onClear = vi.fn(),
+  onChange: ReturnType<typeof makeMockChange> = makeMockChange(),
+  onClear: ReturnType<typeof makeMockClear> = makeMockClear(),
 ) {
   return render(
     <DiscoveryFilters filters={filters} onChange={onChange} onClear={onClear} />,
@@ -63,10 +73,10 @@ describe('DiscoveryFilters — "Limpar filtros"', () => {
 });
 
 describe('DiscoveryFilters — disease_axis Select', () => {
-  let onChange: ReturnType<typeof vi.fn>;
+  let onChange: ReturnType<typeof makeMockChange>;
 
   beforeEach(() => {
-    onChange = vi.fn();
+    onChange = makeMockChange();
   });
 
   it('renderiza o label "Eixo de doença" e o SelectTrigger correspondente', () => {
@@ -225,28 +235,5 @@ describe('DiscoveryFilters — omics_layer checkboxes', () => {
   });
 });
 
-describe('DiscoveryFilters — campo de busca textual', () => {
-  it('chama onChange com o texto digitado no campo de busca', () => {
-    const onChange = vi.fn();
-    renderFilters(EMPTY_FILTERS, onChange);
-
-    const input = screen.getByPlaceholderText('Termo livre…');
-    fireEvent.change(input, { target: { value: 'BRCA1' } });
-
-    expect(onChange).toHaveBeenCalledOnce();
-    const arg = onChange.mock.calls[0][0] as FiltersType;
-    expect(arg.search).toBe('BRCA1');
-  });
-
-  it('remove search dos filtros quando o campo é apagado', () => {
-    const onChange = vi.fn();
-    renderFilters({ search: 'BRCA1' }, onChange);
-
-    const input = screen.getByPlaceholderText('Termo livre…');
-    fireEvent.change(input, { target: { value: '' } });
-
-    expect(onChange).toHaveBeenCalledOnce();
-    const arg = onChange.mock.calls[0][0] as FiltersType;
-    expect(arg.search).toBeUndefined();
-  });
-});
+// Nota: testes de "campo de busca textual" removidos — o campo `search` foi excluído
+// do componente pois não é param válido da operação projects_datasets_export_retrieve.

@@ -6,13 +6,13 @@ import type { components, operations } from './api-schema';
 // Item individual do catálogo de descoberta (DatasetExportItem)
 export type DiscoveryItem = components['schemas']['DatasetExportItem'];
 
-// Envelope paginado do catálogo de descoberta
-export type DiscoveryPage = components['schemas']['PaginatedDatasetExportItemList'];
+// Envelope paginado do catálogo de descoberta (inclui bloco provenance)
+export type DiscoveryPage = components['schemas']['PaginatedDatasetExport'];
 
-// Todos os parâmetros de query do endpoint projects_datasets_export_list
+// Todos os parâmetros de query do endpoint projects_datasets_export_retrieve
 // (fonte única de verdade — derivados do schema OpenAPI)
 export type DiscoveryQueryParams = NonNullable<
-  operations['projects_datasets_export_list']['parameters']['query']
+  operations['projects_datasets_export_retrieve']['parameters']['query']
 >;
 
 // Subconjunto de filtros sem paginação e sem export_format

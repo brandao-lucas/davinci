@@ -69,16 +69,6 @@ export function DiscoveryFilters({ filters, onChange, onClear }: DiscoveryFilter
 
   return (
     <div className="space-y-4 text-sm">
-      {/* Busca textual */}
-      <div className="space-y-1.5">
-        <Label>Busca</Label>
-        <Input
-          placeholder="Termo livre…"
-          value={filters.search ?? ''}
-          onChange={(e) => set('search', e.target.value || undefined)}
-        />
-      </div>
-
       {/* Camadas ômicas (multiselect via checkboxes) */}
       <div className="space-y-1.5">
         <Label>Camada ômica</Label>

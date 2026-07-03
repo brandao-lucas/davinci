@@ -1282,7 +1282,7 @@ paths:
           description: No response body
   /api/v1/projects/{project_pk}/datasets/export/:
     get:
-      operationId: projects_datasets_export_list
+      operationId: projects_datasets_export_retrieve
       description: |-
         Entrega ponteiros + metadados + filtros do contrato §2 para todos os datasets do projeto que passam nos filtros especificados. **Nunca entrega matriz numérica** — matrix_pointer é sempre um ponteiro (URL/path/accession).
 
@@ -1378,18 +1378,6 @@ paths:
         schema:
           type: string
         description: Camada ômica (containment).
-      - name: ordering
-        required: false
-        in: query
-        description: Which field to use when ordering the results.
-        schema:
-          type: string
-      - name: page
-        required: false
-        in: query
-        description: A page number within the paginated result set.
-        schema:
-          type: integer
       - in: path
         name: project_pk
         schema:
@@ -1402,12 +1390,6 @@ paths:
           type: number
           format: float
         description: Score mínimo de confiança para sample_join_key.
-      - name: search
-        required: false
-        in: query
-        description: A search term.
-        schema:
-          type: string
       - in: query
         name: version
         schema:
@@ -1423,7 +1405,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PaginatedDatasetExportItemList'
+                $ref: '#/components/schemas/PaginatedDatasetExport'
           description: ''
   /api/v1/projects/{project_pk}/datasets/search/:
     get:
@@ -3629,6 +3611,31 @@ components:
       - sample_join_key
       - snapshot_version
       - source_db
+    DatasetExportProvenance:
+      type: object
+      description: |-
+        Bloco de proveniência injetado no envelope JSON do export.
+
+        Campos:
+          timestamp_utc            — ISO 8601 UTC do momento da consulta.
+          snapshot_version         — valor de ?version= (default 'live').
+          classifier_rules_version — versão das regras de classificação aplicadas.
+      properties:
+        timestamp_utc:
+          type: string
+          description: 'ISO 8601 UTC do momento da consulta (ex.: ''2024-06-01T12:00:00+00:00'').'
+        snapshot_version:
+          type: string
+          description: Versão do snapshot solicitado (?version=). 'live' indica consulta
+            ao vivo.
+        classifier_rules_version:
+          type: string
+          description: Versão das regras de classificação OmnisPathway aplicadas (Fases
+            2/3).
+      required:
+      - classifier_rules_version
+      - snapshot_version
+      - timestamp_utc
     DatasetFile:
       type: object
       description: |-
@@ -4428,6 +4435,7 @@ components:
       - geo_supplementary_download
       - fastq_download
       - sra_resolution
+      - matrix_load
       type: string
       description: |-
         * `pubmed_search` - Busca PubMed
@@ -4444,6 +4452,7 @@ components:
         * `geo_supplementary_download` - Download Suplementar GEO
         * `fastq_download` - Download FASTQ
         * `sra_resolution` - Resolução GSM→SRR (GEO→SRA)
+        * `matrix_load` - Carga de Matriz (OmnisPathway Obj 2)
     LinkedDatasetBrief:
       type: object
       description: |-
@@ -5027,29 +5036,46 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/DaVinciProject'
-    PaginatedDatasetExportItemList:
+    PaginatedDatasetExport:
       type: object
-      required:
-      - count
-      - results
+      description: |-
+        Envelope completo da resposta JSON paginada do export.
+
+        Espelha o shape real entregue em runtime:
+          {count, next, previous, results, provenance}
+
+        Usado exclusivamente para anotação OpenAPI (@extend_schema responses=).
+        Não é instanciado para serializar dados em runtime — o paginator.get_paginated_response()
+        + injeção manual de provenance continuam sendo a fonte de verdade.
       properties:
         count:
           type: integer
-          example: 123
+          description: Total de itens (sem paginação).
         next:
           type: string
           nullable: true
-          format: uri
-          example: http://api.example.org/accounts/?page=4
+          description: URL da próxima página, ou null se for a última.
         previous:
           type: string
           nullable: true
-          format: uri
-          example: http://api.example.org/accounts/?page=2
+          description: URL da página anterior, ou null se for a primeira.
         results:
           type: array
           items:
             $ref: '#/components/schemas/DatasetExportItem'
+          readOnly: true
+          description: Lista de itens da página atual.
+        provenance:
+          allOf:
+          - $ref: '#/components/schemas/DatasetExportProvenance'
+          description: 'Bloco de proveniência: timestamp, snapshot_version e versão
+            das regras.'
+      required:
+      - count
+      - next
+      - previous
+      - provenance
+      - results
     PaginatedDatasetFileList:
       type: object
       required:
@@ -6996,6 +7022,7 @@ components:
       - sra
       - arrayexpress
       - tcga
+      - cptac
       - bioproject
       - gwas_catalog
       type: string
@@ -7004,6 +7031,7 @@ components:
         * `sra` - Sequence Read Archive
         * `arrayexpress` - ArrayExpress
         * `tcga` - TCGA
+        * `cptac` - CPTAC (Clinical Proteomic Tumor Analysis Consortium)
         * `bioproject` - BioProject
         * `gwas_catalog` - GWAS Catalog
     SourceEnum:

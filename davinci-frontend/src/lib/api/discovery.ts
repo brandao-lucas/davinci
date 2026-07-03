@@ -11,6 +11,7 @@ function buildParams(
   const p = new URLSearchParams();
 
   // Campos escalares do filtro (derivados dos params do schema OpenAPI)
+  // Nota: `search` não é param da operação projects_datasets_export_retrieve — omitido.
   const scalar: (keyof DiscoveryFilters)[] = [
     'access_type',
     'data_format',
@@ -26,7 +27,6 @@ function buildParams(
     'omics_count_max',
     'omics_count_min',
     'sample_join_key_confidence_min',
-    'search',
     'version',
   ];
 
@@ -73,13 +73,15 @@ export const discoveryApi = {
 
   // GET JSON completo — pagina com page_size=200 seguindo `next` para montar dump completo.
   // Trata 429 (throttle download_content) lançando erro com mensagem clara.
+  // Cap de segurança: máximo 500 páginas (100 000 itens a page_size=200) para evitar loop infinito.
   downloadJsonAll: async (projectId: string, filters: DiscoveryFilters): Promise<string> => {
     const PAGE_SIZE = 200;
+    const MAX_PAGES = 500;
     let page = 1;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const allItems: any[] = [];
 
-    while (true) {
+    while (page <= MAX_PAGES) {
       const res = await apiClient.get<DiscoveryPage>(
         `/projects/${projectId}/datasets/export/`,
         {

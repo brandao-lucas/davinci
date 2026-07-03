@@ -47,7 +47,11 @@ function renderConfidence(value: unknown): string {
   return String(value);
 }
 
-// Renderiza matrix_pointer como link quando for URL, ou texto como ponteiro.
+// Renderiza matrix_pointer como link (apenas http/https e sem acesso_controlado),
+// ou como texto puro nos demais casos.
+// Regras (M8 007):
+//   1. access_controlled=true → sempre texto puro, nunca link clicável.
+//   2. Somente http/https são links clicáveis; ftp/ftps e outros são texto puro.
 // NUNCA renderizar o conteúdo da matriz — é ponteiro de acesso (Objetivo 2).
 function MatrixPointer({
   pointer,
@@ -58,23 +62,28 @@ function MatrixPointer({
 }) {
   if (!pointer) return <span className="text-muted-foreground text-xs">—</span>;
 
-  const isUrl = pointer.startsWith('http://') || pointer.startsWith('https://') ||
-    pointer.startsWith('ftp://') || pointer.startsWith('ftps://');
+  const isHttps = pointer.startsWith('http://') || pointer.startsWith('https://');
+  const truncated = pointer.length > 40 ? pointer.slice(0, 40) + '…' : pointer;
 
-  const content = isUrl ? (
+  // Link clicável apenas para http(s) e sem acesso controlado
+  const content = isHttps && !controlled ? (
     <a
       href={pointer}
       target="_blank"
       rel="noopener noreferrer"
       className="flex items-center gap-1 text-xs text-blue-600 hover:underline font-mono"
-      title={controlled ? 'Acesso controlado — requer credenciais (Objetivo 2)' : pointer}
+      title={pointer}
     >
-      {pointer.length > 40 ? pointer.slice(0, 40) + '…' : pointer}
+      {truncated}
       <ExternalLink className="h-3 w-3 shrink-0" />
     </a>
   ) : (
-    <span className="font-mono text-xs text-muted-foreground" title={pointer}>
-      {pointer.length > 40 ? pointer.slice(0, 40) + '…' : pointer}
+    // ftp/ftps, outros esquemas, ou acesso controlado → texto puro
+    <span
+      className="font-mono text-xs text-muted-foreground"
+      title={controlled ? 'Acesso controlado — requer credenciais (Objetivo 2)' : pointer}
+    >
+      {truncated}
     </span>
   );
 
