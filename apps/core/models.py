@@ -2882,6 +2882,7 @@ class IngestionJob(models.Model):
         MATRIX_LOAD = 'matrix_load', 'Carga de Matriz (OmnisPathway Obj 2)'
         GENE_ROLE_LOAD = 'gene_role_load', 'Carga de Papéis de Gene (OncoKB, Obj 2)'
         CNV_MATRIX_LOAD = 'cnv_matrix_load', 'Carga de Matriz CNV (OmnisPathway Obj 2)'
+        CNV_SEED_LOAD = 'cnv_seed_load', 'Derivação de Seed CNV (OmnisPathway Obj 2)'
 
     class JobStatus(models.TextChoices):
         PENDING = 'pending', 'Pendente'

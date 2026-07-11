@@ -1,5 +1,6 @@
 pub mod bioproject_parser;
 pub mod cnv_loader;
+pub mod cnv_seed_derivation;
 pub mod downloader;
 pub mod elink;
 pub mod gene_role_loader;

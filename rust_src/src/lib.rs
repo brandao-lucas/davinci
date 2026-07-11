@@ -1786,6 +1786,145 @@ fn load_cnv_matrix(
     }
 }
 
+// ─── CNV seed derivation (Obj 2 — Fase 2, slice CNV-seed) ───────────────────
+
+/// Manifesto retornado por `seed_cnv_from_parquet`.
+///
+/// Contrato de handoff para o vitruvio que chama esta função:
+///
+/// | Campo | Tipo | Descrição |
+/// |---|---|---|
+/// | `n_seeds_written` | `int` | Linhas gravadas via COPY em `core_varianteffectseed`. |
+/// | `n_activator` | `int` | Seeds com direction='activator' (oncogene amplificado). |
+/// | `n_inactivator` | `int` | Seeds com direction='inactivator' (TSG deletado). |
+/// | `n_neutral_skipped` | `int` | Células puladas: oncogene_and_tsg ambíguo. |
+/// | `n_genes_with_role` | `int` | Tamanho do mapa GeneRole consultado (oncogene+tsg+dual). |
+/// | `n_genes_skipped_no_role` | `int` | Genes sem role relevante (neither/unknown/ausente). |
+/// | `n_cells_subthreshold` | `int` | Células com |cnv| abaixo do threshold. |
+/// | `n_cells_null` | `int` | Células com valor null/missing no Parquet. |
+#[pyclass]
+pub struct CnvSeedManifest {
+    #[pyo3(get)]
+    pub n_seeds_written: u64,
+    #[pyo3(get)]
+    pub n_activator: u64,
+    #[pyo3(get)]
+    pub n_inactivator: u64,
+    #[pyo3(get)]
+    pub n_neutral_skipped: u64,
+    #[pyo3(get)]
+    pub n_genes_with_role: u64,
+    #[pyo3(get)]
+    pub n_genes_skipped_no_role: u64,
+    #[pyo3(get)]
+    pub n_cells_subthreshold: u64,
+    #[pyo3(get)]
+    pub n_cells_null: u64,
+}
+
+#[pymethods]
+impl CnvSeedManifest {
+    fn __repr__(&self) -> String {
+        format!(
+            "CnvSeedManifest(n_seeds_written={}, n_activator={}, n_inactivator={}, \
+             n_neutral_skipped={}, n_genes_with_role={}, n_genes_skipped_no_role={}, \
+             n_cells_subthreshold={}, n_cells_null={})",
+            self.n_seeds_written,
+            self.n_activator,
+            self.n_inactivator,
+            self.n_neutral_skipped,
+            self.n_genes_with_role,
+            self.n_genes_skipped_no_role,
+            self.n_cells_subthreshold,
+            self.n_cells_null,
+        )
+    }
+}
+
+/// Lê o Parquet CNV local, cruza com `GeneRole`+`OmicMatrixSample` do DB,
+/// aplica a regra dosagem×papel (heurística CNV v1) e faz COPY UPSERT
+/// em `core_varianteffectseed`.
+///
+/// # Pré-requisitos
+///
+/// - `parquet_path`: caminho local do Parquet CNV (Django fez o download do object storage
+///   e passa o caminho; I/O de storage é Django).
+/// - `core_generole` populado para `source='oncokb'` (load_oncokb_gene_roles já rodou).
+/// - `core_omicmatrixsample` populado para `matrix_id` (vitruvio registrou o manifesto).
+///
+/// # Regra de sinal (dosagem × papel — heurística v1)
+///
+/// | Role | CNV value | Decisão |
+/// |---|---|---|
+/// | oncogene | >= gain_threshold | activator |
+/// | tsg | <= loss_threshold | inactivator |
+/// | oncogene_and_tsg | qualquer | ambíguo → pular |
+/// | neither / unknown | qualquer | sem papel → pular |
+/// | sub-threshold | qualquer | pular |
+/// | null | — | pular |
+///
+/// Guarda apenas `activator`/`inactivator` (neutro não é seed de perturbação).
+/// `magnitude = |cnv_value|`; `confidence = 0.6` (heurística v1 declarada).
+/// `evidence_type = 'cnv'`; `variant_key = ''` (nível-gene); `effect_source = 'cnv_dosage_x_oncokb'`.
+///
+/// # Segurança
+///
+/// `db_url` nunca logado.
+///
+/// # Argumentos
+///
+/// | Parâmetro | Tipo | Descrição |
+/// |---|---|---|
+/// | `parquet_path` | `str` | Caminho local do Parquet CNV (absoluto). |
+/// | `matrix_id` | `int` | PK de `OmicMatrix` da matriz CNV (FK nas seeds). |
+/// | `db_url` | `str` | PostgreSQL connection string. |
+/// | `method_version` | `str` | Versão do método (default: "fase2-cnv-v1"). |
+/// | `gain_threshold` | `float` | Limiar de amplificação (default: 0.3). |
+/// | `loss_threshold` | `float` | Limiar de deleção (default: -0.3, deve ser negativo). |
+///
+/// # Retorno
+///
+/// `CnvSeedManifest` — ver campos acima.
+/// Lança `PyRuntimeError` em caso de erro fatal.
+#[pyfunction]
+#[pyo3(signature = (
+    parquet_path,
+    matrix_id,
+    db_url,
+    method_version = "fase2-cnv-v1",
+    gain_threshold = 0.3,
+    loss_threshold = -0.3
+))]
+fn seed_cnv_from_parquet(
+    parquet_path: String,
+    matrix_id: i64,
+    db_url: String,
+    method_version: &str,
+    gain_threshold: f32,
+    loss_threshold: f32,
+) -> PyResult<CnvSeedManifest> {
+    match crate::omics::cnv_seed_derivation::seed_cnv_from_parquet(
+        &parquet_path,
+        matrix_id,
+        &db_url,
+        method_version,
+        gain_threshold,
+        loss_threshold,
+    ) {
+        Ok(m) => Ok(CnvSeedManifest {
+            n_seeds_written: m.n_seeds_written,
+            n_activator: m.n_activator,
+            n_inactivator: m.n_inactivator,
+            n_neutral_skipped: m.n_neutral_skipped,
+            n_genes_with_role: m.n_genes_with_role,
+            n_genes_skipped_no_role: m.n_genes_skipped_no_role,
+            n_cells_subthreshold: m.n_cells_subthreshold,
+            n_cells_null: m.n_cells_null,
+        }),
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
 // ─── NER bindings ─────────────────────────────────────────────────────────────
 
 /// Extrai genes mencionados em `text` usando o dicionário HGNC canônico.
@@ -1833,5 +1972,8 @@ fn rust_engine(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // CNV matrix loader (Obj 2 — Fase 2, passo 2.3)
     m.add_class::<CnvMatrixManifest>()?;
     m.add_function(wrap_pyfunction!(load_cnv_matrix, m)?)?;
+    // CNV seed derivation (Obj 2 — Fase 2, slice CNV-seed)
+    m.add_class::<CnvSeedManifest>()?;
+    m.add_function(wrap_pyfunction!(seed_cnv_from_parquet, m)?)?;
     Ok(())
 }

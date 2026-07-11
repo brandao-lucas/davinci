@@ -1258,6 +1258,120 @@ def run_cnv_matrix_load(self, job_id: str, project_id: str):
 
 @shared_task(
     bind=True,
+    max_retries=2,
+    # Derivação de seed CNV: download do Parquet (dezenas de MB) + leitura
+    # no Rust + COPY UPSERT em VariantEffectSeed. Estimativa: até 30 minutos
+    # para redes lentas / storage remoto. 2 horas é margem folgada.
+    time_limit=2 * 3600,
+    soft_time_limit=1 * 3600 + 50 * 60,
+    acks_late=True,
+)
+def run_cnv_seed_load(self, job_id: str, project_id: str):
+    """
+    Orquestra a derivação de VariantEffectSeed a partir da matriz CNV
+    (OmnisPathway Obj 2, Fase 2, Slice CNV-seed).
+
+    Wrapper fino que delega ao CnvSeedService.run(). A task resolve o projeto
+    e o job pelos IDs antes de processar, garantindo isolamento (o job foi
+    criado pelo CnvSeedService.dispatch, que verificou que o projeto pertence
+    ao usuário autenticado).
+
+    Fluxo:
+      1. Resolve DaVinciProject e IngestionJob pelos IDs recebidos.
+      2. Valida isolamento: job.project_id == project_id.
+      3. Delega a CnvSeedService.run(job=job), que:
+           - Resolve OmicMatrix CNV via ProjectDataset (isolamento).
+           - Pré-checks (GeneRole populado?).
+           - Download do Parquet via default_storage → tempfile local.
+           - rust_engine.seed_cnv_from_parquet(parquet_path, matrix_id, db_url, ...).
+           - Marca job COMPLETED com o manifesto.
+
+    Regra #1: task apenas orquestra — não faz HTTP nem parse de dados.
+    Sensitive-data-handling: db_url nunca logada nem gravada em parameters.
+    """
+    from apps.core.models import DaVinciProject
+    from apps.core.services.cnv_seed_service import CnvSeedService
+
+    try:
+        import rust_engine  # noqa: F401 — valida disponibilidade antes de iniciar
+    except ImportError:
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=(
+                    'rust_engine not installed — compile with '
+                    '`maturin develop --release`'
+                ),
+            )
+        except Exception:
+            pass
+        return {'n_seeds_written': 0, 'errors': ['rust_engine not installed']}
+
+    try:
+        try:
+            project = DaVinciProject.objects.select_related('user').get(id=project_id)
+        except DaVinciProject.DoesNotExist:
+            logger.warning(
+                'run_cnv_seed_load: DaVinciProject %s não encontrado — task abortada',
+                project_id,
+            )
+            return {'n_seeds_written': 0, 'errors': ['project not found']}
+
+        try:
+            job = IngestionJob.objects.get(id=job_id)
+        except IngestionJob.DoesNotExist:
+            logger.warning(
+                'run_cnv_seed_load: IngestionJob %s não encontrado — task abortada',
+                job_id,
+            )
+            return {'n_seeds_written': 0, 'errors': ['job not found']}
+
+        # Isolamento: confirma que o job pertence ao projeto recebido
+        if str(job.project_id) != str(project_id):
+            logger.error(
+                'run_cnv_seed_load: job %s não pertence ao projeto %s — '
+                'task abortada (isolamento)',
+                job_id,
+                project_id,
+            )
+            IngestionJob.objects.filter(id=job.id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message='Isolamento: job não pertence ao projeto informado.',
+            )
+            return {'n_seeds_written': 0, 'errors': ['isolation violation']}
+
+        service = CnvSeedService(project)
+        result = service.run(job=job)
+
+        return {
+            'n_seeds_written': result['n_seeds_written'],
+            'n_activator': result['n_activator'],
+            'n_inactivator': result['n_inactivator'],
+            'n_neutral_skipped': result['n_neutral_skipped'],
+            'n_genes_with_role': result['n_genes_with_role'],
+            'n_genes_skipped_no_role': result['n_genes_skipped_no_role'],
+            'errors': [],
+        }
+
+    except Exception as exc:
+        logger.error(
+            'run_cnv_seed_load falhou para projeto %s / job %s: %s',
+            project_id,
+            job_id,
+            exc,
+        )
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=str(exc),
+            )
+        except Exception:
+            pass
+        raise self.retry(exc=exc, countdown=120)
+
+
+@shared_task(
+    bind=True,
     max_retries=3,
     # Resolução SRX→SRR é HTTP + parse — tipicamente segundos a poucos minutos.
     # Limites generosos para datasets grandes com muitos GSM.
