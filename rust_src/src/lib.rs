@@ -1563,6 +1563,229 @@ fn load_cptac_matrix(
     }
 }
 
+// ─── OncoKB gene role loader (Obj 2 — Fase 2, passo 2.2) ────────────────────
+
+/// Manifesto retornado por `load_oncokb_gene_roles`.
+///
+/// | Campo | Tipo | Descrição |
+/// |---|---|---|
+/// | `n_genes` | `int` | Total de genes parseados do TSV. |
+/// | `n_oncogene` | `int` | Genes com role=oncogene. |
+/// | `n_tsg` | `int` | Genes com role=tsg. |
+/// | `n_dual` | `int` | Genes com role=oncogene_and_tsg. |
+/// | `n_neither` | `int` | Genes com role=neither. |
+/// | `n_unknown` | `int` | Genes com role=unknown (INSUFFICIENT_EVIDENCE ou vazio). |
+/// | `source_version` | `str` | Data do download ISO (ex.: "2026-07-11"). |
+/// | `n_upserted` | `int` | Linhas gravadas via COPY UPSERT em core_generole. |
+#[pyclass]
+pub struct GeneRoleManifest {
+    #[pyo3(get)]
+    pub n_genes: usize,
+    #[pyo3(get)]
+    pub n_oncogene: usize,
+    #[pyo3(get)]
+    pub n_tsg: usize,
+    #[pyo3(get)]
+    pub n_dual: usize,
+    #[pyo3(get)]
+    pub n_neither: usize,
+    #[pyo3(get)]
+    pub n_unknown: usize,
+    #[pyo3(get)]
+    pub source_version: String,
+    #[pyo3(get)]
+    pub n_upserted: u64,
+}
+
+#[pymethods]
+impl GeneRoleManifest {
+    fn __repr__(&self) -> String {
+        format!(
+            "GeneRoleManifest(n_genes={}, n_oncogene={}, n_tsg={}, n_dual={}, \
+             n_neither={}, n_unknown={}, source_version={:?}, n_upserted={})",
+            self.n_genes,
+            self.n_oncogene,
+            self.n_tsg,
+            self.n_dual,
+            self.n_neither,
+            self.n_unknown,
+            self.source_version,
+            self.n_upserted,
+        )
+    }
+}
+
+/// Baixa o catálogo de papel do gene do OncoKB (cancerGeneList.txt — TOKEN-FREE),
+/// parseia em streaming e faz COPY UPSERT na tabela `core_generole`.
+///
+/// # Fonte
+///
+/// `https://www.oncokb.org/api/v1/utils/cancerGeneList.txt` (TSV público, ~138KB).
+/// Nenhum token é necessário para este arquivo.
+///
+/// # Mapeamento Gene Type → role
+///
+/// | Gene Type (OncoKB) | role |
+/// |---|---|
+/// | ONCOGENE | oncogene |
+/// | TSG | tsg |
+/// | ONCOGENE_AND_TSG | oncogene_and_tsg |
+/// | NEITHER | neither |
+/// | INSUFFICIENT_EVIDENCE / vazio | unknown |
+///
+/// # COPY UPSERT
+///
+/// ON CONFLICT (gene_symbol, source) DO UPDATE — idempotente.
+/// `source_version` = data ISO do download (não há campo de versão no arquivo).
+///
+/// # Argumentos
+///
+/// | Parâmetro | Tipo | Descrição |
+/// |---|---|---|
+/// | `url` | `str` | URL do TSV OncoKB (deve ser `https://www.oncokb.org/…`). |
+/// | `dest_dir` | `str` | Diretório onde o TSV baixado é temporariamente salvo. |
+/// | `db_url` | `str` | PostgreSQL connection string. |
+///
+/// # Retorno
+///
+/// `GeneRoleManifest` com contagens por role, source_version e n_upserted.
+/// Lança `PyRuntimeError` em caso de erro fatal.
+#[pyfunction]
+#[pyo3(signature = (url, dest_dir, db_url))]
+fn load_oncokb_gene_roles(
+    url: String,
+    dest_dir: String,
+    db_url: String,
+) -> PyResult<GeneRoleManifest> {
+    match crate::omics::gene_role_loader::load_oncokb_gene_roles(&url, &dest_dir, &db_url) {
+        Ok(m) => Ok(GeneRoleManifest {
+            n_genes: m.n_genes,
+            n_oncogene: m.n_oncogene,
+            n_tsg: m.n_tsg,
+            n_dual: m.n_dual,
+            n_neither: m.n_neither,
+            n_unknown: m.n_unknown,
+            source_version: m.source_version,
+            n_upserted: m.n_upserted,
+        }),
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
+// ─── CNV matrix loader (Obj 2 — Fase 2, passo 2.3) ──────────────────────────
+
+/// Manifesto retornado por `load_cnv_matrix`.
+///
+/// Handoff para o vitruvio (passo 2.3):
+///
+/// | Campo | Tipo | Descrição |
+/// |---|---|---|
+/// | `parquet_path` | `str` | Caminho absoluto do Parquet gravado em `dest_dir`. |
+/// | `checksum_md5` | `str` | MD5 lowercase-hex do arquivo Parquet. |
+/// | `n_features` | `int` | Número de genes (linhas do .cct). |
+/// | `n_samples` | `int` | Número de amostras (todas tumor). |
+/// | `sample_columns` | `list[CptacSampleColumn]` | Todas com `sample_role = "tumor"`. |
+///
+/// O vitruvio usa `parquet_path` para upload via `default_storage` e
+/// `sample_columns` para criar registros `OmicMatrixSample` + `OmicMatrix`
+/// com `omics_layer` adequado (handoff — ver nota de handoff abaixo).
+#[pyclass]
+pub struct CnvMatrixManifest {
+    #[pyo3(get)]
+    pub parquet_path: String,
+    #[pyo3(get)]
+    pub checksum_md5: String,
+    #[pyo3(get)]
+    pub n_features: usize,
+    #[pyo3(get)]
+    pub n_samples: usize,
+    #[pyo3(get)]
+    pub sample_columns: Vec<CptacSampleColumn>,
+}
+
+#[pymethods]
+impl CnvMatrixManifest {
+    fn __repr__(&self) -> String {
+        format!(
+            "CnvMatrixManifest(n_features={}, n_samples={}, checksum_md5={:?})",
+            self.n_features, self.n_samples, self.checksum_md5
+        )
+    }
+}
+
+/// Baixa a matriz CNV CPTAC CCRCC do LinkedOmics, parseia em streaming e grava Parquet.
+///
+/// # Fonte
+///
+/// `https://www.linkedomics.org/data_download/CPTAC-CCRCC/HS_CPTAC_CCRCC_CNV_gene_Tumor.cct`
+/// (~26.7 MB, público). Requer User-Agent de browser (LinkedOmics retorna 403 sem ele).
+///
+/// # Diferença em relação a `load_cptac_matrix`
+///
+/// O loader do proteoma (Fase 0) alinha DOIS arquivos (tumor + normal) por interseção.
+/// O CNV tem UM arquivo só (tumor): todas as amostras são `sample_role = "tumor"`,
+/// e não há alinhamento de interseção — todos os genes do arquivo são incluídos.
+///
+/// # Parquet de saída
+///
+/// - Coluna `feature` (Utf8): gene symbol.
+/// - Colunas `T_<case_id>` (Float32, nullable): log-ratio tumor por amostra.
+///
+/// # Não faz
+///
+/// - Não cria `OmicMatrix` / `OmicMatrixSample` (responsabilidade do vitruvio).
+/// - Não faz COPY de metadados CNV — apenas Parquet + manifesto.
+///
+/// # HANDOFF para vitruvio (passo 2.3)
+///
+/// O vitruvio precisa saber qual valor usar para `OmicMatrix.omics_layer` ao criar
+/// o registro para o CNV. O vocabulário atual de `omics_layer` pode não incluir
+/// 'copy_number' ou 'cnv' — verificar CheckConstraint antes de usar (handoff cartografo
+/// se necessário — não inventar valor que viole a constraint).
+///
+/// # Argumentos
+///
+/// | Parâmetro | Tipo | Descrição |
+/// |---|---|---|
+/// | `url` | `str` | URL do .cct CNV (deve ser `https://www.linkedomics.org/…`). |
+/// | `dest_dir` | `str` | Diretório local para o .cct baixado e o Parquet. |
+/// | `parquet_name` | `str` | Nome do arquivo Parquet de saída. |
+///
+/// # Retorno
+///
+/// `CnvMatrixManifest` — ver campos acima.
+/// Lança `PyRuntimeError` em caso de erro fatal.
+#[pyfunction]
+#[pyo3(signature = (url, dest_dir, parquet_name = "cptac_ccrcc_cnv.parquet"))]
+fn load_cnv_matrix(
+    url: String,
+    dest_dir: String,
+    parquet_name: &str,
+) -> PyResult<CnvMatrixManifest> {
+    match crate::omics::cnv_loader::load_cnv_matrix(&url, &dest_dir, parquet_name) {
+        Ok(manifest) => {
+            let sample_columns: Vec<CptacSampleColumn> = manifest
+                .sample_columns
+                .into_iter()
+                .map(|sc| CptacSampleColumn {
+                    case_id: sc.case_id,
+                    sample_role: sc.sample_role,
+                    column_index: sc.column_index,
+                })
+                .collect();
+
+            Ok(CnvMatrixManifest {
+                parquet_path: manifest.parquet_path,
+                checksum_md5: manifest.checksum_md5,
+                n_features: manifest.n_features,
+                n_samples: manifest.n_samples,
+                sample_columns,
+            })
+        }
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
 // ─── NER bindings ─────────────────────────────────────────────────────────────
 
 /// Extrai genes mencionados em `text` usando o dicionário HGNC canônico.
@@ -1604,5 +1827,11 @@ fn rust_engine(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CptacSampleColumn>()?;
     m.add_class::<CptacMatrixManifest>()?;
     m.add_function(wrap_pyfunction!(load_cptac_matrix, m)?)?;
+    // OncoKB gene role loader (Obj 2 — Fase 2, passo 2.2)
+    m.add_class::<GeneRoleManifest>()?;
+    m.add_function(wrap_pyfunction!(load_oncokb_gene_roles, m)?)?;
+    // CNV matrix loader (Obj 2 — Fase 2, passo 2.3)
+    m.add_class::<CnvMatrixManifest>()?;
+    m.add_function(wrap_pyfunction!(load_cnv_matrix, m)?)?;
     Ok(())
 }

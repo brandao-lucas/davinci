@@ -1049,6 +1049,215 @@ def run_matrix_load(self, job_id: str, project_id: str):
 
 @shared_task(
     bind=True,
+    max_retries=2,
+    # Carga do cancerGeneList.txt (TOKEN-FREE): arquivo pequeno (~300KB TSV),
+    # parse rápido, UPSERT. Estimativa: alguns minutos. 30 min é folgado.
+    time_limit=30 * 60,
+    soft_time_limit=25 * 60,
+    acks_late=True,
+)
+def run_gene_role_load(self, job_id: str, project_id: str):
+    """
+    Orquestra a carga do catálogo GeneRole via OncoKB cancerGeneList.txt
+    (OmnisPathway Obj 2, Fase 2, Slice 2A).
+
+    Wrapper fino que delega ao GeneRoleLoadService.run(). A task resolve o
+    projeto e o job pelos IDs antes de processar.
+
+    Fonte TOKEN-FREE: https://www.oncokb.org/api/v1/utils/cancerGeneList.txt
+    O Rust faz COPY/UPSERT direto em GeneRole — Django apenas orquestra.
+
+    Regra #1: task apenas orquestra — não faz HTTP nem parse.
+    Sensitive-data-handling: db_url nunca logada nem gravada em parameters.
+    """
+    from apps.core.models import DaVinciProject
+    from apps.core.services.gene_role_load_service import GeneRoleLoadService
+
+    try:
+        import rust_engine  # noqa: F401 — valida disponibilidade antes de iniciar
+    except ImportError:
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=(
+                    'rust_engine not installed — compile with '
+                    '`maturin develop --release`'
+                ),
+            )
+        except Exception:
+            pass
+        return {'n_genes': 0, 'n_upserted': 0, 'errors': ['rust_engine not installed']}
+
+    try:
+        try:
+            project = DaVinciProject.objects.select_related('user').get(id=project_id)
+        except DaVinciProject.DoesNotExist:
+            logger.warning(
+                'run_gene_role_load: DaVinciProject %s não encontrado — task abortada',
+                project_id,
+            )
+            return {'n_genes': 0, 'n_upserted': 0, 'errors': ['project not found']}
+
+        try:
+            job = IngestionJob.objects.get(id=job_id)
+        except IngestionJob.DoesNotExist:
+            logger.warning(
+                'run_gene_role_load: IngestionJob %s não encontrado — task abortada',
+                job_id,
+            )
+            return {'n_genes': 0, 'n_upserted': 0, 'errors': ['job not found']}
+
+        # Isolamento: confirma que o job pertence ao projeto recebido
+        if str(job.project_id) != str(project_id):
+            logger.error(
+                'run_gene_role_load: job %s não pertence ao projeto %s — '
+                'task abortada (isolamento)',
+                job_id,
+                project_id,
+            )
+            IngestionJob.objects.filter(id=job.id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message='Isolamento: job não pertence ao projeto informado.',
+            )
+            return {'n_genes': 0, 'n_upserted': 0, 'errors': ['isolation violation']}
+
+        service = GeneRoleLoadService(project)
+        result = service.run(job=job)
+
+        return {
+            'n_genes': result['n_genes'],
+            'n_oncogene': result['n_oncogene'],
+            'n_tsg': result['n_tsg'],
+            'n_dual': result['n_dual'],
+            'n_neither': result['n_neither'],
+            'n_unknown': result['n_unknown'],
+            'source_version': result['source_version'],
+            'n_upserted': result['n_upserted'],
+            'errors': [],
+        }
+
+    except Exception as exc:
+        logger.error(
+            'run_gene_role_load falhou para projeto %s / job %s: %s',
+            project_id,
+            job_id,
+            exc,
+        )
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=str(exc),
+            )
+        except Exception:
+            pass
+        raise self.retry(exc=exc, countdown=120)
+
+
+@shared_task(
+    bind=True,
+    max_retries=2,
+    # Carga da matriz CNV: download do .cct (~100 MB) + parse streaming +
+    # escrita de Parquet local + upload via default_storage.
+    # Estimativa conservadora: 2 horas para redes lentas / storage remoto.
+    time_limit=4 * 3600,
+    soft_time_limit=3 * 3600 + 50 * 60,
+    acks_late=True,
+)
+def run_cnv_matrix_load(self, job_id: str, project_id: str):
+    """
+    Orquestra a carga da matriz CNV CPTAC CCRCC
+    (OmnisPathway Obj 2, Fase 2, Slice CNV — materialização da matriz).
+
+    Wrapper fino que delega ao CnvMatrixLoadService.run(). A task resolve
+    o projeto e o job pelo ID antes de processar.
+
+    Fonte pública (sem credencial): LinkedOmics HS_CPTAC_CCRCC_CNV_gene_Tumor.cct
+    O Rust NÃO toca PG, NÃO faz upload — apenas escrita de Parquet local.
+    Django faz upload via shared_omics_storage_key (dado público).
+
+    Regra #1: task apenas orquestra — não faz HTTP nem parse de dados.
+    Sensitive-data-handling: db_url nunca logada nem gravada em parameters.
+    """
+    from apps.core.models import DaVinciProject
+    from apps.core.services.cnv_matrix_load_service import CnvMatrixLoadService
+
+    try:
+        import rust_engine  # noqa: F401 — valida disponibilidade antes de iniciar
+    except ImportError:
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=(
+                    'rust_engine not installed — compile with '
+                    '`maturin develop --release`'
+                ),
+            )
+        except Exception:
+            pass
+        return {'n_features': 0, 'n_samples': 0, 'errors': ['rust_engine not installed']}
+
+    try:
+        try:
+            project = DaVinciProject.objects.select_related('user').get(id=project_id)
+        except DaVinciProject.DoesNotExist:
+            logger.warning(
+                'run_cnv_matrix_load: DaVinciProject %s não encontrado — task abortada',
+                project_id,
+            )
+            return {'n_features': 0, 'n_samples': 0, 'errors': ['project not found']}
+
+        try:
+            job = IngestionJob.objects.get(id=job_id)
+        except IngestionJob.DoesNotExist:
+            logger.warning(
+                'run_cnv_matrix_load: IngestionJob %s não encontrado — task abortada',
+                job_id,
+            )
+            return {'n_features': 0, 'n_samples': 0, 'errors': ['job not found']}
+
+        # Isolamento: confirma que o job pertence ao projeto recebido
+        if str(job.project_id) != str(project_id):
+            logger.error(
+                'run_cnv_matrix_load: job %s não pertence ao projeto %s — '
+                'task abortada (isolamento)',
+                job_id,
+                project_id,
+            )
+            IngestionJob.objects.filter(id=job.id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message='Isolamento: job não pertence ao projeto informado.',
+            )
+            return {'n_features': 0, 'n_samples': 0, 'errors': ['isolation violation']}
+
+        service = CnvMatrixLoadService(project)
+        result = service.run(job=job)
+
+        return {
+            'n_features': result['n_features'],
+            'n_samples': result['n_samples'],
+            'storage_key': result['storage_key'],
+            'errors': [],
+        }
+
+    except Exception as exc:
+        logger.error(
+            'run_cnv_matrix_load falhou para projeto %s / job %s: %s',
+            project_id,
+            job_id,
+            exc,
+        )
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=str(exc),
+            )
+        except Exception:
+            pass
+        raise self.retry(exc=exc, countdown=120)
+
+
+@shared_task(
+    bind=True,
     max_retries=3,
     # Resolução SRX→SRR é HTTP + parse — tipicamente segundos a poucos minutos.
     # Limites generosos para datasets grandes com muitos GSM.

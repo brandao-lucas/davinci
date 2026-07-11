@@ -489,9 +489,11 @@ class OmicDataset(models.Model):
         UNKNOWN = 'unknown', 'Desconhecido'
 
     # Vocabulário canônico de camadas ômicas (minúsculas, alinhado ao OmicType)
+    # 'copy_number' (OmnisPathway Obj 2, Fase 2): camada semântica do CNV
+    # gene×amostra log-ratio — distinta de 'genomic' (mutação/sequência).
     OMICS_LAYER_VOCAB = [
         'genomic', 'transcriptomic', 'proteomic', 'metabolomic',
-        'epigenomic', 'metagenomic', 'microbiome',
+        'epigenomic', 'metagenomic', 'microbiome', 'copy_number',
     ]
 
     # Identificação — accession como chave natural
@@ -673,7 +675,7 @@ class OmicDataset(models.Model):
                 name='omicdataset_omics_layers_valid',
                 condition=models.Q(omics_layers__contained_by=[
                     'genomic', 'transcriptomic', 'proteomic', 'metabolomic',
-                    'epigenomic', 'metagenomic', 'microbiome',
+                    'epigenomic', 'metagenomic', 'microbiome', 'copy_number',
                 ]),
             ),
         ]
@@ -1110,6 +1112,7 @@ class OmicMatrix(models.Model):
         TPM = 'tpm', 'TPM'
         INTENSITIES = 'intensities', 'Intensidades (proteoma/MS)'
         BETAS = 'betas', 'Betas (metilação)'
+        LOG_RATIO = 'log_ratio', 'Log-ratio (CNV contínuo)'
 
     class FeatureAxis(models.TextChoices):
         GENE = 'gene', 'Gene'
@@ -1129,14 +1132,14 @@ class OmicMatrix(models.Model):
         'Camada Ômica',
         max_length=40,
         help_text='Camada ômica canônica (genomic, transcriptomic, proteomic, '
-                  '...). Reusa OmicDataset.OMICS_LAYER_VOCAB.'
+                  'copy_number, ...). Reusa OmicDataset.OMICS_LAYER_VOCAB.'
     )
     data_format_level = models.CharField(
         'Nível do Formato',
         max_length=20,
         choices=DataFormatLevel.choices,
         help_text='Granularidade quantitativa da matriz (counts/TPM/'
-                  'intensities/betas).'
+                  'intensities/betas/log_ratio).'
     )
     feature_axis = models.CharField(
         'Eixo de Features',
@@ -1206,13 +1209,13 @@ class OmicMatrix(models.Model):
                 name='omicmatrix_omics_layer_valid',
                 condition=models.Q(omics_layer__in=[
                     'genomic', 'transcriptomic', 'proteomic', 'metabolomic',
-                    'epigenomic', 'metagenomic', 'microbiome',
+                    'epigenomic', 'metagenomic', 'microbiome', 'copy_number',
                 ]),
             ),
             models.CheckConstraint(
                 name='omicmatrix_data_format_level_valid',
                 condition=models.Q(data_format_level__in=[
-                    'counts', 'tpm', 'intensities', 'betas',
+                    'counts', 'tpm', 'intensities', 'betas', 'log_ratio',
                 ]),
             ),
             models.CheckConstraint(
@@ -1452,6 +1455,628 @@ class OmicSamplePairing(models.Model):
         return (
             f"{self.matrix_id} · {self.case_id}: "
             f"{self.tumor_sample.accession} ↔ {self.normal_sample.accession}"
+        )
+
+
+# =============================================================================
+# SEÇÃO 3c: ANOTAÇÃO DE EFEITO DE VARIANTE (OmnisPathway Objetivo 2, Fase 2)
+# =============================================================================
+#
+# Camada que transforma variante CRUA em SEED INTERPRETADA
+# `(variante, gene, amostra) → {direção, magnitude, confiança, fonte}` — o
+# pré-requisito bloqueante do PFS (objetivo2.md §1: "evidência genômica entra
+# INTERPRETADA, nunca crua"). Quatro modelos, duas naturezas:
+#
+#   CATÁLOGO DE REFERÊNCIA (público-compartilhável, SEM FK de projeto — mesmo
+#   padrão de MendelianGene/DiseaseAxisReference/OmicMatrixSample):
+#     - GeneRole            (2A) papel do gene (oncogene/tsg/...) — OncoKB/CGC.
+#     - VariantEffectRaw    (2B) anotação CRUA por fonte, antes da combinação.
+#     - VariantEffectResolved (2C) magnitude+direção resolvidas, SEM amostra.
+#
+#   DERIVADO DA MATRIZ (escopo matrix/dataset, isolamento via ProjectDataset —
+#   mesmo padrão de OmicSamplePairing):
+#     - VariantEffectSeed   (2D/2E) a seed interpretada POR amostra.
+#
+# Design travado (objetivo2.md §1, não reabrir): MAGNITUDE por precedência
+# ClinVar > AlphaMissense > dbNSFP; DIREÇÃO por magnitude + PAPEL DO GENE
+# (LoF em supressor → perda de freio; ativação em oncogene → seed ativador);
+# CNV NÃO é monotônico (estado conjunto CNV×alelo, nunca sign(cnv)).
+#
+# NÃO estende VariantAnnotation (~linha 403): aquele é anotação de LITERATURA
+# por rs-number (NER), semanticamente incompatível com efeito somático por
+# amostra. Confirmado no plano da Fase 2.
+# =============================================================================
+
+
+class GeneRole(models.Model):
+    """
+    Papel funcional do gene em câncer — CATÁLOGO GLOBAL de REFERÊNCIA (2A).
+
+    Responde "este gene é oncogene ou supressor?" — o insumo que RESOLVE A
+    DIREÇÃO do sinal em `VariantEffectResolved` (magnitude dá o quão danoso;
+    o papel dá o sentido: LoF em supressor → perda de freio; ativação em
+    oncogene → seed ativador). Espelha o padrão `MendelianGene`: store de
+    referência versionado, público-compartilhável, SEM FK de projeto, com
+    igualdade exata de símbolo UPPERCASE.
+
+    Fontes bundled no `cancerGeneList.txt` do OncoKB (design confirmado): o
+    OncoKB Gene Type (oncogene/tsg) é a fonte primária de papel; os flags CGC
+    (COSMIC Cancer Gene Census) e Vogelstein vêm no MESMO arquivo como
+    cross-check. Por isso `cgc_flag`/`vogelstein_flag` são colunas próprias
+    (não linhas separadas): são anotações-satélite do MESMO registro de papel,
+    não papéis independentes. A regra de resolução em caso de divergência
+    (ex.: OncoKB diz oncogene, CGC marca TSG) é do vitruvio (2C, Decisão J) —
+    o schema PRESERVA ambos os flags sem colapsar (a decisão E-K travada: não
+    colapsar divergência no schema).
+
+    Carga (responsabilidade do ferris/Rust, NÃO deste model): COPY/UPSERT ON
+    CONFLICT (gene_symbol, source) DO UPDATE durante o load de papel do gene.
+    `gene_symbol` guardado já em UPPERCASE (alinhado a MendelianGene/DatasetGene).
+    """
+
+    class Role(models.TextChoices):
+        ONCOGENE = 'oncogene', 'Oncogene'
+        TSG = 'tsg', 'Tumor Suppressor Gene'
+        ONCOGENE_AND_TSG = 'oncogene_and_tsg', 'Oncogene e TSG (papel duplo)'
+        NEITHER = 'neither', 'Nenhum (listado, sem papel definido)'
+        UNKNOWN = 'unknown', 'Desconhecido'
+
+    class Source(models.TextChoices):
+        ONCOKB = 'oncokb', 'OncoKB'
+        CGC = 'cgc', 'COSMIC Cancer Gene Census'
+
+    gene_symbol = models.CharField(
+        'Símbolo do Gene',
+        max_length=50,
+        db_index=True,
+        help_text='UPPERCASE normalizado — casa por igualdade exata com '
+                  'VariantEffectRaw.gene_symbol / DatasetGene.gene_symbol.'
+    )
+    entrez_id = models.BigIntegerField(
+        'Entrez Gene ID',
+        blank=True,
+        null=True,
+        help_text='Xref estável quando disponível.'
+    )
+    role = models.CharField(
+        'Papel do Gene',
+        max_length=20,
+        choices=Role.choices,
+        default=Role.UNKNOWN,
+        db_index=True,
+        help_text='oncogene/tsg/oncogene_and_tsg/neither/unknown — resolve a '
+                  'DIREÇÃO do sinal (com a magnitude).'
+    )
+    cgc_flag = models.BooleanField(
+        'Flag CGC',
+        default=False,
+        help_text='Cross-check: gene está no COSMIC Cancer Gene Census '
+                  '(bundled no cancerGeneList.txt do OncoKB). Preservado sem '
+                  'colapsar divergência com role (resolução é do vitruvio).'
+    )
+    vogelstein_flag = models.BooleanField(
+        'Flag Vogelstein',
+        default=False,
+        help_text='Cross-check: gene está na lista Vogelstein (bundled no '
+                  'cancerGeneList.txt do OncoKB).'
+    )
+    source = models.CharField(
+        'Fonte',
+        max_length=20,
+        choices=Source.choices,
+        db_index=True,
+        help_text='Fonte autoritativa do papel (oncokb primária; cgc quando '
+                  'carregado direto do Census).'
+    )
+    source_version = models.CharField(
+        'Versão/Release da Fonte',
+        max_length=100,
+        blank=True,
+        default='',
+        help_text='Release da fonte (ex.: OncoKB data version).'
+    )
+    loaded_at = models.DateTimeField('Carregado em', auto_now=True)
+
+    class Meta:
+        constraints = [
+            # Natural key: um papel por (gene, fonte). `source` na chave permite
+            # que o MESMO gene venha de OncoKB E de CGC sem colidir (mesma
+            # lógica de MendelianGene) → ON CONFLICT DO UPDATE do COPY do Rust
+            # e idempotência da carga. Cobre a query quente "papel deste gene
+            # por fonte" (prefixo gene_symbol).
+            models.UniqueConstraint(
+                fields=['gene_symbol', 'source'],
+                name='generole_gene_source_uniq',
+            ),
+            models.CheckConstraint(
+                name='generole_role_valid',
+                condition=models.Q(role__in=[
+                    'oncogene', 'tsg', 'oncogene_and_tsg', 'neither', 'unknown',
+                ]),
+            ),
+            models.CheckConstraint(
+                name='generole_source_valid',
+                condition=models.Q(source__in=['oncokb', 'cgc']),
+            ),
+        ]
+        # gene_symbol ganha B-tree via db_index=True (lookup do cross por
+        # símbolo); a UniqueConstraint cobre o prefixo (gene_symbol). role e
+        # source ganham B-tree via db_index=True (filtro "todos os oncogenes").
+        verbose_name = 'Gene role'
+        verbose_name_plural = 'Gene roles'
+
+    def __str__(self):
+        return f"{self.gene_symbol} [{self.role}] ({self.source})"
+
+
+class VariantEffectRaw(models.Model):
+    """
+    Anotação CRUA de efeito de variante por FONTE — CATÁLOGO GLOBAL de
+    staging (2B), ANTES da combinação de precedência.
+
+    Uma linha por `(variant_key, source, gene_symbol)`: a MESMA variante é
+    anotada por ClinVar E AlphaMissense E dbNSFP (3 linhas com o MESMO
+    `variant_key`), e a combinação de precedência (2C, vitruvio, set-based)
+    escolhe a vencedora. Manter o cru em staging separado torna a combinação
+    AUDITÁVEL e REPROCESSÁVEL (re-rodar a resolução sem re-baixar as fontes).
+
+    Público-compartilhável, SEM FK de projeto (o efeito de uma variante é
+    idêntico para todos os projetos, como o `_shared` da Fase 0).
+
+    `variant_key` = `CHROM:POS:REF:ALT` em GRCh38 (Decisão E-K travada; NÃO
+    rs-number — SNV somático raramente tem rs). O build vive na proveniência;
+    variantes GRCh37 são normalizadas para GRCh38 pelo loader antes do COPY.
+
+    Escala de dados: o catálogo pode chegar a DEZENAS DE MILHÕES de linhas
+    (AlphaMissense cobre ~todo missense do proteoma). Mitigação de escopo
+    (plano 2.3): carregar só o subconjunto de genes das vias-alvo + CGC, não o
+    genoma inteiro. Índice B-tree em `variant_key` para o lookup da combinação.
+    (Ver nota de escala no handoff — particionamento é decisão futura, não v1.)
+
+    Carga (responsabilidade do ferris/Rust): COPY streaming (dbNSFP não cabe em
+    memória) UPSERT ON CONFLICT (variant_key, source, gene_symbol) DO UPDATE.
+    NENHUMA combinação aqui — combinação é Django set-based (2C).
+    """
+
+    class Source(models.TextChoices):
+        CLINVAR = 'clinvar', 'ClinVar'
+        ALPHAMISSENSE = 'alphamissense', 'AlphaMissense'
+        DBNSFP = 'dbnsfp', 'dbNSFP'
+
+    variant_key = models.CharField(
+        'Chave da Variante',
+        max_length=128,
+        db_index=True,
+        help_text='CHROM:POS:REF:ALT normalizado em GRCh38 (chave canônica; '
+                  'NÃO rs-number). Idêntico entre fontes p/ a mesma variante.'
+    )
+    gene_symbol = models.CharField(
+        'Símbolo do Gene',
+        max_length=50,
+        db_index=True,
+        help_text='UPPERCASE. Uma variante pode anotar >1 gene (por isso entra '
+                  'na natural key).'
+    )
+    source = models.CharField(
+        'Fonte',
+        max_length=20,
+        choices=Source.choices,
+        db_index=True,
+        help_text='clinvar/alphamissense/dbnsfp — a ordem de precedência da '
+                  'combinação (2C) é ClinVar > AlphaMissense > dbNSFP.'
+    )
+    raw_magnitude = models.FloatField(
+        'Magnitude Crua',
+        null=True,
+        blank=True,
+        help_text='Score numérico cru da fonte (AlphaMissense pathogenicity '
+                  '[0,1]; dbNSFP consenso). ClinVar não tem score → NULL '
+                  '(usar raw_class).'
+    )
+    raw_class = models.CharField(
+        'Classe Crua',
+        max_length=128,
+        blank=True,
+        default='',
+        help_text='Classe categórica crua (ClinVar Pathogenic/Benign; '
+                  'AlphaMissense likely_pathogenic/ambiguous/likely_benign; '
+                  'dbNSFP consenso textual).'
+    )
+    clinvar_significance = models.CharField(
+        'Significância Clínica (ClinVar)',
+        max_length=255,
+        blank=True,
+        default='',
+        help_text='Texto cru de clinical significance do ClinVar germinativo '
+                  '(preservado para auditoria; só relevante quando source=clinvar).'
+    )
+    oncogenicity = models.CharField(
+        'Oncogenicidade (ClinVar somático)',
+        max_length=64,
+        blank=True,
+        default='',
+        help_text='Classificação de oncogenicidade do ClinVar somático '
+                  '(Oncogenic/Likely Oncogenic/VUS/... quando disponível); '
+                  'complementa clinvar_significance para variante somática.'
+    )
+    am_pathogenicity = models.FloatField(
+        'AlphaMissense Pathogenicity',
+        null=True,
+        blank=True,
+        help_text='Score [0,1] do AlphaMissense preservado explícito (além de '
+                  'raw_magnitude) para auditoria da precedência.'
+    )
+    confidence = models.FloatField(
+        'Confiança da Anotação',
+        null=True,
+        blank=True,
+        help_text='Confiança crua da fonte quando disponível (ex.: nº de '
+                  'submissões ClinVar, star rating); NULL se a fonte não '
+                  'fornece.'
+    )
+    source_version = models.CharField(
+        'Versão/Release da Fonte',
+        max_length=100,
+        blank=True,
+        default='',
+        help_text='Release da fonte + build de referência (proveniência da '
+                  'normalização GRCh37→GRCh38).'
+    )
+    loaded_at = models.DateTimeField('Carregado em', auto_now=True)
+
+    class Meta:
+        constraints = [
+            # Natural key: uma anotação por (variante, fonte, gene). O gene
+            # entra porque uma variante pode anotar >1 gene; a fonte entra
+            # porque as 3 fontes anotam a MESMA variante (é o ponto do staging).
+            # → ON CONFLICT DO UPDATE do COPY do Rust e idempotência.
+            models.UniqueConstraint(
+                fields=['variant_key', 'source', 'gene_symbol'],
+                name='varianteffectraw_natural_key_uniq',
+            ),
+            models.CheckConstraint(
+                name='varianteffectraw_source_valid',
+                condition=models.Q(source__in=[
+                    'clinvar', 'alphamissense', 'dbnsfp',
+                ]),
+            ),
+        ]
+        indexes = [
+            # Caminho QUENTE da combinação (2C): agrupar todas as fontes de uma
+            # variante para escolher a vencedora por precedência. variant_key
+            # ganha B-tree via db_index=True; este composto cobre o lookup
+            # exato (variant_key, gene_symbol) do DISTINCT ON da resolução.
+            models.Index(
+                fields=['variant_key', 'gene_symbol'],
+                name='vefraw_vkey_gene_idx',
+            ),
+            # Cruzamento por gene (carregar/inspecionar variantes de um gene
+            # das vias-alvo). gene_symbol já tem db_index; este é o composto
+            # (gene_symbol, source) p/ "variantes deste gene nesta fonte".
+            models.Index(
+                fields=['gene_symbol', 'source'],
+                name='vefraw_gene_source_idx',
+            ),
+        ]
+        verbose_name = 'Variant effect (raw)'
+        verbose_name_plural = 'Variant effects (raw)'
+
+    def __str__(self):
+        return f"{self.variant_key} · {self.gene_symbol} ({self.source})"
+
+
+class VariantEffectResolved(models.Model):
+    """
+    Efeito de variante RESOLVIDO (magnitude + direção + confiança) — produto
+    da combinação set-based, CATÁLOGO GLOBAL SEM amostra (2C).
+
+    Uma linha por `(variant_key, gene_symbol, resolution_version)`: a
+    combinação de precedência (ClinVar > AlphaMissense > dbNSFP) escolhe a
+    magnitude vencedora; o papel do gene (`GeneRole`) resolve a direção. É
+    ainda CATÁLOGO (sem amostra) — a aplicação por amostra é `VariantEffectSeed`.
+
+    `resolution_version` na chave permite REPROCESSAR (evoluir a regra de
+    combinação) sem apagar a versão anterior — mesma lógica de
+    `loader_version`/`pairing_version` (auditoria). É derivado, delete/regeração
+    permitidos (Regra #2 não se aplica a derivado).
+
+    Combinação (responsabilidade do vitruvio, NÃO deste model, Django
+    set-based): DISTINCT ON por precedência + LEFT JOIN GeneRole + CASE de
+    direção. Zero Rust, zero parse de arquivo — cruza tabelas já em PG.
+    """
+
+    class Direction(models.TextChoices):
+        ACTIVATOR = 'activator', 'Ativador (GoF)'
+        INACTIVATOR = 'inactivator', 'Inativador (LoF)'
+        NEUTRAL = 'neutral', 'Neutro'
+
+    class EffectSource(models.TextChoices):
+        CLINVAR = 'clinvar', 'ClinVar'
+        ALPHAMISSENSE = 'alphamissense', 'AlphaMissense'
+        DBNSFP = 'dbnsfp', 'dbNSFP'
+
+    variant_key = models.CharField(
+        'Chave da Variante',
+        max_length=128,
+        db_index=True,
+        help_text='CHROM:POS:REF:ALT em GRCh38 (mesma convenção de '
+                  'VariantEffectRaw).'
+    )
+    gene_symbol = models.CharField(
+        'Símbolo do Gene',
+        max_length=50,
+        db_index=True,
+        help_text='UPPERCASE.'
+    )
+    magnitude = models.FloatField(
+        'Magnitude Resolvida',
+        help_text='Magnitude de dano normalizada em [0,1] (Decisão E-K: escala '
+                  'comum entre fontes; categórico ClinVar mapeado p/ âncoras).'
+    )
+    effect_class = models.CharField(
+        'Classe do Efeito',
+        max_length=64,
+        blank=True,
+        default='',
+        help_text='Classe funcional resolvida (ex.: missense, nonsense/LoF) '
+                  'que fundamentou magnitude/direção — auditoria da resolução.'
+    )
+    direction = models.CharField(
+        'Direção do Efeito',
+        max_length=20,
+        choices=Direction.choices,
+        default=Direction.NEUTRAL,
+        db_index=True,
+        help_text='activator (GoF) / inactivator (LoF) / neutral — magnitude + '
+                  'papel do gene.'
+    )
+    confidence = models.FloatField(
+        'Confiança da Resolução',
+        default=0.0,
+        help_text='Confiança [0,1] herdada da fonte vencedora + concordância '
+                  'dos preditores.'
+    )
+    effect_source = models.CharField(
+        'Fonte Vencedora (magnitude)',
+        max_length=20,
+        choices=EffectSource.choices,
+        db_index=True,
+        help_text='Qual fonte venceu a precedência da magnitude '
+                  '(clinvar/alphamissense/dbnsfp).'
+    )
+    gene_role_used = models.CharField(
+        'Papel do Gene Usado',
+        max_length=20,
+        choices=GeneRole.Role.choices,
+        default=GeneRole.Role.UNKNOWN,
+        help_text='Papel (denorm de GeneRole) que resolveu a direção — '
+                  'oncogene/tsg/oncogene_and_tsg/neither/unknown.'
+    )
+    resolution_version = models.CharField(
+        'Versão da Resolução',
+        max_length=50,
+        help_text='Versão do algoritmo de combinação (ex.: fase2-v1) — parte '
+                  'da chave natural; reprocessar coexiste com versão anterior.'
+    )
+    resolved_at = models.DateTimeField('Resolvido em', auto_now=True)
+
+    class Meta:
+        constraints = [
+            # Natural key: um efeito resolvido por (variante, gene, versão da
+            # resolução). A versão na chave permite reprocessar sem apagar a
+            # anterior (auditoria) → UPSERT/idempotência da resolução.
+            models.UniqueConstraint(
+                fields=['variant_key', 'gene_symbol', 'resolution_version'],
+                name='varianteffectresolved_natural_key_uniq',
+            ),
+            models.CheckConstraint(
+                name='varianteffectresolved_direction_valid',
+                condition=models.Q(direction__in=[
+                    'activator', 'inactivator', 'neutral',
+                ]),
+            ),
+            models.CheckConstraint(
+                name='varianteffectresolved_effect_source_valid',
+                condition=models.Q(effect_source__in=[
+                    'clinvar', 'alphamissense', 'dbnsfp',
+                ]),
+            ),
+            models.CheckConstraint(
+                name='varianteffectresolved_gene_role_used_valid',
+                condition=models.Q(gene_role_used__in=[
+                    'oncogene', 'tsg', 'oncogene_and_tsg', 'neither', 'unknown',
+                ]),
+            ),
+        ]
+        indexes = [
+            # Caminho quente da seed por amostra (2D): dado (variante, gene) da
+            # amostra, buscar o efeito resolvido. variant_key/gene_symbol têm
+            # db_index; este composto cobre o lookup exato do cruzamento.
+            models.Index(
+                fields=['variant_key', 'gene_symbol'],
+                name='vefresolved_vkey_gene_idx',
+            ),
+            # "Efeitos resolvidos desta versão para este gene" (inspeção/QA).
+            models.Index(
+                fields=['gene_symbol', 'resolution_version'],
+                name='vefresolved_gene_version_idx',
+            ),
+        ]
+        verbose_name = 'Variant effect (resolved)'
+        verbose_name_plural = 'Variant effects (resolved)'
+
+    def __str__(self):
+        return (
+            f"{self.variant_key} · {self.gene_symbol} → {self.direction} "
+            f"(mag={self.magnitude:.3f}, {self.effect_source}) "
+            f"[{self.resolution_version}]"
+        )
+
+
+class VariantEffectSeed(models.Model):
+    """
+    SEED interpretada POR AMOSTRA — insumo direto do PFS, DERIVADO da matriz
+    (2D SNV / 2E CNV).
+
+    A saída da Fase 2: por `(sample, gene, variant_key, evidence_type)` →
+    `{direção, magnitude, confiança, fonte}`. Só materializa seed onde a
+    variante/evento DE FATO ocorre naquela amostra (é OCORRÊNCIA, não catálogo).
+
+    Duas trilhas de evidência (`evidence_type`), semânticas distintas:
+      - `snv`: cruza `VariantEffectResolved` (precedência ClinVar>AM>dbNSFP)
+        com as variantes somáticas reais da amostra. `variant_key` preenchido.
+      - `cnv`: NÃO reusa a precedência de SNV. Efeito NÃO-monotônico do estado
+        conjunto CNV×alelo (baseline v1: dosagem×papel do gene). CNV é
+        NÍVEL-GENE → `variant_key` NULL (a seed é do gene, não de uma posição).
+
+    Ancorada em `OmicMatrix`/`OmicSample` (SEM FK de projeto) — mesmo padrão de
+    `OmicSamplePairing`. Isolamento por usuário vive em `ProjectDataset`
+    (leitura futura filtra `sample__dataset__in_projects__project`). É derivado:
+    delete/regeração permitidos.
+
+    Materialização (responsabilidade do vitruvio, set-based; CONDICIONAL ferris
+    se CNV×alelo exigir abrir o Parquet — Decisão I do plano), NÃO deste model.
+    """
+
+    class EvidenceType(models.TextChoices):
+        SNV = 'snv', 'SNV (single-nucleotide variant)'
+        CNV = 'cnv', 'CNV (copy-number variation)'
+
+    class Direction(models.TextChoices):
+        ACTIVATOR = 'activator', 'Ativador (GoF)'
+        INACTIVATOR = 'inactivator', 'Inativador (LoF)'
+        NEUTRAL = 'neutral', 'Neutro'
+
+    matrix = models.ForeignKey(
+        OmicMatrix,
+        on_delete=models.CASCADE,
+        related_name='effect_seeds',
+        help_text='Matriz (estudo+camada+versão do loader) que ancora a seed.'
+    )
+    sample = models.ForeignKey(
+        OmicSample,
+        on_delete=models.CASCADE,
+        related_name='effect_seeds',
+        help_text='Amostra onde o evento ocorre (ocorrência, não catálogo).'
+    )
+    gene_symbol = models.CharField(
+        'Símbolo do Gene',
+        max_length=50,
+        db_index=True,
+        help_text='UPPERCASE. CNV é nível-gene; SNV também carrega o gene.'
+    )
+    variant_key = models.CharField(
+        'Chave da Variante',
+        max_length=128,
+        blank=True,
+        default='',
+        db_index=True,
+        help_text='CHROM:POS:REF:ALT (GRCh38) para SNV. VAZIO para CNV '
+                  '(nível-gene, sem posição). NULL-like via string vazia p/ '
+                  'compor a natural key sem coluna nullable.'
+    )
+    evidence_type = models.CharField(
+        'Tipo de Evidência',
+        max_length=10,
+        choices=EvidenceType.choices,
+        db_index=True,
+        help_text='snv (precedência) / cnv (estado conjunto não-monotônico).'
+    )
+    direction = models.CharField(
+        'Direção do Efeito',
+        max_length=20,
+        choices=Direction.choices,
+        default=Direction.NEUTRAL,
+        db_index=True,
+        help_text='activator/inactivator/neutral — sinal já resolvido que o '
+                  'PFS propaga (nunca o evento cru).'
+    )
+    magnitude = models.FloatField(
+        'Magnitude',
+        help_text='Magnitude do efeito normalizada [0,1] (herda de '
+                  'VariantEffectResolved para SNV; resolução CNV×alelo p/ CNV).'
+    )
+    confidence = models.FloatField(
+        'Confiança',
+        default=0.0,
+        help_text='Confiança [0,1] da seed.'
+    )
+    gene_role = models.CharField(
+        'Papel do Gene (denorm)',
+        max_length=20,
+        choices=GeneRole.Role.choices,
+        default=GeneRole.Role.UNKNOWN,
+        help_text='Papel denormalizado (de GeneRole) que fundamentou a direção '
+                  '— evita re-join na leitura do PFS.'
+    )
+    effect_source = models.CharField(
+        'Fonte do Efeito',
+        max_length=64,
+        blank=True,
+        default='',
+        help_text='Fonte que resolveu (denorm de VariantEffectResolved.'
+                  'effect_source + gene_role_used para SNV; base do CNV p/ CNV).'
+    )
+    method_version = models.CharField(
+        'Versão do Método',
+        max_length=50,
+        help_text='Versão do método de seeding (ex.: fase2-v1) — parte da '
+                  'proveniência; re-seed coexiste/UPSERT.'
+    )
+    resolved_at = models.DateTimeField('Resolvido em', auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            # Natural key: uma seed por (amostra, gene, variante, tipo de
+            # evidência) DENTRO de uma matriz. `evidence_type` na chave separa
+            # SNV (com variant_key) de CNV (variant_key vazio, nível-gene) sem
+            # colidir; `variant_key` vazio para CNV mantém a chave estável sem
+            # coluna nullable. → ON CONFLICT DO UPDATE e idempotência do seeding.
+            models.UniqueConstraint(
+                fields=['matrix', 'sample', 'gene_symbol', 'variant_key',
+                        'evidence_type'],
+                name='varianteffectseed_natural_key_uniq',
+            ),
+            models.CheckConstraint(
+                name='varianteffectseed_evidence_type_valid',
+                condition=models.Q(evidence_type__in=['snv', 'cnv']),
+            ),
+            models.CheckConstraint(
+                name='varianteffectseed_direction_valid',
+                condition=models.Q(direction__in=[
+                    'activator', 'inactivator', 'neutral',
+                ]),
+            ),
+            models.CheckConstraint(
+                name='varianteffectseed_gene_role_valid',
+                condition=models.Q(gene_role__in=[
+                    'oncogene', 'tsg', 'oncogene_and_tsg', 'neither', 'unknown',
+                ]),
+            ),
+        ]
+        indexes = [
+            # Caminho QUENTE do PFS: "todas as seeds desta amostra nesta matriz"
+            # (as sementes que entram na propagação). O prefixo da natural key
+            # cobre (matrix, sample, ...); este índice dedicado serve a consulta
+            # que filtra só por (matrix, sample) sem o resto da chave.
+            models.Index(
+                fields=['matrix', 'sample'],
+                name='vefseed_matrix_sample_idx',
+            ),
+            # "Seeds deste gene" cross-amostra (inspeção por gene-alvo).
+            models.Index(
+                fields=['gene_symbol'],
+                name='vefseed_gene_idx',
+            ),
+        ]
+        verbose_name = 'Variant effect seed'
+        verbose_name_plural = 'Variant effect seeds'
+
+    def __str__(self):
+        vk = self.variant_key or '(gene-level)'
+        return (
+            f"{self.sample.accession} · {self.gene_symbol} · {vk} "
+            f"[{self.evidence_type}] → {self.direction}"
         )
 
 
@@ -2255,6 +2880,8 @@ class IngestionJob(models.Model):
         FASTQ_DOWNLOAD = 'fastq_download', 'Download FASTQ'
         SRA_RESOLUTION = 'sra_resolution', 'Resolução GSM→SRR (GEO→SRA)'
         MATRIX_LOAD = 'matrix_load', 'Carga de Matriz (OmnisPathway Obj 2)'
+        GENE_ROLE_LOAD = 'gene_role_load', 'Carga de Papéis de Gene (OncoKB, Obj 2)'
+        CNV_MATRIX_LOAD = 'cnv_matrix_load', 'Carga de Matriz CNV (OmnisPathway Obj 2)'
 
     class JobStatus(models.TextChoices):
         PENDING = 'pending', 'Pendente'

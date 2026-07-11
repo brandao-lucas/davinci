@@ -1,6 +1,8 @@
 pub mod bioproject_parser;
+pub mod cnv_loader;
 pub mod downloader;
 pub mod elink;
+pub mod gene_role_loader;
 pub mod geo_parser;
 pub mod gwas_parser;
 pub mod matrix_loader;
