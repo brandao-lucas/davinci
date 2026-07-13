@@ -18,8 +18,8 @@
 ///    - confidence = 0.6 (heurística v1 — ver §DECISÕES)
 /// 5. COPY UPSERT em `core_varianteffectseed`:
 ///    variant_key='', evidence_type='cnv', gene_role=role, effect_source='cnv_dosage_x_oncokb',
-///    method_version, ON CONFLICT (matrix, sample, gene_symbol, variant_key, evidence_type)
-///    DO UPDATE.
+///    method_version, ON CONFLICT (matrix, sample, gene_symbol, variant_key,
+///    evidence_type, method_version) DO UPDATE.  [natural key inclui method_version — migration 0034]
 ///
 /// # DECISÕES tomadas (reportar ao usuário)
 ///
@@ -572,14 +572,13 @@ async fn copy_variant_effect_seeds(
                 evidence_type, direction, magnitude, confidence,
                 gene_role, effect_source, method_version, NOW()
             FROM _staging_vef_seed
-            ON CONFLICT (matrix_id, sample_id, gene_symbol, variant_key, evidence_type)
+            ON CONFLICT (matrix_id, sample_id, gene_symbol, variant_key, evidence_type, method_version)
             DO UPDATE SET
                 direction      = EXCLUDED.direction,
                 magnitude      = EXCLUDED.magnitude,
                 confidence     = EXCLUDED.confidence,
                 gene_role      = EXCLUDED.gene_role,
-                effect_source  = EXCLUDED.effect_source,
-                method_version = EXCLUDED.method_version",
+                effect_source  = EXCLUDED.effect_source",
             &[],
         )
         .await

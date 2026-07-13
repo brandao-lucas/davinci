@@ -1918,9 +1918,12 @@ class VariantEffectSeed(models.Model):
     SEED interpretada POR AMOSTRA — insumo direto do PFS, DERIVADO da matriz
     (2D SNV / 2E CNV).
 
-    A saída da Fase 2: por `(sample, gene, variant_key, evidence_type)` →
-    `{direção, magnitude, confiança, fonte}`. Só materializa seed onde a
-    variante/evento DE FATO ocorre naquela amostra (é OCORRÊNCIA, não catálogo).
+    A saída da Fase 2: por `(sample, gene, variant_key, evidence_type,
+    method_version)` → `{direção, magnitude, confiança, fonte}`. Só materializa
+    seed onde a variante/evento DE FATO ocorre naquela amostra (é OCORRÊNCIA,
+    não catálogo). `method_version` integra a chave natural para que VERSÕES DE
+    MÉTODO COEXISTAM (ex.: `fase2-cnv-v2` ao lado de `fase2-cnv-v1`) sem
+    sobrescrever — permite benchmark entre métodos.
 
     Duas trilhas de evidência (`evidence_type`), semânticas distintas:
       - `snv`: cruza `VariantEffectResolved` (precedência ClinVar>AM>dbNSFP)
@@ -2020,21 +2023,28 @@ class VariantEffectSeed(models.Model):
     method_version = models.CharField(
         'Versão do Método',
         max_length=50,
-        help_text='Versão do método de seeding (ex.: fase2-v1) — parte da '
-                  'proveniência; re-seed coexiste/UPSERT.'
+        help_text='Versão do método de seeding (ex.: fase2-cnv-v2, '
+                  'fase2-cnv-v1, fase2-snv-v1) — PARTE DA CHAVE NATURAL: '
+                  'versões coexistem sem sobrescrever (benchmark entre '
+                  'métodos); re-seed da mesma versão é idempotente/UPSERT.'
     )
     resolved_at = models.DateTimeField('Resolvido em', auto_now_add=True)
 
     class Meta:
         constraints = [
             # Natural key: uma seed por (amostra, gene, variante, tipo de
-            # evidência) DENTRO de uma matriz. `evidence_type` na chave separa
-            # SNV (com variant_key) de CNV (variant_key vazio, nível-gene) sem
-            # colidir; `variant_key` vazio para CNV mantém a chave estável sem
-            # coluna nullable. → ON CONFLICT DO UPDATE e idempotência do seeding.
+            # evidência, VERSÃO DO MÉTODO) DENTRO de uma matriz. `evidence_type`
+            # na chave separa SNV (com variant_key) de CNV (variant_key vazio,
+            # nível-gene) sem colidir; `variant_key` vazio para CNV mantém a
+            # chave estável sem coluna nullable. `method_version` na chave faz
+            # VERSÕES DE MÉTODO COEXISTIREM (ex.: fase2-cnv-v2 ao lado de
+            # fase2-cnv-v1, e fase2-snv-v1) sem sobrescrever — habilita benchmark
+            # entre métodos. → ON CONFLICT DO UPDATE por (…, method_version):
+            # re-seed da MESMA versão é idempotente/UPSERT; versão nova adiciona
+            # linhas, nunca apaga a anterior.
             models.UniqueConstraint(
                 fields=['matrix', 'sample', 'gene_symbol', 'variant_key',
-                        'evidence_type'],
+                        'evidence_type', 'method_version'],
                 name='varianteffectseed_natural_key_uniq',
             ),
             models.CheckConstraint(

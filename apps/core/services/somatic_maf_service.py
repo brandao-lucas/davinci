@@ -1144,7 +1144,9 @@ class SomaticMafService:
                 continue
 
             # Natural key check (evitar duplicatas no lote)
-            # A UniqueConstraint é (matrix, sample, gene_symbol, variant_key, evidence_type)
+            # UniqueConstraint (0034): (matrix, sample, gene_symbol, variant_key,
+            # evidence_type, method_version). Aqui evidence_type='snv' e
+            # method_version fixos no lote, então basta a tupla variável abaixo.
             natural_key = (matrix.id, sample.id, gene_symbol, variant_key)
             if natural_key in seen_natural_keys:
                 continue
@@ -1181,11 +1183,11 @@ class SomaticMafService:
                     update_conflicts=True,
                     unique_fields=[
                         'matrix', 'sample', 'gene_symbol',
-                        'variant_key', 'evidence_type',
+                        'variant_key', 'evidence_type', 'method_version',
                     ],
                     update_fields=[
                         'direction', 'magnitude', 'confidence',
-                        'gene_role', 'effect_source', 'method_version',
+                        'gene_role', 'effect_source',
                     ],
                 )
 

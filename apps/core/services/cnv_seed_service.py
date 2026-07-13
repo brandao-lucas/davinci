@@ -50,9 +50,11 @@ Catálogo derivado:
 
 Versão do método:
   METHOD_VERSION = 'fase2-cnv-v1'
-  Grava em VariantEffectSeed.method_version. Re-seed com method_version diferente
-  coexiste via UPSERT (a natural key inclui matrix/sample/gene/variant_key/
-  evidence_type, não method_version — o Rust faz DO UPDATE).
+  Grava em VariantEffectSeed.method_version. Após a migration 0034, method_version
+  FAZ PARTE da natural key (matrix/sample/gene/variant_key/evidence_type/
+  method_version) — logo versões distintas (cnv-v1, cnv-v2, snv-v1) COEXISTEM;
+  re-seed da mesma versão é idempotente via UPSERT (o Rust faz DO UPDATE nos
+  campos de valor, method_version fica na chave do ON CONFLICT).
 
 Padrões reutilizados:
   - resolve_matrix: espelha SamplePairingService.resolve_matrix (Fase 1):
