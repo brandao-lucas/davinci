@@ -1372,6 +1372,177 @@ def run_cnv_seed_load(self, job_id: str, project_id: str):
 
 @shared_task(
     bind=True,
+    max_retries=1,
+    # Carga ClinVar (~1 GB) + AlphaMissense (~643 MB): download streaming +
+    # parse + COPY UPSERT em VariantEffectRaw. Estimativa: 4-6h em redes lentas.
+    # time_limit conservador de 8h; soft a 7h50m para flush limpo.
+    time_limit=8 * 3600,
+    soft_time_limit=7 * 3600 + 50 * 60,
+    acks_late=True,
+)
+def run_variant_effect_raw_load(
+    self,
+    job_id: str,
+    project_id: str,
+    skip_alphamissense: bool = False,
+):
+    """
+    Orquestra a carga de VariantEffectRaw via ClinVar + AlphaMissense
+    (OmnisPathway Obj 2, Fase 2, Slice 2B).
+
+    Wrapper fino que delega ao VariantEffectRawService.run(). A task resolve
+    o projeto e o job pelos IDs antes de processar, garantindo isolamento
+    (o job foi criado pelo VariantEffectRawService.dispatch, que verificou que
+    o projeto pertence ao usuário autenticado).
+
+    Fluxo:
+      1. Resolve DaVinciProject e IngestionJob pelos IDs recebidos.
+      2. Valida isolamento: job.project_id == project_id.
+      3. Delega a VariantEffectRawService.run(job=job), que:
+           - Pré-check: GeneRole populado.
+           - Constrói gene_allowlist de GeneRole(source='oncokb').
+           - Mapa uniprot→gene via UniProt REST (com cache).
+           - rust_engine.load_clinvar_effects(url, dest_dir, db_url, allowlist).
+           - rust_engine.load_alphamissense_effects(...) se não skip_alphamissense.
+           - Marca job COMPLETED com contadores combinados.
+
+    Regra #1: task apenas orquestra — não faz HTTP de dados grandes nem parse.
+    Sensitive-data-handling: db_url nunca logada nem gravada em parameters.
+    """
+    from apps.core.models import DaVinciProject
+    from apps.core.services.variant_effect_raw_service import (
+        GeneRoleNotPopulatedError,
+        VariantEffectRawService,
+    )
+
+    try:
+        import rust_engine  # noqa: F401 — valida disponibilidade antes de iniciar
+    except ImportError:
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=(
+                    'rust_engine not installed — compile with '
+                    '`maturin develop --release`'
+                ),
+            )
+        except Exception:
+            pass
+        return {
+            'clinvar_n_upserted': 0,
+            'am_n_upserted': 0,
+            'errors': ['rust_engine not installed'],
+        }
+
+    try:
+        try:
+            project = DaVinciProject.objects.select_related('user').get(
+                id=project_id
+            )
+        except DaVinciProject.DoesNotExist:
+            logger.warning(
+                'run_variant_effect_raw_load: DaVinciProject %s não encontrado '
+                '— task abortada',
+                project_id,
+            )
+            return {
+                'clinvar_n_upserted': 0,
+                'am_n_upserted': 0,
+                'errors': ['project not found'],
+            }
+
+        try:
+            job = IngestionJob.objects.get(id=job_id)
+        except IngestionJob.DoesNotExist:
+            logger.warning(
+                'run_variant_effect_raw_load: IngestionJob %s não encontrado '
+                '— task abortada',
+                job_id,
+            )
+            return {
+                'clinvar_n_upserted': 0,
+                'am_n_upserted': 0,
+                'errors': ['job not found'],
+            }
+
+        # Isolamento: confirma que o job pertence ao projeto recebido
+        if str(job.project_id) != str(project_id):
+            logger.error(
+                'run_variant_effect_raw_load: job %s não pertence ao projeto %s '
+                '— task abortada (isolamento)',
+                job_id,
+                project_id,
+            )
+            IngestionJob.objects.filter(id=job.id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message='Isolamento: job não pertence ao projeto informado.',
+            )
+            return {
+                'clinvar_n_upserted': 0,
+                'am_n_upserted': 0,
+                'errors': ['isolation violation'],
+            }
+
+        service = VariantEffectRawService(
+            project,
+            skip_alphamissense=skip_alphamissense,
+        )
+        result = service.run(job=job)
+
+        return {
+            'clinvar_n_kept': result['clinvar_n_kept'],
+            'clinvar_n_upserted': result['clinvar_n_upserted'],
+            'clinvar_source_version': result['clinvar_source_version'],
+            'am_skipped': result['am_skipped'],
+            'am_n_kept': result['am_n_kept'],
+            'am_n_upserted': result['am_n_upserted'],
+            'n_genes_in_allowlist': result['n_genes_in_allowlist'],
+            'n_genes_with_uniprot': result['n_genes_with_uniprot'],
+            'n_genes_without_uniprot': result['n_genes_without_uniprot'],
+            'errors': [],
+        }
+
+    except GeneRoleNotPopulatedError as exc:
+        logger.error(
+            'run_variant_effect_raw_load: GeneRole não populado (projeto %s / '
+            'job %s) — task abortada sem retry: %s',
+            project_id,
+            job_id,
+            exc,
+        )
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=str(exc),
+            )
+        except Exception:
+            pass
+        # GeneRole vazio é erro de configuração, não transitório — não retry
+        return {
+            'clinvar_n_upserted': 0,
+            'am_n_upserted': 0,
+            'errors': [str(exc)],
+        }
+
+    except Exception as exc:
+        logger.error(
+            'run_variant_effect_raw_load falhou para projeto %s / job %s: %s',
+            project_id,
+            job_id,
+            exc,
+        )
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=str(exc),
+            )
+        except Exception:
+            pass
+        raise self.retry(exc=exc, countdown=300)
+
+
+@shared_task(
+    bind=True,
     max_retries=3,
     # Resolução SRX→SRR é HTTP + parse — tipicamente segundos a poucos minutos.
     # Limites generosos para datasets grandes com muitos GSM.
@@ -1525,3 +1696,117 @@ def run_sra_resolution(self, project_id: str, dataset_id: int):
         except Exception:
             pass
         raise self.retry(exc=exc, countdown=60)
+
+
+@shared_task(
+    bind=True,
+    max_retries=1,
+    # Carga do MAF somático GDC: fetch em lote de ~353 arquivos + parse streaming +
+    # Parquet gene×amostra + TSV de ocorrências + seed SNV set-based.
+    # Estimativa conservadora: 4-6h em redes lentas. time_limit de 8h; soft a 7h50m.
+    time_limit=8 * 3600,
+    soft_time_limit=7 * 3600 + 50 * 60,
+    acks_late=True,
+)
+def run_somatic_maf_load(self, job_id: str, project_id: str):
+    """
+    Orquestra a carga do MAF somático GDC CPTAC-3 Kidney + derivação de seeds SNV
+    (OmnisPathway Obj 2, Fase 2, Passo 2.6 — Slice 2D).
+
+    Wrapper fino que delega ao SomaticMafService.run(). A task resolve o projeto
+    e o job pelos IDs antes de processar, garantindo isolamento.
+
+    Fluxo único (matriz + seed na mesma execução):
+      1. Resolve file_map via GDC API pública (sem credencial).
+      2. Chama rust_engine.load_somatic_maf (Parquet burden + TSV ocorrências).
+      3. Upload Parquet + ORM (OmicMatrix/OmicSample/OmicMatrixSample).
+      4. Seed SNV set-based: lê TSV × VariantEffectResolved → VariantEffectSeed.
+
+    Regra #1: task apenas orquestra — não faz parse de dados.
+    Sensitive-data-handling: db_url nunca logada nem gravada em parameters.
+    """
+    from apps.core.models import DaVinciProject
+    from apps.core.services.somatic_maf_service import SomaticMafService
+
+    try:
+        import rust_engine  # noqa: F401 — valida disponibilidade antes de iniciar
+    except ImportError:
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=(
+                    'rust_engine not installed — compile with '
+                    '`maturin develop --release`'
+                ),
+            )
+        except Exception:
+            pass
+        return {'n_seeds_created': 0, 'errors': ['rust_engine not installed']}
+
+    try:
+        try:
+            project = DaVinciProject.objects.select_related('user').get(id=project_id)
+        except DaVinciProject.DoesNotExist:
+            logger.warning(
+                'run_somatic_maf_load: DaVinciProject %s não encontrado — task abortada',
+                project_id,
+            )
+            return {'n_seeds_created': 0, 'errors': ['project not found']}
+
+        try:
+            job = IngestionJob.objects.get(id=job_id)
+        except IngestionJob.DoesNotExist:
+            logger.warning(
+                'run_somatic_maf_load: IngestionJob %s não encontrado — task abortada',
+                job_id,
+            )
+            return {'n_seeds_created': 0, 'errors': ['job not found']}
+
+        # Isolamento: confirma que o job pertence ao projeto recebido
+        if str(job.project_id) != str(project_id):
+            logger.error(
+                'run_somatic_maf_load: job %s não pertence ao projeto %s — '
+                'task abortada (isolamento)',
+                job_id,
+                project_id,
+            )
+            IngestionJob.objects.filter(id=job.id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message='Isolamento: job não pertence ao projeto informado.',
+            )
+            return {'n_seeds_created': 0, 'errors': ['isolation violation']}
+
+        service = SomaticMafService(project)
+        result = service.run(job=job)
+
+        return {
+            'n_files_processed': result['n_files_processed'],
+            'n_samples': result['n_samples'],
+            'n_occurrences': result['n_occurrences'],
+            'n_seeds_created': result['n_seeds_created'],
+            'n_inactivator': result['n_inactivator'],
+            'n_activator': result['n_activator'],
+            'n_neutral': result['n_neutral'],
+            'n_truncating_lof': result['n_truncating_lof'],
+            'n_missense_resolved': result['n_missense_resolved'],
+            'n_unannotated_skipped': result['n_unannotated_skipped'],
+            'storage_key': result['storage_key'],
+            'errors': result.get('errors', []),
+        }
+
+    except Exception as exc:
+        logger.error(
+            'run_somatic_maf_load falhou para projeto %s / job %s: %s',
+            project_id,
+            job_id,
+            exc,
+        )
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=str(exc),
+                completed_at=timezone.now(),
+            )
+        except Exception:
+            pass
+        raise self.retry(exc=exc, countdown=120)

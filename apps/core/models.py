@@ -2883,6 +2883,9 @@ class IngestionJob(models.Model):
         GENE_ROLE_LOAD = 'gene_role_load', 'Carga de Papéis de Gene (OncoKB, Obj 2)'
         CNV_MATRIX_LOAD = 'cnv_matrix_load', 'Carga de Matriz CNV (OmnisPathway Obj 2)'
         CNV_SEED_LOAD = 'cnv_seed_load', 'Derivação de Seed CNV (OmnisPathway Obj 2)'
+        VARIANT_EFFECT_RAW_LOAD = 'variant_effect_raw_load', 'Carga de Efeito Cru de Variante (ClinVar/AlphaMissense) (OmnisPathway Obj 2)'
+        SOMATIC_MAF_LOAD = 'somatic_maf_load', 'Carga de MAF Somático GDC (OmnisPathway Obj 2)'
+        SNV_SEED_LOAD = 'snv_seed_load', 'Derivação de Seed SNV (OmnisPathway Obj 2)'
 
     class JobStatus(models.TextChoices):
         PENDING = 'pending', 'Pendente'

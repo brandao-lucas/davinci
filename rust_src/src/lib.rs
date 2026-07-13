@@ -1925,6 +1925,468 @@ fn seed_cnv_from_parquet(
     }
 }
 
+// ─── Variant effect loaders (Obj 2 — Fase 2, passo 2.4) ─────────────────────
+
+/// Manifesto retornado por `load_clinvar_effects`.
+///
+/// | Campo | Tipo | Descrição |
+/// |---|---|---|
+/// | `n_variants_processed` | `int` | Linhas VCF parseadas (excluindo comentários/cabeçalho). |
+/// | `n_kept` | `int` | Variantes cujo gene está na allowlist e foram gravadas. |
+/// | `n_skipped_offlist` | `int` | Variantes descartadas (gene não está na allowlist). |
+/// | `n_skipped_no_gene` | `int` | Linhas sem campo GENEINFO no INFO. |
+/// | `n_upserted` | `int` | Linhas gravadas via COPY UPSERT em core_varianteffectraw. |
+/// | `source_version` | `str` | Versão da fonte extraída do cabeçalho VCF. |
+/// | `errors` | `list[str]` | Erros não-fatais durante o parse. |
+#[pyclass]
+pub struct ClinVarLoadManifest {
+    #[pyo3(get)]
+    pub n_variants_processed: usize,
+    #[pyo3(get)]
+    pub n_kept: usize,
+    #[pyo3(get)]
+    pub n_skipped_offlist: usize,
+    #[pyo3(get)]
+    pub n_skipped_no_gene: usize,
+    #[pyo3(get)]
+    pub n_upserted: u64,
+    #[pyo3(get)]
+    pub source_version: String,
+    #[pyo3(get)]
+    pub errors: Vec<String>,
+}
+
+#[pymethods]
+impl ClinVarLoadManifest {
+    fn __repr__(&self) -> String {
+        format!(
+            "ClinVarLoadManifest(n_processed={}, n_kept={}, n_offlist={}, \
+             n_no_gene={}, n_upserted={}, source_version={:?}, n_errors={})",
+            self.n_variants_processed, self.n_kept, self.n_skipped_offlist,
+            self.n_skipped_no_gene, self.n_upserted, self.source_version,
+            self.errors.len()
+        )
+    }
+}
+
+/// Manifesto retornado por `load_alphamissense_effects`.
+///
+/// | Campo | Tipo | Descrição |
+/// |---|---|---|
+/// | `n_variants_processed` | `int` | Linhas TSV parseadas (excluindo cabeçalho). |
+/// | `n_kept` | `int` | Variantes cujo gene está no mapa e foram gravadas. |
+/// | `n_skipped_no_map` | `int` | Variantes descartadas (uniprot_id não mapeado). |
+/// | `n_upserted` | `int` | Linhas gravadas via COPY UPSERT em core_varianteffectraw. |
+/// | `source_version` | `str` | Versão da fonte (data do download). |
+/// | `errors` | `list[str]` | Erros não-fatais. |
+/// | `handoff_required` | `bool` | `True` quando mapa uniprot→gene não foi fornecido (AM não carregado). |
+#[pyclass]
+pub struct AlphaMissenseLoadManifest {
+    #[pyo3(get)]
+    pub n_variants_processed: usize,
+    #[pyo3(get)]
+    pub n_kept: usize,
+    #[pyo3(get)]
+    pub n_skipped_no_map: usize,
+    #[pyo3(get)]
+    pub n_upserted: u64,
+    #[pyo3(get)]
+    pub source_version: String,
+    #[pyo3(get)]
+    pub errors: Vec<String>,
+    /// `True` quando o mapa uniprot→gene não foi fornecido.
+    /// O caller (vitruvio) deve fornecer o mapa para carregar AM no v2.
+    #[pyo3(get)]
+    pub handoff_required: bool,
+}
+
+#[pymethods]
+impl AlphaMissenseLoadManifest {
+    fn __repr__(&self) -> String {
+        format!(
+            "AlphaMissenseLoadManifest(n_processed={}, n_kept={}, n_no_map={}, \
+             n_upserted={}, source_version={:?}, handoff_required={}, n_errors={})",
+            self.n_variants_processed, self.n_kept, self.n_skipped_no_map,
+            self.n_upserted, self.source_version, self.handoff_required,
+            self.errors.len()
+        )
+    }
+}
+
+/// Baixa o VCF ClinVar GRCh38 (clinvar.vcf.gz — ~192MB), parseia em streaming e
+/// faz COPY UPSERT em `core_varianteffectraw`.
+///
+/// # Fonte
+///
+/// `https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz`
+/// (domínio público, NCBI FTP).
+///
+/// # Filtro de escala v1
+///
+/// Somente variantes cujo `gene_symbol` (campo `GENEINFO` do INFO VCF) esteja em
+/// `gene_allowlist` são gravadas. A allowlist deve conter os genes do `GeneRole`
+/// (carregados por `load_oncokb_gene_roles` no passo 2.2). Descarte em streaming —
+/// sem bufferizar o VCF na memória.
+///
+/// # Normalização de variant_key (Decisão F)
+///
+/// `variant_key` = `CHROM:POS:REF:ALT` GRCh38, CHROM sem prefixo `chr`.
+/// ClinVar VCF GRCh38 já vem sem `chr` — nenhuma transformação necessária.
+/// Indels: strip de base de ancoragem VCF (left-anchor único, v1).
+///
+/// # COPY UPSERT
+///
+/// ON CONFLICT (variant_key, source, gene_symbol) DO UPDATE — idempotente.
+/// `source='clinvar'`; `raw_magnitude=NULL` (ClinVar é categórico); `confidence=0.9`.
+///
+/// # Segurança
+///
+/// URL validada: apenas `https://ftp.ncbi.nlm.nih.gov/` é permitido.
+/// `db_url` nunca logado.
+///
+/// # Argumentos
+///
+/// | Parâmetro | Tipo | Descrição |
+/// |---|---|---|
+/// | `url` | `str` | URL do VCF GRCh38 gzip (deve ser `https://ftp.ncbi.nlm.nih.gov/…`). |
+/// | `dest_dir` | `str` | Diretório onde o `.vcf.gz` baixado é salvo temporariamente. |
+/// | `db_url` | `str` | PostgreSQL connection string. |
+/// | `gene_allowlist` | `list[str]` | Symbols dos genes do GeneRole (UPPERCASE). |
+///
+/// # Retorno
+///
+/// `ClinVarLoadManifest` com contagens e `source_version`.
+/// Lança `PyRuntimeError` em caso de erro fatal.
+#[pyfunction]
+#[pyo3(signature = (url, dest_dir, db_url, gene_allowlist))]
+fn load_clinvar_effects(
+    url: String,
+    dest_dir: String,
+    db_url: String,
+    gene_allowlist: Vec<String>,
+) -> PyResult<ClinVarLoadManifest> {
+    match crate::omics::variant_effect_loader::load_clinvar_effects(
+        &url, &dest_dir, &db_url, gene_allowlist,
+    ) {
+        Ok(m) => Ok(ClinVarLoadManifest {
+            n_variants_processed: m.n_variants_processed,
+            n_kept: m.n_kept,
+            n_skipped_offlist: m.n_skipped_offlist,
+            n_skipped_no_gene: m.n_skipped_no_gene,
+            n_upserted: m.n_upserted,
+            source_version: m.source_version,
+            errors: m.errors,
+        }),
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
+/// Baixa o TSV AlphaMissense hg38 (AlphaMissense_hg38.tsv.gz — ~643MB), parseia
+/// em streaming e faz COPY UPSERT em `core_varianteffectraw`.
+///
+/// # Decisão de filtro (HANDOFF v1)
+///
+/// AlphaMissense não tem `gene_symbol` — só `uniprot_id`. Para filtrar por gene,
+/// o caller deve fornecer `uniprot_to_gene` (mapa `uniprot_id → gene_symbol`,
+/// derivado de UniProt/Ensembl para os genes do GeneRole).
+///
+/// **Se `uniprot_to_gene` estiver vazio**: a função retorna imediatamente com
+/// `handoff_required=True` sem baixar o arquivo. Isso é o comportamento correto
+/// para o v1 — AM fica como handoff. O vitruvio deve fornecer o mapa no v2.
+///
+/// # Fonte
+///
+/// `https://storage.googleapis.com/dm_alphamissense/AlphaMissense_hg38.tsv.gz`
+/// (CC BY-NC-SA 4.0, Google DeepMind). Mirror Zenodo: `https://zenodo.org/record/8208688/…`.
+///
+/// # Normalização de variant_key (Decisão F)
+///
+/// AlphaMissense vem com `CHROM` com prefixo `chr` → REMOVIDO. `POS` 1-based.
+/// Resultado idêntico ao ClinVar para a mesma variante SNV.
+///
+/// # Segurança
+///
+/// URL validada: apenas `storage.googleapis.com` e `zenodo.org` são permitidos.
+/// `db_url` nunca logado. Licença AM: NÃO commitar recortes do arquivo real —
+/// fixtures nos testes são sintéticas.
+///
+/// # Argumentos
+///
+/// | Parâmetro | Tipo | Descrição |
+/// |---|---|---|
+/// | `url` | `str` | URL do TSV gzip AlphaMissense. |
+/// | `dest_dir` | `str` | Diretório onde o `.tsv.gz` é salvo temporariamente. |
+/// | `db_url` | `str` | PostgreSQL connection string. |
+/// | `uniprot_to_gene` | `dict[str,str]` | Mapa `uniprot_id → gene_symbol` para genes do GeneRole. Vazio → `handoff_required=True`. |
+/// | `gene_allowlist` | `list[str]` | Symbols dos genes do GeneRole (UPPERCASE). |
+///
+/// # Retorno
+///
+/// `AlphaMissenseLoadManifest` com contagens, `source_version` e `handoff_required`.
+/// Lança `PyRuntimeError` em caso de erro fatal.
+#[pyfunction]
+#[pyo3(signature = (url, dest_dir, db_url, uniprot_to_gene, gene_allowlist))]
+fn load_alphamissense_effects(
+    url: String,
+    dest_dir: String,
+    db_url: String,
+    uniprot_to_gene: std::collections::HashMap<String, String>,
+    gene_allowlist: Vec<String>,
+) -> PyResult<AlphaMissenseLoadManifest> {
+    match crate::omics::variant_effect_loader::load_alphamissense_effects(
+        &url, &dest_dir, &db_url, uniprot_to_gene, gene_allowlist,
+    ) {
+        Ok(m) => Ok(AlphaMissenseLoadManifest {
+            n_variants_processed: m.n_variants_processed,
+            n_kept: m.n_kept,
+            n_skipped_no_map: m.n_skipped_no_map,
+            n_upserted: m.n_upserted,
+            source_version: m.source_version,
+            errors: m.errors,
+            handoff_required: m.handoff_required,
+        }),
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
+// ─── Somatic MAF loader (Obj 2 — Fase 2, passo 2.6) ─────────────────────────
+
+/// Entrada do mapa `file_id → sample_accession` passado pelo Django.
+///
+/// O Django resolve o mapa via GDC API (`/files?fields=cases.submitter_id`)
+/// e passa uma lista de `{file_id: str, sample_accession: str}`. O loader
+/// associa cada variante à `sample_accession` pelo `file_id` que está baixando —
+/// sem derivar o case_id do Tumor_Sample_Barcode (que é aliquot CPTAC interno).
+#[pyclass]
+#[derive(Clone)]
+pub struct SomaticMafFileEntry {
+    #[pyo3(get, set)]
+    pub file_id: String,
+    #[pyo3(get, set)]
+    pub sample_accession: String,
+}
+
+#[pymethods]
+impl SomaticMafFileEntry {
+    #[new]
+    fn new(file_id: String, sample_accession: String) -> Self {
+        SomaticMafFileEntry { file_id, sample_accession }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SomaticMafFileEntry(file_id={:?}, sample_accession={:?})",
+            self.file_id, self.sample_accession
+        )
+    }
+}
+
+/// Metadados de uma coluna de amostra no Parquet somatic MAF.
+///
+/// Campos:
+/// - `case_id`: accession da amostra (ex.: `"C3L-00004_tumor"`).
+/// - `sample_role`: sempre `"tumor"` para MAFs somáticos CPTAC.
+/// - `column_index`: posição 0-based da coluna no Parquet (col 0 = `feature`; amostras ≥ 1).
+#[pyclass]
+#[derive(Clone)]
+pub struct SomaticMafSampleColumn {
+    #[pyo3(get)]
+    pub case_id: String,
+    #[pyo3(get)]
+    pub sample_role: String,
+    #[pyo3(get)]
+    pub column_index: usize,
+}
+
+#[pymethods]
+impl SomaticMafSampleColumn {
+    #[new]
+    fn new() -> Self {
+        SomaticMafSampleColumn {
+            case_id: String::new(),
+            sample_role: String::new(),
+            column_index: 0,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SomaticMafSampleColumn(case_id={:?}, sample_role={:?}, column_index={})",
+            self.case_id, self.sample_role, self.column_index
+        )
+    }
+}
+
+/// Manifesto retornado por `load_somatic_maf`.
+///
+/// Handoff para o vitruvio (passo 2.6):
+///
+/// | Campo | Tipo | Descrição |
+/// |---|---|---|
+/// | `parquet_path` | `str` | Caminho absoluto do Parquet burden (`feature × T_<sample>`, Int32). |
+/// | `checksum_md5` | `str` | MD5 lowercase-hex do Parquet. |
+/// | `n_features` | `int` | Número de genes (features = linhas do Parquet). |
+/// | `n_samples` | `int` | Número de amostras únicas. |
+/// | `sample_columns` | `list[SomaticMafSampleColumn]` | Todas com `sample_role = "tumor"`. |
+/// | `occurrences_path` | `str` | Caminho do TSV `(sample_accession, variant_key, gene_symbol, variant_classification)`. |
+/// | `n_files_processed` | `int` | Arquivos MAF baixados e parseados com sucesso. |
+/// | `n_occurrences` | `int` | Ocorrências únicas `(sample, variant_key)` após dedupe. |
+/// | `n_variants_skipped_synonymous` | `int` | Variantes descartadas por serem sinônimas. |
+/// | `n_variants_skipped_offlist` | `int` | Variantes descartadas (gene não na allowlist). |
+/// | `errors` | `list[str]` | Erros não-fatais por arquivo MAF. |
+#[pyclass]
+pub struct SomaticMafManifest {
+    #[pyo3(get)]
+    pub parquet_path: String,
+    #[pyo3(get)]
+    pub checksum_md5: String,
+    #[pyo3(get)]
+    pub n_features: usize,
+    #[pyo3(get)]
+    pub n_samples: usize,
+    #[pyo3(get)]
+    pub sample_columns: Vec<SomaticMafSampleColumn>,
+    #[pyo3(get)]
+    pub occurrences_path: String,
+    #[pyo3(get)]
+    pub n_files_processed: usize,
+    #[pyo3(get)]
+    pub n_occurrences: usize,
+    #[pyo3(get)]
+    pub n_variants_skipped_synonymous: usize,
+    #[pyo3(get)]
+    pub n_variants_skipped_offlist: usize,
+    #[pyo3(get)]
+    pub errors: Vec<String>,
+}
+
+#[pymethods]
+impl SomaticMafManifest {
+    fn __repr__(&self) -> String {
+        format!(
+            "SomaticMafManifest(n_features={}, n_samples={}, n_files_processed={}, \
+             n_occurrences={}, n_skipped_syn={}, n_skipped_off={}, n_errors={})",
+            self.n_features,
+            self.n_samples,
+            self.n_files_processed,
+            self.n_occurrences,
+            self.n_variants_skipped_synonymous,
+            self.n_variants_skipped_offlist,
+            self.errors.len(),
+        )
+    }
+}
+
+/// Baixa e parseia arquivos GDC masked MAF em lote, produzindo dois artefatos locais:
+///
+/// 1. **Parquet burden** (`feature × T_<sample>`, Int32) — uma linha por gene, uma
+///    coluna por amostra, valor = contagem de variantes não-sinônimas (`omics_layer='genomic'`,
+///    `data_format_level='counts'`). Usado pelo vitruvio para criar `OmicMatrix`.
+/// 2. **TSV de ocorrências** (`sample_accession, variant_key, gene_symbol,
+///    variant_classification`) — consumido pelo `snv_seed_service` (vitruvio)
+///    para cruzar com `VariantEffectResolved` e materializar `VariantEffectSeed`.
+///
+/// # Contrato do file_map
+///
+/// O Django resolve `file_id → sample_accession` via GDC API (`/files?fields=cases.submitter_id`)
+/// antes de chamar esta função. O mapa é passado como lista de `SomaticMafFileEntry`.
+/// O loader **não** tenta derivar o case_id do `Tumor_Sample_Barcode` in-file (que é
+/// um aliquot CPTAC interno como `CPT0077490009`, sem relação direta com C3L-/C3N-).
+///
+/// # Variantes não-sinônimas (lista exata)
+///
+/// Missense_Mutation, Nonsense_Mutation, Frame_Shift_Del, Frame_Shift_Ins,
+/// In_Frame_Del, In_Frame_Ins, Splice_Site, Translation_Start_Site, Nonstop_Mutation.
+/// Silent, Intron, UTR, IGR, RNA → descartados.
+///
+/// # variant_key
+///
+/// Reutiliza `normalize_variant_key` / `strip_chr_prefix` de `variant_effect_loader.rs`
+/// (strip de `chr` + strip de base de ancoragem VCF para indels). Consistente com
+/// ClinVar/AlphaMissense — crítico para o cruzamento do seed.
+///
+/// # Dedupe
+///
+/// Mesma `(sample_accession, variant_key)` em múltiplos arquivos conta 1× no burden
+/// e 1× no TSV. CPTAC tem casos com múltiplos MAFs por amostra.
+///
+/// # Download
+///
+/// GET `https://api.gdc.cancer.gov/data/{file_id}` (não HEAD — HEAD retorna 400).
+/// Host validado: apenas `api.gdc.cancer.gov`. Teto de 512 MB por arquivo.
+/// Arquivo gzip descomprimido em streaming. Timeout 30 min.
+///
+/// # Segurança
+///
+/// `db_url` nunca logado. Host allowlist. Teto de bytes. Sem SQL cru.
+///
+/// # Argumentos
+///
+/// | Parâmetro | Tipo | Descrição |
+/// |---|---|---|
+/// | `file_map` | `list[SomaticMafFileEntry]` | Mapa `file_id → sample_accession` (Django resolve). |
+/// | `dest_dir` | `str` | Diretório local onde os artefatos serão gravados. |
+/// | `db_url` | `str` | PostgreSQL connection string (reservado; não usado no loader). |
+/// | `gene_allowlist` | `list[str]` | Symbols dos genes do GeneRole (UPPERCASE). |
+/// | `parquet_name` | `str` | Nome do Parquet de saída (default: `"cptac_ccrcc_somatic.parquet"`). |
+///
+/// # Retorno
+///
+/// `SomaticMafManifest` — ver campos acima.
+/// Lança `PyRuntimeError` em caso de erro fatal (diretório, Parquet). Erros por arquivo
+/// são não-fatais e acumulados em `errors`.
+#[pyfunction]
+#[pyo3(signature = (file_map, dest_dir, db_url, gene_allowlist, parquet_name = "cptac_ccrcc_somatic.parquet"))]
+fn load_somatic_maf(
+    file_map: Vec<SomaticMafFileEntry>,
+    dest_dir: String,
+    db_url: String,
+    gene_allowlist: Vec<String>,
+    parquet_name: &str,
+) -> PyResult<SomaticMafManifest> {
+    let rust_entries: Vec<crate::omics::maf_loader::MafFileEntry> = file_map
+        .into_iter()
+        .map(|e| crate::omics::maf_loader::MafFileEntry {
+            file_id: e.file_id,
+            sample_accession: e.sample_accession,
+        })
+        .collect();
+
+    match crate::omics::maf_loader::load_somatic_maf(
+        rust_entries,
+        &dest_dir,
+        &db_url,
+        gene_allowlist,
+        parquet_name,
+    ) {
+        Ok(m) => {
+            let sample_columns: Vec<SomaticMafSampleColumn> = m
+                .sample_columns
+                .into_iter()
+                .map(|sc| SomaticMafSampleColumn {
+                    case_id: sc.case_id,
+                    sample_role: sc.sample_role,
+                    column_index: sc.column_index,
+                })
+                .collect();
+            Ok(SomaticMafManifest {
+                parquet_path: m.parquet_path,
+                checksum_md5: m.checksum_md5,
+                n_features: m.n_features,
+                n_samples: m.n_samples,
+                sample_columns,
+                occurrences_path: m.occurrences_path,
+                n_files_processed: m.n_files_processed,
+                n_occurrences: m.n_occurrences,
+                n_variants_skipped_synonymous: m.n_variants_skipped_synonymous,
+                n_variants_skipped_offlist: m.n_variants_skipped_offlist,
+                errors: m.errors,
+            })
+        }
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
 // ─── NER bindings ─────────────────────────────────────────────────────────────
 
 /// Extrai genes mencionados em `text` usando o dicionário HGNC canônico.
@@ -1975,5 +2437,15 @@ fn rust_engine(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // CNV seed derivation (Obj 2 — Fase 2, slice CNV-seed)
     m.add_class::<CnvSeedManifest>()?;
     m.add_function(wrap_pyfunction!(seed_cnv_from_parquet, m)?)?;
+    // Variant effect loaders — ClinVar + AlphaMissense (Obj 2 — Fase 2, passo 2.4)
+    m.add_class::<ClinVarLoadManifest>()?;
+    m.add_class::<AlphaMissenseLoadManifest>()?;
+    m.add_function(wrap_pyfunction!(load_clinvar_effects, m)?)?;
+    m.add_function(wrap_pyfunction!(load_alphamissense_effects, m)?)?;
+    // Somatic MAF loader — GDC masked MAF → Parquet burden + ocorrências (Obj 2 — Fase 2, passo 2.6)
+    m.add_class::<SomaticMafFileEntry>()?;
+    m.add_class::<SomaticMafSampleColumn>()?;
+    m.add_class::<SomaticMafManifest>()?;
+    m.add_function(wrap_pyfunction!(load_somatic_maf, m)?)?;
     Ok(())
 }
