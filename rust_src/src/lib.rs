@@ -2781,6 +2781,204 @@ fn load_collectri_regulons(
     }
 }
 
+// ─── Motor PFS v1 (Obj 2 — Fase 4) ────────────────────────────────────────────
+
+/// Manifesto retornado por `run_pfs_scoring`. Resumo pequeno (contadores +
+/// agregados + tempos por etapa) — NUNCA a matriz de escores (skill
+/// django-rust-boundary). O detalhe vive em `core_pathwayactivityscore`.
+///
+/// `n_readouts_mapped`/`with_value`/`missing` são somados na MESMA
+/// granularidade — uma vez por linha de escore `(via, amostra)` — para que
+/// `with_value / mapped` seja a cobertura de readout real da execução (2º
+/// passo do diagnóstico anti-p-hacking do plano) e `missing == mapped -
+/// with_value` valha também no agregado. `n_readouts_phospho`/`n_readouts_tf`
+/// contam NÓS (não linhas mapeadas nem pares TF-alvo) — não somar os dois
+/// esperando bater com `n_readouts_mapped`.
+///
+/// Ver `rust_src/src/omics/pfs_engine.rs` para a semântica exata de cada
+/// contador (contrato travado com `PathwayActivityScore`, migration 0037).
+#[pyclass]
+#[derive(Clone)]
+pub struct PfsRunManifest {
+    #[pyo3(get)]
+    pub n_pathways: u64,
+    #[pyo3(get)]
+    pub n_pathways_no_readout: u64,
+    #[pyo3(get)]
+    pub n_cases_scored: u64,
+    #[pyo3(get)]
+    pub n_rows_written: u64,
+    #[pyo3(get)]
+    pub n_seeds_total: u64,
+    #[pyo3(get)]
+    pub n_seeds_on_graph: u64,
+    #[pyo3(get)]
+    pub n_seeds_off_graph: u64,
+    #[pyo3(get)]
+    pub n_seeds_masked_by_neutral_v2: u64,
+    #[pyo3(get)]
+    pub n_readouts_mapped: u64,
+    #[pyo3(get)]
+    pub n_readouts_with_value: u64,
+    #[pyo3(get)]
+    pub n_readouts_missing: u64,
+    #[pyo3(get)]
+    pub n_readouts_phospho: u64,
+    #[pyo3(get)]
+    pub n_readouts_tf: u64,
+    #[pyo3(get)]
+    pub n_tf_below_min_targets: u64,
+    #[pyo3(get)]
+    pub n_tumor_unpaired_skipped: u64,
+    #[pyo3(get)]
+    pub n_zero_sd_null: u64,
+    #[pyo3(get)]
+    pub n_unsigned_edges: u64,
+    #[pyo3(get)]
+    pub n_signed_edges: u64,
+    #[pyo3(get)]
+    pub elapsed_ms_load: u64,
+    #[pyo3(get)]
+    pub elapsed_ms_graph_precompute: u64,
+    #[pyo3(get)]
+    pub elapsed_ms_readout_and_permutation: u64,
+    #[pyo3(get)]
+    pub elapsed_ms_copy: u64,
+    #[pyo3(get)]
+    pub elapsed_ms_total: u64,
+}
+
+#[pymethods]
+impl PfsRunManifest {
+    fn __repr__(&self) -> String {
+        format!(
+            "PfsRunManifest(n_pathways={}, n_cases_scored={}, n_rows_written={}, \
+             n_seeds_total={}, n_seeds_on_graph={}, n_seeds_off_graph={}, \
+             n_readouts_with_value={}, n_readouts_missing={}, n_zero_sd_null={}, \
+             elapsed_ms_total={})",
+            self.n_pathways,
+            self.n_cases_scored,
+            self.n_rows_written,
+            self.n_seeds_total,
+            self.n_seeds_on_graph,
+            self.n_seeds_off_graph,
+            self.n_readouts_with_value,
+            self.n_readouts_missing,
+            self.n_zero_sd_null,
+            self.elapsed_ms_total,
+        )
+    }
+}
+
+/// Roda o motor PFS v1 (RWR assinado + leitura por Regras + escore contínuo
+/// por permutação) para as vias dadas e grava `core_pathwayactivityscore` via
+/// COPY UPSERT. Ponto de entrada único (D1 TRAVADO: núcleo 100% Rust).
+///
+/// # Argumentos
+///
+/// | Parâmetro | Tipo | Descrição |
+/// |---|---|---|
+/// | `pathway_kegg_ids` | `list[str]` | IDs KEGG das vias a pontuar (ex.: `["hsa04151","hsa04010","hsa04115"]`). |
+/// | `phospho_parquet_path` | `str` | Caminho local do Parquet de fosfoproteoma (Django já baixou). |
+/// | `proteome_parquet_path` | `str` | Caminho local do Parquet de proteoma. |
+/// | `phospho_matrix_id` | `int` | PK de `OmicMatrix` do fosfoproteoma. |
+/// | `proteome_matrix_id` | `int` | PK de `OmicMatrix` do proteoma. |
+/// | `seed_method_versions` | `list[str]` | Versões de seed consideradas (precedência D3 é fixa: cnv-v2 > snv-v1 > cnv-v1). |
+/// | `mapping_version` | `str` | Versão do mapeamento readout→feature (`PathwayReadoutFeature.mapping_version`). |
+/// | `method_version` | `str` | Versão do método do PFS — PARTE DA NATURAL KEY do escore. |
+/// | `db_url` | `str` | PostgreSQL connection string (nunca logada). |
+/// | `restart` | `float` | `r` do RWR (default 0.3). |
+/// | `unsigned_weight` | `float` | Peso das arestas `sign=0` (default 0.3). |
+/// | `n_permutations` | `int` | `B` da nula (default 1000). |
+/// | `rng_seed` | `int` | Semente-base do PRNG counter-based (derivada por permutação — D7). |
+/// | `min_regulon_targets` | `int` | Mínimo de alvos com valor para o ULM da Regra 2 (default 5). |
+/// | `dry_run` | `bool` | `true` calcula tudo e NÃO escreve — sonda de cobertura (D-4/D-5). |
+///
+/// # Retorno
+///
+/// `PfsRunManifest` — contadores agregados + tempos por etapa (ms).
+#[pyfunction]
+#[pyo3(signature = (
+    pathway_kegg_ids,
+    phospho_parquet_path,
+    proteome_parquet_path,
+    phospho_matrix_id,
+    proteome_matrix_id,
+    seed_method_versions,
+    mapping_version,
+    method_version,
+    db_url,
+    restart=0.3,
+    unsigned_weight=0.3,
+    n_permutations=1000,
+    rng_seed=42,
+    min_regulon_targets=5,
+    dry_run=false
+))]
+#[allow(clippy::too_many_arguments)]
+fn run_pfs_scoring(
+    pathway_kegg_ids: Vec<String>,
+    phospho_parquet_path: String,
+    proteome_parquet_path: String,
+    phospho_matrix_id: i64,
+    proteome_matrix_id: i64,
+    seed_method_versions: Vec<String>,
+    mapping_version: String,
+    method_version: String,
+    db_url: String,
+    restart: f64,
+    unsigned_weight: f64,
+    n_permutations: u32,
+    rng_seed: u64,
+    min_regulon_targets: usize,
+    dry_run: bool,
+) -> PyResult<PfsRunManifest> {
+    match crate::omics::pfs_engine::run_pfs_scoring(
+        pathway_kegg_ids,
+        phospho_parquet_path,
+        proteome_parquet_path,
+        phospho_matrix_id,
+        proteome_matrix_id,
+        seed_method_versions,
+        mapping_version,
+        method_version,
+        db_url,
+        restart,
+        unsigned_weight,
+        n_permutations,
+        rng_seed,
+        min_regulon_targets,
+        dry_run,
+    ) {
+        Ok(m) => Ok(PfsRunManifest {
+            n_pathways: m.n_pathways,
+            n_pathways_no_readout: m.n_pathways_no_readout,
+            n_cases_scored: m.n_cases_scored,
+            n_rows_written: m.n_rows_written,
+            n_seeds_total: m.n_seeds_total,
+            n_seeds_on_graph: m.n_seeds_on_graph,
+            n_seeds_off_graph: m.n_seeds_off_graph,
+            n_seeds_masked_by_neutral_v2: m.n_seeds_masked_by_neutral_v2,
+            n_readouts_mapped: m.n_readouts_mapped,
+            n_readouts_with_value: m.n_readouts_with_value,
+            n_readouts_missing: m.n_readouts_missing,
+            n_readouts_phospho: m.n_readouts_phospho,
+            n_readouts_tf: m.n_readouts_tf,
+            n_tf_below_min_targets: m.n_tf_below_min_targets,
+            n_tumor_unpaired_skipped: m.n_tumor_unpaired_skipped,
+            n_zero_sd_null: m.n_zero_sd_null,
+            n_unsigned_edges: m.n_unsigned_edges,
+            n_signed_edges: m.n_signed_edges,
+            elapsed_ms_load: m.elapsed_ms_load,
+            elapsed_ms_graph_precompute: m.elapsed_ms_graph_precompute,
+            elapsed_ms_readout_and_permutation: m.elapsed_ms_readout_and_permutation,
+            elapsed_ms_copy: m.elapsed_ms_copy,
+            elapsed_ms_total: m.elapsed_ms_total,
+        }),
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
 // ─── NER bindings ─────────────────────────────────────────────────────────────
 
 /// Extrai genes mencionados em `text` usando o dicionário HGNC canônico.
@@ -2853,5 +3051,8 @@ fn rust_engine(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Catálogo de features de matriz — promoção A→C (Obj 2 — Fase 3)
     m.add_class::<FeatureCatalogManifest>()?;
     m.add_function(wrap_pyfunction!(catalog_matrix_features, m)?)?;
+    // Motor PFS v1 — RWR assinado + leitura por Regras + permutação (Obj 2 — Fase 4)
+    m.add_class::<PfsRunManifest>()?;
+    m.add_function(wrap_pyfunction!(run_pfs_scoring, m)?)?;
     Ok(())
 }

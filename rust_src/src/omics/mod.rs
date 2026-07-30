@@ -11,6 +11,7 @@ pub mod maf_loader;
 pub mod matrix_feature_catalog;
 pub mod matrix_loader;
 pub mod models;
+pub mod pfs_engine;
 pub mod pride_parser;
 pub mod regulon_loader;
 pub mod sample_parser;

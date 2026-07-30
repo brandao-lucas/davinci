@@ -2228,3 +2228,133 @@ def run_regulon_load(self, job_id: str, project_id: str):
         except Exception:
             pass
         raise self.retry(exc=exc, countdown=120)
+
+
+@shared_task(
+    bind=True,
+    max_retries=1,
+    # Motor PFS v1: download de DOIS Parquets (fosfo + proteoma, dezenas de
+    # MB cada) + RWR assinado/ULM/permutação em Rust (algoritmicamente
+    # segundos, pela linearidade do RWR — D7 do plano) + COPY UPSERT em
+    # PathwayActivityScore. O tempo dominante é I/O de download, não CPU.
+    # max_retries=1 (não 2/3): o gate de reprodutibilidade (D3) e os
+    # pré-checks já falham alto de forma determinística — re-tentar um erro
+    # de configuração não ajuda; falhas de rede/I/O justificam 1 retry.
+    time_limit=2 * 3600,
+    soft_time_limit=1 * 3600 + 50 * 60,
+    acks_late=True,
+)
+def run_pathway_scoring(self, job_id: str, project_id: str):
+    """
+    Orquestra o run do motor PFS v1 (OmnisPathway Obj 2, Fase 4).
+
+    Wrapper fino que delega ao PathwayScoringService.run(). A task resolve
+    o projeto e o job pelos IDs antes de processar, garantindo isolamento
+    (o job foi criado por PathwayScoringService.dispatch, que já validou
+    que o projeto pertence ao usuário autenticado e checou todos os
+    pré-checks/gates).
+
+    Fluxo:
+      1. Resolve DaVinciProject e IngestionJob pelos IDs recebidos.
+      2. Valida isolamento: job.project_id == project_id.
+      3. Delega a PathwayScoringService.run(job=job), que:
+           - Resolve as duas OmicMatrix (fosfo + proteoma) via
+             ProjectDataset (isolamento).
+           - Download dos dois Parquets via default_storage → tempfile
+             local.
+           - rust_engine.run_pfs_scoring(...) → PfsRunManifest.
+           - Marca job COMPLETED com os contadores do manifesto.
+
+    Regra #1: task apenas orquestra — não faz nenhuma conta numérica.
+    Sensitive-data-handling: db_url nunca logada nem gravada em parameters.
+    """
+    from apps.core.models import DaVinciProject
+    from apps.core.services.pathway_scoring_service import PathwayScoringService
+
+    empty_result = {
+        'n_rows_written': 0,
+        'n_cases_scored': 0,
+        'n_seeds_on_graph': 0,
+        'n_seeds_off_graph': 0,
+        'n_readouts_mapped': 0,
+        'n_readouts_with_value': 0,
+        'errors': [],
+    }
+
+    try:
+        import rust_engine  # noqa: F401 — valida disponibilidade antes de iniciar
+    except ImportError:
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=(
+                    'rust_engine not installed — compile with '
+                    '`maturin develop --release`'
+                ),
+            )
+        except Exception:
+            pass
+        return {**empty_result, 'errors': ['rust_engine not installed']}
+
+    try:
+        try:
+            project = DaVinciProject.objects.select_related('user').get(id=project_id)
+        except DaVinciProject.DoesNotExist:
+            logger.warning(
+                'run_pathway_scoring: DaVinciProject %s não encontrado — task abortada',
+                project_id,
+            )
+            return {**empty_result, 'errors': ['project not found']}
+
+        try:
+            job = IngestionJob.objects.get(id=job_id)
+        except IngestionJob.DoesNotExist:
+            logger.warning(
+                'run_pathway_scoring: IngestionJob %s não encontrado — task abortada',
+                job_id,
+            )
+            return {**empty_result, 'errors': ['job not found']}
+
+        # Isolamento: confirma que o job pertence ao projeto recebido
+        if str(job.project_id) != str(project_id):
+            logger.error(
+                'run_pathway_scoring: job %s não pertence ao projeto %s — '
+                'task abortada (isolamento)',
+                job_id,
+                project_id,
+            )
+            IngestionJob.objects.filter(id=job.id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message='Isolamento: job não pertence ao projeto informado.',
+            )
+            return {**empty_result, 'errors': ['isolation violation']}
+
+        service = PathwayScoringService(project)
+        result = service.run(job=job)
+
+        return {
+            'n_rows_written': result['n_rows_written'],
+            'n_cases_scored': result['n_cases_scored'],
+            'n_seeds_on_graph': result['n_seeds_on_graph'],
+            'n_seeds_off_graph': result['n_seeds_off_graph'],
+            'n_readouts_mapped': result['n_readouts_mapped'],
+            'n_readouts_with_value': result['n_readouts_with_value'],
+            'zero_seeds_on_graph': result['zero_seeds_on_graph'],
+            'errors': [],
+        }
+
+    except Exception as exc:
+        logger.error(
+            'run_pathway_scoring falhou para projeto %s / job %s: %s',
+            project_id,
+            job_id,
+            exc,
+        )
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=str(exc),
+            )
+        except Exception:
+            pass
+        raise self.retry(exc=exc, countdown=120)

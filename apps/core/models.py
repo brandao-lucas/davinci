@@ -2610,6 +2610,227 @@ class PathwayReadoutFeature(models.Model):
         )
 
 
+class PathwayActivityScore(models.Model):
+    """
+    ESCORE DE ATIVIDADE DE VIA (PFS) — saída do motor PFS v1.
+    OmnisPathway Obj 2, Fase 4 (Decisão D2 do plano, TRAVADA).
+
+    Uma linha por `(via, amostra TUMOR, versão do método)`. O escore JÁ É o do
+    contraste tumor↔normal pareado (D8): as sementes vêm da genômica do tumor
+    (as matrizes-âncora de seed são tumor-only, não existe vetor de sementes
+    para amostra normal) e o readout é `Δ = tumor − normal` do MESMO paciente.
+    Por isso não há tabela de contraste separada — não existem dois escores
+    para subtrair.
+
+    `z_score` é o PFS primário (contínuo, comparável entre vias e amostras);
+    `p_empirical` satura em 1/(B+1) e serve como anotação de significância, não
+    como ranking (D7). O modelo nulo permuta a POSIÇÃO das sementes no mesmo
+    grafo, estratificada por quartil de out-degree.
+
+    Catálogo GLOBAL derivado, SEM FK de projeto — espelha `VariantEffectSeed` e
+    `OmicSamplePairing`. Isolamento por usuário (Regra #3) vive em
+    `ProjectDataset`: qualquer leitura futura filtra
+    `sample__dataset__in_projects__project`. É derivado: delete/regeração
+    permitidos, a Regra #2 (curadoria) não se aplica.
+
+    Materialização (responsabilidade do ferris/Rust): COPY UPSERT
+    `ON CONFLICT (pathway_id, sample_id, method_version) DO UPDATE` ao fim do
+    `score_pathways` — NÃO deste model, NÃO via ORM. Django orquestra e não faz
+    nenhuma conta numérica (Regra #1).
+
+    ─── POR QUE DOIS CONTADORES DE READOUT (regra travada no adendo do plano) ──
+    A ingestão live mediu que 36% dos readouts candidatos da Regra 1 (71 de
+    197) NÃO têm feature alguma na matriz — são READOUTS FANTASMA, consequência
+    de a Fase 3 ter validado o mapeamento intra-grafo, não contra o Parquet.
+    Se o motor normalizasse pelo número de readouts MAPEADOS (linhas de
+    `PathwayReadoutFeature`), o denominador ficaria até 36% inflado e o PFS
+    sairia sistematicamente SUBESTIMADO, com viés DESIGUAL entre vias (a via de
+    pior cobertura é a mais penalizada) — o que contaminaria justamente a
+    comparação entre vias.
+
+    Logo: o motor normaliza por readouts EFETIVAMENTE LIDOS
+    (`n_readouts_with_value`) e persiste os dois números lado a lado, para que a
+    cobertura seja auditável POR VIA E POR AMOSTRA sem re-executar o motor. É
+    também o diagnóstico ordenado previsto para o caso z≈0 em toda a coorte
+    (cobertura de seed → cobertura de readout → arestas sem sinal → nº de
+    pares): o achado é REGISTRADO, nunca compensado por ajuste de parâmetro
+    (anti-p-hacking).
+
+    A mesma lógica vale para as sementes: `n_seeds_on_graph` /
+    `n_seeds_off_graph` (D4 — semente cujo gene não tem nó nesta via é
+    descartada por construção e CONTADA; ~0 sementes no grafo produz z≈0 como
+    SINTOMA, não como bug).
+
+    Contadores — semântica exata (contrato com o motor Rust):
+      - `n_seeds_on_graph`      sementes da amostra que caíram em nó desta via
+      - `n_seeds_off_graph`     sementes da amostra descartadas (gene sem nó)
+      - `n_readouts_mapped`     linhas de `PathwayReadoutFeature` candidatas
+                                desta via nesta `mapping_version` (ambas as
+                                regras) — o denominador ERRADO, guardado só
+                                para auditoria
+      - `n_readouts_with_value` subconjunto com feature real E valor no Parquet
+                                — o denominador DE FATO usado no escore
+      - `n_readouts_missing`    fantasmas = mapped − with_value (redundante por
+                                desenho; gravado pelo motor como diagnóstico
+                                direto e invariante verificável)
+      - `n_readouts_phospho`    nós da Regra 1 que contribuíram (termo 1)
+      - `n_readouts_tf`         TFs da Regra 2 com footprint computado, isto é,
+                                com ≥ `min_regulon_targets` alvos com valor
+                                (termo 2)
+
+    Extensibilidade (D10): o ponto de extensão é `method_version` na natural
+    key — RWR assinado, PCST e difusão de calor coexistem na mesma tabela SEM
+    migration futura. Não há trait/registry de propagador enquanto houver um só
+    implementador.
+    """
+
+    pathway = models.ForeignKey(
+        Pathway,
+        on_delete=models.CASCADE,
+        related_name='activity_scores',
+        help_text='Via pontuada (o PFS é POR VIA; grafos não são unidos).'
+    )
+    sample = models.ForeignKey(
+        OmicSample,
+        on_delete=models.CASCADE,
+        related_name='pathway_scores',
+        help_text='Amostra TUMOR do contraste — é ela que carrega as sementes '
+                  'genômicas (D8).'
+    )
+    pairing = models.ForeignKey(
+        OmicSamplePairing,
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
+        related_name='pathway_scores',
+        help_text='Par que forneceu o baseline normal do readout. NULL é o '
+                  'ponto de extensão reservado a baseline NÃO pareado (GTEx, '
+                  'pendente no roadmap) — no v1 vem sempre preenchido.'
+    )
+
+    # ─── Estatística do escore (D6 leitura por Regras + D7 nulo) ──────────────
+    score = models.FloatField(
+        'Escore Observado (S_obs)',
+        help_text='Estatística observada da leitura por Regras: '
+                  'média(p_v · Δx_v | Regra 1) + média(p_t · a_t | Regra 2). '
+                  'Média (não soma) por regra → vias com nº de readouts '
+                  'diferente ficam comparáveis.'
+    )
+    null_mean = models.FloatField(
+        'Média da Nula',
+        help_text='Média da distribuição nula (permutação da POSIÇÃO das '
+                  'sementes, estratificada por quartil de out-degree).'
+    )
+    null_sd = models.FloatField(
+        'Desvio-padrão da Nula',
+        help_text='Desvio-padrão da nula. 0.0 → z_score = 0 por convenção '
+                  '(D7); é sintoma de cobertura, não de bug.'
+    )
+    z_score = models.FloatField(
+        'Z-score (PFS primário)',
+        help_text='(S_obs − null_mean)/null_sd. É o PFS CONTÍNUO primário — '
+                  'comparável entre vias e amostras.'
+    )
+    p_empirical = models.FloatField(
+        'p Empírico',
+        help_text='Bicaudal com correção +1: (1 + #{|S_null| ≥ |S_obs|})/(1+B). '
+                  'Satura em 1/(B+1) → anotação de significância, NÃO ranking.'
+    )
+    n_permutations = models.PositiveIntegerField(
+        'Nº de Permutações (B)',
+        default=0,
+        help_text='B efetivo usado na nula (default 1000).'
+    )
+
+    # ─── Cobertura de semente (D4/D-5) ────────────────────────────────────────
+    n_seeds_on_graph = models.PositiveIntegerField(
+        'Sementes no Grafo',
+        default=0,
+        help_text='Sementes desta amostra que caíram em nó gene/ortholog DESTA '
+                  'via (peso dividido w/k entre nós homônimos).'
+    )
+    n_seeds_off_graph = models.PositiveIntegerField(
+        'Sementes Fora do Grafo',
+        default=0,
+        help_text='Sementes descartadas por não haver nó com o símbolo nesta '
+                  'via — esperado e correto (a via é o recorte), mas CONTADO: '
+                  'on/off é a cobertura de semente por via e amostra (D-5).'
+    )
+
+    # ─── Cobertura de readout (regra travada do adendo — ver docstring) ───────
+    n_readouts_mapped = models.PositiveIntegerField(
+        'Readouts Mapeados (candidatos)',
+        default=0,
+        help_text='Linhas de PathwayReadoutFeature desta via/mapping_version '
+                  '(ambas as regras). NÃO é o denominador do escore — inclui '
+                  'readouts fantasma (36% na Regra 1 na medição live).'
+    )
+    n_readouts_with_value = models.PositiveIntegerField(
+        'Readouts com Valor Real',
+        default=0,
+        help_text='Readouts com feature real E valor no Parquet neste par — É '
+                  'ESTE o denominador da normalização. Nunca imputar zero para '
+                  'ausência: zero é um valor, ausência não é.'
+    )
+    n_readouts_missing = models.PositiveIntegerField(
+        'Readouts Ausentes (fantasma)',
+        default=0,
+        help_text='mapped − with_value: mapeamentos candidatos sem feature/'
+                  'valor no Parquet. Invariante auditável do motor.'
+    )
+    n_readouts_phospho = models.PositiveIntegerField(
+        'Readouts de Fosfo (Regra 1)',
+        default=0,
+        help_text='Nós da Regra 1 que contribuíram (com valor). 0 = caso '
+                  'pareado no proteoma mas não no fosfo → só a Regra 2 pontua.'
+    )
+    n_readouts_tf = models.PositiveIntegerField(
+        'Readouts de TF (Regra 2)',
+        default=0,
+        help_text='TFs com footprint computado (≥ min_regulon_targets alvos '
+                  'com valor). hsa04115 (p53) só tem este termo.'
+    )
+
+    # ─── Proveniência / plugabilidade (D10) ───────────────────────────────────
+    method_version = models.CharField(
+        'Versão do Método',
+        max_length=50,
+        help_text='ex.: fase4-pfs-v1 — PARTE DA NATURAL KEY. Codifica a '
+                  'configuração inteira (seeds, restart, unsigned_weight, B, '
+                  'rng_seed); duas configurações distintas NÃO podem colidir na '
+                  'mesma chave.'
+    )
+    computed_at = models.DateTimeField('Computado em', auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            # Natural key: um escore por (via, amostra tumor, VERSÃO DO MÉTODO)
+            # → COPY ON CONFLICT DO UPDATE (idempotente) e coexistência de
+            # versões de método para benchmark, sem migration futura (D10).
+            # O prefixo da chave já serve (pathway) e (pathway, sample).
+            models.UniqueConstraint(
+                fields=['pathway', 'sample', 'method_version'],
+                name='pathwayactivityscore_natural_key_uniq',
+            ),
+        ]
+        indexes = [
+            # "Todos os escores desta amostra nesta versão" — leitura do
+            # relatório de separação e de qualquer consumidor futuro.
+            models.Index(
+                fields=['sample', 'method_version'],
+                name='pathwayscore_sample_mv_idx',
+            ),
+        ]
+        verbose_name = 'Pathway activity score'
+        verbose_name_plural = 'Pathway activity scores'
+
+    def __str__(self):
+        return (
+            f"{self.pathway_id} · sample {self.sample_id} "
+            f"[{self.method_version}] z={self.z_score:+.3f}"
+        )
+
+
 # =============================================================================
 # SEÇÃO 4: CATEGORIZAÇÃO ÔMICA (Configuração global)
 # =============================================================================
@@ -3420,6 +3641,7 @@ class IngestionJob(models.Model):
         REGULON_LOAD = 'regulon_load', 'Carga de Regulons CollecTRI/OmniPath (OmnisPathway Obj 2)'
         PHOSPHO_MATRIX_LOAD = 'phospho_matrix_load', 'Carga de Matriz de Fosfoproteoma (OmnisPathway Obj 2)'
         READOUT_MAPPING = 'readout_mapping', 'Mapeamento Readout→Feature (OmnisPathway Obj 2)'
+        PATHWAY_SCORE_RUN = 'pathway_score_run', 'Execução do Motor PFS (OmnisPathway Obj 2, Fase 4)'
 
     class JobStatus(models.TextChoices):
         PENDING = 'pending', 'Pendente'
