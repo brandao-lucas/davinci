@@ -611,8 +611,15 @@ pub async fn load_somatic_maf_async(
         .map_err(|e| format!("create_dir_all {:?}: {}", dest_dir, e))?;
 
     // Cliente HTTP com timeout longo (arquivos MAF grandes)
+    //
+    // `redirect::Policy::none()` — hardening A4 (laudo 007): checagem empírica
+    // (download real de um arquivo `access=open` via `api.gdc.cancer.gov/data/`)
+    // confirmou 200 direto, sem 3xx, então proibir redirect não quebra a
+    // ingestão. Isso impede que a allowlist de host (`validate_gdc_url`) seja
+    // contornada por um redirect para host fora da allowlist.
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(1800)) // 30 min
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
              AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",

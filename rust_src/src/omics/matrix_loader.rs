@@ -400,8 +400,15 @@ pub async fn load_cptac_matrix_async(
     validate_linkedomics_url(normal_url)?;
 
     // 2. Cliente HTTP com User-Agent de browser
+    //
+    // `redirect::Policy::none()` — hardening A4 (laudo 007): checagem empírica
+    // confirmou que `linkedomics.org/data_download/...` responde 200 direto
+    // (sem 3xx), então proibir redirect não quebra a ingestão. Isso impede que
+    // a allowlist de host (`validate_linkedomics_url`) seja contornada por um
+    // redirect para host fora da allowlist.
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .build()
         .map_err(|e| format!("Falha ao criar HTTP client: {}", e))?;
@@ -639,8 +646,11 @@ async fn load_cptac_phospho_matrix_async(
     validate_linkedomics_url(tumor_url)?;
     validate_linkedomics_url(normal_url)?;
 
+    // `redirect::Policy::none()` — hardening A4 (laudo 007): ver justificativa
+    // acima em `load_cptac_matrix_async`.
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
              AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",

@@ -2211,9 +2211,19 @@ export interface components {
          *     * `fastq_download` - Download FASTQ
          *     * `sra_resolution` - Resolução GSM→SRR (GEO→SRA)
          *     * `matrix_load` - Carga de Matriz (OmnisPathway Obj 2)
+         *     * `gene_role_load` - Carga de Papéis de Gene (OncoKB, Obj 2)
+         *     * `cnv_matrix_load` - Carga de Matriz CNV (OmnisPathway Obj 2)
+         *     * `cnv_seed_load` - Derivação de Seed CNV (OmnisPathway Obj 2)
+         *     * `variant_effect_raw_load` - Carga de Efeito Cru de Variante (ClinVar/AlphaMissense) (OmnisPathway Obj 2)
+         *     * `somatic_maf_load` - Carga de MAF Somático GDC (OmnisPathway Obj 2)
+         *     * `snv_seed_load` - Derivação de Seed SNV (OmnisPathway Obj 2)
+         *     * `pathway_topology_load` - Carga de Topologia KEGG (OmnisPathway Obj 2)
+         *     * `regulon_load` - Carga de Regulons CollecTRI/OmniPath (OmnisPathway Obj 2)
+         *     * `phospho_matrix_load` - Carga de Matriz de Fosfoproteoma (OmnisPathway Obj 2)
+         *     * `readout_mapping` - Mapeamento Readout→Feature (OmnisPathway Obj 2)
          * @enum {string}
          */
-        JobTypeEnum: "pubmed_search" | "pubmed_fetch" | "geo_search" | "sra_search" | "gwas_search" | "pride_search" | "sample_fetch" | "variant_annotation" | "gene_ner" | "drug_ner" | "context_extraction" | "geo_supplementary_download" | "fastq_download" | "sra_resolution" | "matrix_load";
+        JobTypeEnum: "pubmed_search" | "pubmed_fetch" | "geo_search" | "sra_search" | "gwas_search" | "pride_search" | "sample_fetch" | "variant_annotation" | "gene_ner" | "drug_ner" | "context_extraction" | "geo_supplementary_download" | "fastq_download" | "sra_resolution" | "matrix_load" | "gene_role_load" | "cnv_matrix_load" | "cnv_seed_load" | "variant_effect_raw_load" | "somatic_maf_load" | "snv_seed_load" | "pathway_topology_load" | "regulon_load" | "phospho_matrix_load" | "readout_mapping";
         /**
          * @description Resumo de um vínculo ProjectPaperDataset para exibir no detalhe de um paper.
          *

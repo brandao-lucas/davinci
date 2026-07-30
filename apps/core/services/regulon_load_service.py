@@ -55,8 +55,26 @@ Licença CollecTRI/OmniPath (GPL/acadêmica):
 Sensitive-data-handling:
   - Nenhum token/credencial (OmniPath público sem autenticação no v1).
   - db_url NÃO é necessária para esta pyfunction (sem COPY em PG).
-  - regulon_path gravado em IngestionJob.parameters é caminho LOCAL — não
-    expor ao cliente nem em logs de produção.
+  - regulon_path gravado em IngestionJob.parameters É EXPOSTO ao cliente:
+    `IngestionJobSerializer` (apps/core/serializers/job.py) serializa o campo
+    `parameters` por inteiro, sem allowlist de chaves, e
+    `GET /projects/{project_pk}/jobs/` devolve isso ao dono do projeto.
+    `IngestionJobViewSet.get_queryset()` já filtra por
+    `DaVinciProject(user=request.user)`, então não é vazamento cross-usuário
+    (Regra #3 preservada) — mas o dono do projeto vê o caminho absoluto do
+    arquivo no filesystem do worker (inclui nome de usuário do SO).
+    Consequência prática: NADA sensível (credencial, PII, segredo) pode ir
+    para `parameters` de nenhum IngestionJob — é por isso que `db_url` e
+    `ncbi_api_key`, por exemplo, corretamente nunca são gravados ali. Isso é
+    padrão pré-existente do serializer (afeta todos os job_types, não só
+    REGULON_LOAD); mitigação (allowlist de chaves ou redação de valores que
+    pareçam caminho absoluto) avaliada e NÃO implementada — o frontend lê
+    hoje chaves como `synonyms`/`date_from`/`date_to`/`query` de `parameters`
+    de outros job_types (davinci-frontend/src/lib/utils/descriptor-diff.ts),
+    então qualquer allowlist precisa ser desenhada por job_type para não
+    quebrar consumidores existentes, e a severidade aqui é baixa (mesmo
+    usuário, sem credencial) — não justifica o escopo maior agora. Se
+    decidir revisitar, começar por apps/core/serializers/job.py.
 
 Idempotência:
   Gate verifica REGULON_LOAD ativo (PENDING/RUNNING). O arquivo JSONL é

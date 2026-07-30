@@ -71,8 +71,56 @@ Catálogo global:
   PathwayReadoutFeature e PathwayNode são catálogo global (sem FK de projeto).
   Isolamento futuro na leitura pela Fase 4 via matrix__dataset__in_projects__project.
 
+  Isolamento (Regra #3) e `_resolve_regulon_path` — decisão deliberada:
+  `_resolve_regulon_path` busca o IngestionJob(REGULON_LOAD, COMPLETED) MAIS
+  RECENTE GLOBALMENTE, sem filtrar por `project`, mesmo o modelo IngestionJob
+  tendo FK de projeto obrigatória. Avaliado e decidido MANTER global (não
+  filtrar por projeto), pelos motivos abaixo — não é descuido:
+
+  1. `project` em IngestionJob(REGULON_LOAD) é FK de TRACKING, não de escopo
+     de dado. `load_regulons` (management command) documenta isso
+     explicitamente: "--project ... obrigatório — FK do IngestionJob; NÃO
+     restringe o regulon ao projeto". O dado carregado nunca foi
+     project-scoped por design.
+  2. O conteúdo do JSONL é determinístico a partir de (tf_allowlist, dado
+     público CollecTRI/OmniPath). `tf_allowlist` é derivado exclusivamente do
+     catálogo global `PathwayNode` (RegulonLoadService._derive_tf_allowlist),
+     que também não tem FK de projeto — logo dois projetos que rodem
+     `load_regulons` com os mesmos `pathway_ids` (o caso normal: o command
+     não expõe `--pathway-ids`, sempre usa DEFAULT_PATHWAY_IDS) produzem
+     JSONLs com conteúdo idêntico. Não há dado de usuário, credencial, nem
+     recorte privado de projeto no arquivo — é público e catalogável.
+  3. Consequência: pegar o job mais recente de OUTRO projeto não vaza nada
+     sensível daquele projeto — o arquivo não carrega informação alguma sobre
+     qual projeto o gerou, apenas o grafo KEGG (global) filtrado pelo dado
+     público CollecTRI.
+  4. Robustez (não isolamento): se o job mais recente tiver sido gerado com um
+     `pathway_ids` diferente (custom, via chamada programática do service —
+     não exposto no command), o pior caso é a Regra 2 mapear MENOS do que o
+     possível (TFs fora do tf_allowlist original simplesmente não aparecem no
+     JSONL) — nunca mais nem incorreto, porque `_apply_rule_tf` só materializa
+     entradas cujo `tf_symbol` bate com um `PathwayNode` do conjunto de vias
+     desta execução (`tf_nodes`); qualquer linha do JSONL fora desse conjunto
+     é ignorada. Esse caso já é observável via `n_unmapped_nodes` /
+     `regulon_path_found` no relatório — não é um risco silencioso de
+     integridade, só de cobertura.
+  5. Se no futuro o regulon deixar de ser 100% público (ex.: allowlist
+     derivado de dado privado de projeto), esta decisão deve ser revisitada e
+     o filtro por `project` precisa ser adicionado — o service teria que
+     passar a receber o projeto como o `RegulonLoadService` já faz.
+
 Sensitive-data-handling:
-  Nenhuma credencial. regulon_path é caminho local (nunca exposto ao cliente).
+  Nenhuma credencial. regulon_path (lido aqui via IngestionJob.parameters do
+  job REGULON_LOAD mais recente) É EXPOSTO ao dono do projeto: o campo
+  `parameters` é serializado por inteiro por `IngestionJobSerializer`
+  (apps/core/serializers/job.py, sem allowlist de chaves) e devolvido em
+  `GET /projects/{project_pk}/jobs/` — não é vazamento cross-usuário
+  (`IngestionJobViewSet.get_queryset()` já filtra por request.user, Regra #3
+  preservada), mas o caminho absoluto do worker (com nome de usuário do SO)
+  é visível para o dono do projeto. Ver justificativa completa e decisão de
+  não mitigar agora em regulon_load_service.py (docstring de módulo, seção
+  Sensitive-data-handling) — regra prática: nada sensível vai em
+  `IngestionJob.parameters`.
 """
 
 from __future__ import annotations
@@ -361,6 +409,10 @@ class ReadoutMappingService:
         Busca o IngestionJob mais recente de REGULON_LOAD completado e extrai
         parameters['regulon_path']. Retorna None se não encontrado (Regra 2
         será pulada).
+
+        Busca GLOBAL (sem filtro por `project`) — decisão deliberada, ver
+        "Isolamento (Regra #3) e `_resolve_regulon_path`" na docstring do
+        módulo para a justificativa completa.
 
         O caminho é local do worker — não exposto ao cliente.
         """

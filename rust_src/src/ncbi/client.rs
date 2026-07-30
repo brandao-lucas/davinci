@@ -26,6 +26,16 @@ impl NcbiClient {
         Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(600)) // 10 min for large files
+                // SECURITY (007 N1): `api_key` (user's NCBI credential) is sent in the
+                // query string (see `fetch_with_retry` below). Every URL this client
+                // calls is a hardcoded HTTPS constant (eutils.ncbi.nlm.nih.gov,
+                // ftp.ncbi.nlm.nih.gov, ftp.sra.ebi.ac.uk) — empirically verified
+                // (curl -sI) to never 3xx-redirect. `Policy::none()` removes any
+                // future dependency on that assumption; `.referer(false)` is
+                // defense-in-depth so the key can never leak via `Referer` even if a
+                // redirect were somehow followed elsewhere in the call chain.
+                .redirect(reqwest::redirect::Policy::none())
+                .referer(false)
                 .build()
                 .unwrap(),
             api_key,

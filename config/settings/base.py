@@ -10,7 +10,10 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+import os
 from pathlib import Path
+
+from django.core.exceptions import ImproperlyConfigured
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 # ATENÇÃO: BASE_DIR aponta para config/ (não para a raiz do repo) — é assim
@@ -23,11 +26,27 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # não-redistribuíveis, gitignored). Serviços/commands em apps/ devem usar
 # REPO_ROOT em vez de contar os.path.dirname(__file__) manualmente — contagem
 # de níveis quebra silenciosamente quando o arquivo muda de lugar.
-REPO_ROOT = BASE_DIR.parent
-assert (REPO_ROOT / 'manage.py').is_file(), (
-    f'REPO_ROOT ({REPO_ROOT}) não aponta para a raiz do repositório '
-    '(manage.py não encontrado) — revise BASE_DIR em config/settings/base.py'
-)
+#
+# DAVINCI_REPO_ROOT (opcional): override explícito para cenários de
+# empacotamento onde manage.py não acompanha config/ e apps/ no mesmo layout
+# (ex.: imagem slim, wheel instalado, layout src/). Sem a env var, o padrão
+# de dev/monorepo (BASE_DIR.parent) é usado.
+_repo_root_override = os.environ.get('DAVINCI_REPO_ROOT')
+REPO_ROOT = Path(_repo_root_override).resolve() if _repo_root_override else BASE_DIR.parent
+
+# A checagem abaixo é feita com `if` + raise (não `assert`) deliberadamente:
+# `assert` é removido pelo interpretador sob `python -O` / PYTHONOPTIMIZE=1,
+# o que faria a verificação desaparecer silenciosamente em produção — exatamente
+# o modo de falha que ela existe para prevenir (deploy sem manage.py ao lado de
+# config/apps/ derrubaria web, worker e todo `manage.py` sem esse aviso).
+if not (REPO_ROOT / 'manage.py').is_file():
+    raise ImproperlyConfigured(
+        f'REPO_ROOT ({REPO_ROOT}) não aponta para a raiz do repositório '
+        '(manage.py não encontrado). Revise BASE_DIR em config/settings/base.py, '
+        'ou, se este é um layout de empacotamento onde manage.py não acompanha '
+        'config/ e apps/ (imagem slim, wheel, layout src/), defina a env var '
+        'DAVINCI_REPO_ROOT apontando para a raiz correta.'
+    )
 
 
 # Quick-start development settings - unsuitable for production

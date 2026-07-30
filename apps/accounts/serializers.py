@@ -32,6 +32,9 @@ class UserProfileUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = UserProfile
         fields = ['orcid_id', 'institution', 'research_area', 'first_name', 'last_name', 'ncbi_api_key']
+        extra_kwargs = {
+            'ncbi_api_key': {'write_only': True},
+        }
 
     def update(self, instance, validated_data):
         first_name = validated_data.pop('first_name', None)

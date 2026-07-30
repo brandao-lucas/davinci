@@ -30,10 +30,17 @@
 /// # Segurança (M2/M3)
 ///
 /// - `validate_kegg_url`: prefixo `https://rest.kegg.jp/`, rejeita `..`.
+/// - `validate_kegg_id`: `kegg_id` deve casar `^[a-z]{3,4}\d{5}$` — aplicado
+///   antes de montar a URL e antes de montar o path de cache, impedindo que
+///   `kegg_id` vire componente de path (`Path::join` com absoluto descarta a
+///   base) ou injete segmentos na URL (hardening A3, laudo 007).
 /// - Teto de bytes: 50 MB por KGML (arquivos KEGG são pequenos; cap generoso).
 /// - Rate limit: ≤ 3 req/s (3 vias = 3 chamadas; sem sleep necessário, mas documentado).
 /// - Cache local em `dest_dir/kegg/` (gitignored).
 /// - Fixtures de teste **SINTÉTICAS** — não commitar KGML bruto KEGG.
+/// - `redirect::Policy::none()` no client HTTP (hardening A4, laudo 007):
+///   `rest.kegg.jp` não depende de redirect (checado empiricamente); proibir
+///   evita que a allowlist de host seja contornada por um 3xx para host externo.
 ///
 /// # Manifesto retornado
 ///
@@ -99,6 +106,28 @@ pub fn validate_kegg_url(url: &str) -> Result<(), String> {
         return Err(format!(
             "URL rejeitada: contém path traversal '..' em '{}'",
             url
+        ));
+    }
+    Ok(())
+}
+
+/// Valida que `kegg_id` é um identificador de via KEGG bem formado.
+///
+/// Formato esperado: prefixo de organismo com 3–4 letras minúsculas seguido de
+/// 5 dígitos (ex.: `hsa04151`, `mmu04010`). Rejeita qualquer coisa fora desse
+/// formato — em particular `/`, `..`, string vazia e sufixos/prefixos extras —
+/// para impedir que `kegg_id` seja usado como componente de path (`Path::join`
+/// com caminho absoluto descarta a base) ou injete segmentos na URL.
+///
+/// Aplicado **antes** de montar a URL (`kgml_url`) e **antes** de montar o
+/// path de cache (`cache_path`) — hardening A3 (laudo 007).
+fn validate_kegg_id(kegg_id: &str) -> Result<(), String> {
+    let re = regex::Regex::new(r"^[a-z]{3,4}\d{5}$")
+        .expect("validate_kegg_id: regex inválida");
+    if !re.is_match(kegg_id) {
+        return Err(format!(
+            "kegg_id inválido: '{}'. Esperado formato <org><5 dígitos> (ex.: hsa04151).",
+            kegg_id
         ));
     }
     Ok(())
@@ -417,6 +446,7 @@ pub fn parse_kgml(xml: &[u8]) -> Result<ParsedKgml, String> {
 
 /// Constrói a URL KGML para um ID de via e valida.
 fn kgml_url(kegg_id: &str) -> Result<String, String> {
+    validate_kegg_id(kegg_id)?;
     let url = format!("https://rest.kegg.jp/get/{}/kgml", kegg_id);
     validate_kegg_url(&url)?;
     Ok(url)
@@ -824,8 +854,15 @@ pub async fn load_kegg_topology_async(
     let source_version = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
     // HTTP client com UA de browser (KEGG REST é público mas pode rejeitar UA não-browser)
+    //
+    // `redirect::Policy::none()` — hardening A4 (laudo 007): checagem empírica
+    // confirmou que `rest.kegg.jp/get/<id>/kgml` responde 200 direto (sem
+    // 3xx), então proibir redirect não quebra a ingestão. Isso impede que a
+    // allowlist de host (`validate_kegg_url`) seja contornada por um redirect
+    // para host fora da allowlist.
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
              AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -858,6 +895,7 @@ pub async fn load_kegg_topology_async(
         eprintln!("[kegg_topology_loader] processando via: {}", kegg_id);
 
         let url = kgml_url(kegg_id)?;
+        validate_kegg_id(kegg_id)?;
         let cache_path = kegg_cache_dir.join(format!("{}.kgml", kegg_id));
 
         // Download (ou usar cache local se existir)
@@ -1564,5 +1602,40 @@ mod tests {
     fn test_validate_kegg_url_reject_omnipathdb() {
         // host diferente não deve ser aceito
         assert!(validate_kegg_url("https://omnipathdb.org/interactions").is_err());
+    }
+
+    // ─── Testes de validação de kegg_id (hardening A3) ───────────────────────
+
+    #[test]
+    fn test_validate_kegg_id_accept() {
+        assert!(validate_kegg_id("hsa04151").is_ok());
+        assert!(validate_kegg_id("hsa04010").is_ok());
+        assert!(validate_kegg_id("hsa04115").is_ok());
+        assert!(validate_kegg_id("mmu04010").is_ok());
+    }
+
+    #[test]
+    fn test_validate_kegg_id_reject_path_traversal_and_slash() {
+        assert!(validate_kegg_id("/etc/passwd").is_err());
+        assert!(validate_kegg_id("../foo").is_err());
+        assert!(validate_kegg_id("hsa04151/../x").is_err());
+        assert!(validate_kegg_id("hsa04151/x").is_err());
+        assert!(validate_kegg_id("hsa/04151").is_err());
+    }
+
+    #[test]
+    fn test_validate_kegg_id_reject_empty_and_malformed() {
+        assert!(validate_kegg_id("").is_err());
+        assert!(validate_kegg_id("hsa041511").is_err());
+        assert!(validate_kegg_id("hsa0415").is_err());
+        assert!(validate_kegg_id("HSA04151").is_err());
+        assert!(validate_kegg_id("hsaabcde").is_err());
+    }
+
+    #[test]
+    fn test_kgml_url_rejects_malicious_kegg_id() {
+        assert!(kgml_url("/etc/passwd").is_err());
+        assert!(kgml_url("../../etc/passwd").is_err());
+        assert!(kgml_url("hsa04151/../x").is_err());
     }
 }

@@ -37,6 +37,9 @@
 /// - `tf_allowlist`: só TFs das 3 vias — filtra na origem para não puxar reguloma inteiro.
 /// - Sem token/credencial (OmniPath é público).
 /// - Fixtures de teste **SINTÉTICAS** — não commitar CollecTRI bruto.
+/// - `redirect::Policy::none()` no client HTTP (hardening A4, laudo 007):
+///   `omnipathdb.org` não depende de redirect (checado empiricamente); proibir
+///   evita que a allowlist de host seja contornada por um 3xx para host externo.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
@@ -377,8 +380,15 @@ pub async fn load_collectri_regulons_async(
     validate_omnipath_url(url)?;
 
     // HTTP client
+    //
+    // `redirect::Policy::none()` — hardening A4 (laudo 007): checagem empírica
+    // confirmou que `omnipathdb.org/interactions` responde 200 direto (sem
+    // 3xx), então proibir redirect não quebra a ingestão. Isso impede que a
+    // allowlist de host (`validate_omnipath_url`) seja contornada por um
+    // redirect para host fora da allowlist.
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
              AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",

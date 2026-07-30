@@ -51,6 +51,12 @@
 ///   `storage.googleapis.com` / `zenodo.org` (AlphaMissense).
 /// - Todos os valores de string passam por `escape_csv_field` antes do COPY.
 /// - Sem SQL cru com interpolação de strings.
+/// - `redirect::Policy::none()` no client HTTP (hardening A4, laudo 007):
+///   checagem empírica confirmou 200 direto para `ftp.ncbi.nlm.nih.gov`,
+///   `storage.googleapis.com` e a URL **canônica** do mirror Zenodo
+///   (`zenodo.org/records/<id>/…`, plural). A forma legada `zenodo.org/record/<id>/…`
+///   (singular) faz 301 para a forma canônica — **callers devem usar a forma
+///   plural** para evitar quebra. Ver `build_http_client`.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
@@ -708,9 +714,25 @@ async fn download_gzip_file(
 }
 
 /// Cria cliente HTTP com User-Agent de browser e timeout longo (arquivos grandes).
+///
+/// # Hardening A4 (laudo 007) — redirect proibido, fonte legada corrigida
+///
+/// Checagem empírica (`curl -IL`) mostrou que a URL legada do mirror Zenodo
+/// para AlphaMissense (`https://zenodo.org/record/<id>/files/...`, singular)
+/// responde **301** para a forma canônica `https://zenodo.org/records/<id>/files/...`
+/// (plural, mesmo host) — resquício de uma migração de path do Zenodo, não CDN
+/// nem balanceamento. A forma canônica responde **200 direto**, assim como
+/// `ftp.ncbi.nlm.nih.gov` e `storage.googleapis.com`. Logo, nenhuma das três
+/// fontes desta allowlist depende de redirect — `Policy::none()` fecha o A4
+/// por completo, sem política customizada de revalidação por salto.
+///
+/// **Callers devem usar a forma plural** (`zenodo.org/records/...`) para o
+/// mirror Zenodo; a forma singular passa em `validate_variant_effect_url`
+/// (que só checa host) mas falha no client (redirect proibido).
 fn build_http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(1800)) // 30 min — ClinVar ~192MB, AM ~643MB
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
              AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -1518,6 +1540,17 @@ mod tests {
 
     #[test]
     fn test_validate_url_zenodo_aceito() {
+        // Forma canônica (plural) — a que deve ser usada pelo caller (hardening A4).
+        assert!(validate_variant_effect_url(
+            "https://zenodo.org/records/8208688/files/AlphaMissense_hg38.tsv.gz"
+        ).is_ok());
+    }
+
+    #[test]
+    fn test_validate_url_zenodo_forma_legada_ainda_passa_no_validator() {
+        // `validate_variant_effect_url` só checa host — não distingue singular/plural.
+        // A forma legada (singular) responde 301 no Zenodo real e é rejeitada pelo
+        // client HTTP (redirect proibido, hardening A4), não pelo validator.
         assert!(validate_variant_effect_url(
             "https://zenodo.org/record/8208688/files/AlphaMissense_hg38.tsv.gz"
         ).is_ok());

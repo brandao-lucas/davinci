@@ -380,8 +380,15 @@ pub async fn load_oncokb_gene_roles_async(
     let source_version = Utc::now().format("%Y-%m-%d").to_string();
 
     // 3. Cliente HTTP com User-Agent de browser (precaução — OncoKB pode verificar)
+    //
+    // `redirect::Policy::none()` — hardening A4 (laudo 007): checagem empírica
+    // confirmou que `www.oncokb.org/api/v1/utils/cancerGeneList.txt` responde
+    // 200 direto (sem 3xx), então proibir redirect não quebra a ingestão.
+    // Isso impede que a allowlist de host (`validate_oncokb_url`) seja
+    // contornada por um redirect para host fora da allowlist.
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
              AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",

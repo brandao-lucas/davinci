@@ -2097,7 +2097,8 @@ fn load_clinvar_effects(
 /// # Fonte
 ///
 /// `https://storage.googleapis.com/dm_alphamissense/AlphaMissense_hg38.tsv.gz`
-/// (CC BY-NC-SA 4.0, Google DeepMind). Mirror Zenodo: `https://zenodo.org/record/8208688/…`.
+/// (CC BY-NC-SA 4.0, Google DeepMind). Mirror Zenodo (forma canônica, plural —
+/// hardening A4/laudo 007, client rejeita redirect): `https://zenodo.org/records/8208688/…`.
 ///
 /// # Normalização de variant_key (Decisão F)
 ///

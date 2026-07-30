@@ -78,6 +78,11 @@ pub async fn fetch_gwas_datasets(
     let client = Client::builder()
         .timeout(Duration::from_secs(60))
         .user_agent("DaVinci/1.0 (biohub.solutions; bioinformatics)")
+        // SECURITY (007 N1 hardening): www.ebi.ac.uk/gwas endpoints were
+        // empirically verified (curl -sI) to never 3xx-redirect for the paths
+        // this client calls; no credential travels in this client's query
+        // string either way, but redirects are disabled defensively.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("Failed to build GWAS HTTP client: {e}"))?;
 
