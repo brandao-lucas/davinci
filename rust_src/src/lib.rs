@@ -2387,6 +2387,328 @@ fn load_somatic_maf(
     }
 }
 
+// ─── Fosfoproteoma loader (Obj 2 — Fase 3, passo 3.1) ───────────────────────
+
+/// Manifesto retornado por `load_cptac_phospho_matrix`.
+///
+/// Mesmo contrato que `CptacMatrixManifest` (proteoma, Fase 0) — o vitruvio
+/// usa os mesmos campos para criar `OmicMatrix(omics_layer='proteomic',
+/// feature_axis='phospho_site', data_format_level='intensities')`.
+///
+/// | Campo | Tipo | Descrição |
+/// |---|---|---|
+/// | `parquet_path` | `str` | Caminho absoluto do Parquet gravado em `dest_dir`. |
+/// | `checksum_md5` | `str` | MD5 lowercase-hex do Parquet. |
+/// | `n_features` | `int` | Número de features (genes na interseção tumor ∩ normal). |
+/// | `n_samples` | `int` | Total de amostras (tumor + normal). |
+/// | `sample_columns` | `list[CptacSampleColumn]` | Colunas de amostra (tumor primeiro). |
+/// | `genes_discarded` | `int` | Genes descartados fora da interseção. |
+#[pyclass]
+pub struct PhosphoMatrixManifest {
+    #[pyo3(get)]
+    pub parquet_path: String,
+    #[pyo3(get)]
+    pub checksum_md5: String,
+    #[pyo3(get)]
+    pub n_features: usize,
+    #[pyo3(get)]
+    pub n_samples: usize,
+    #[pyo3(get)]
+    pub sample_columns: Vec<CptacSampleColumn>,
+    #[pyo3(get)]
+    pub genes_discarded: usize,
+}
+
+#[pymethods]
+impl PhosphoMatrixManifest {
+    fn __repr__(&self) -> String {
+        format!(
+            "PhosphoMatrixManifest(n_features={}, n_samples={}, genes_discarded={}, checksum_md5={:?})",
+            self.n_features, self.n_samples, self.genes_discarded, self.checksum_md5
+        )
+    }
+}
+
+/// Baixa o fosfoproteoma CPTAC CCRCC (gene-level, Tumor + Normal) do LinkedOmics,
+/// parseia e grava Parquet. Reusa `matrix_loader` sem nova allowlist de host.
+///
+/// # Discovery (2026-07-16)
+///
+/// Arquivos: `HS_CPTAC_CCRCC_phosphoproteome_gene_Tumor.cct` /
+/// `HS_CPTAC_CCRCC_phosphoproteome_gene_Normal.cct` (gene-level, não site-level).
+/// Feature = símbolo de gene UPPERCASE (mesmo formato do proteoma).
+/// `feature_axis = 'phospho_site'` é o vocabulário do `OmicMatrix` (já existe desde a Fase 0);
+/// host `www.linkedomics.org` já validado por `validate_linkedomics_url`.
+///
+/// # Argumentos
+///
+/// | Parâmetro | Tipo | Descrição |
+/// |---|---|---|
+/// | `tumor_url` | `str` | URL do `.cct` tumor (deve ser `https://www.linkedomics.org/…`). |
+/// | `normal_url` | `str` | URL do `.cct` normal (deve ser `https://www.linkedomics.org/…`). |
+/// | `dest_dir` | `str` | Diretório onde Parquet e cache `.cct` são gravados. |
+/// | `parquet_name` | `str` | Nome do arquivo Parquet (default: `"cptac_ccrcc_phospho.parquet"`). |
+///
+/// # Retorno
+///
+/// `PhosphoMatrixManifest` — mesmo contrato do proteoma.
+/// O vitruvio cria `OmicMatrix(omics_layer='proteomic', feature_axis='phospho_site',
+/// data_format_level='intensities')` + `OmicMatrixSample` com base no manifesto.
+#[pyfunction]
+#[pyo3(signature = (tumor_url, normal_url, dest_dir, parquet_name = "cptac_ccrcc_phospho.parquet"))]
+fn load_cptac_phospho_matrix(
+    tumor_url: String,
+    normal_url: String,
+    dest_dir: String,
+    parquet_name: &str,
+) -> PyResult<PhosphoMatrixManifest> {
+    match crate::omics::matrix_loader::load_cptac_phospho_matrix(
+        &tumor_url,
+        &normal_url,
+        &dest_dir,
+        parquet_name,
+    ) {
+        Ok(manifest) => {
+            let sample_columns: Vec<CptacSampleColumn> = manifest
+                .sample_columns
+                .into_iter()
+                .map(|sc| CptacSampleColumn {
+                    case_id: sc.case_id,
+                    sample_role: sc.sample_role,
+                    column_index: sc.column_index,
+                })
+                .collect();
+
+            Ok(PhosphoMatrixManifest {
+                parquet_path: manifest.parquet_path,
+                checksum_md5: manifest.checksum_md5,
+                n_features: manifest.n_features,
+                n_samples: manifest.n_samples,
+                sample_columns,
+                genes_discarded: manifest.genes_discarded,
+            })
+        }
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
+// ─── KEGG topology loader (Obj 2 — Fase 3, passo 3.2) ───────────────────────
+
+/// Manifesto retornado por `load_kegg_topology`.
+///
+/// | Campo | Tipo | Descrição |
+/// |---|---|---|
+/// | `n_pathways` | `int` | Vias inseridas/atualizadas em `core_pathway`. |
+/// | `n_nodes` | `int` | Total de nós inseridos (todos os pathways). |
+/// | `n_edges` | `int` | Total de arestas inseridas. |
+/// | `n_signed` | `int` | Arestas com sign ≠ 0 (+1 ou -1). |
+/// | `n_unsigned` | `int` | Arestas com sign = 0 (associação/desconhecido). |
+/// | `n_orphan_symbols` | `int` | Nós `gene`/`ortholog` sem `gene_symbol` derivável. |
+/// | `source_version` | `str` | Data do download (ex.: "2026-07-16"). |
+#[pyclass]
+pub struct KeggTopologyManifest {
+    #[pyo3(get)]
+    pub n_pathways: usize,
+    #[pyo3(get)]
+    pub n_nodes: usize,
+    #[pyo3(get)]
+    pub n_edges: usize,
+    #[pyo3(get)]
+    pub n_signed: usize,
+    #[pyo3(get)]
+    pub n_unsigned: usize,
+    #[pyo3(get)]
+    pub n_orphan_symbols: usize,
+    #[pyo3(get)]
+    pub source_version: String,
+}
+
+#[pymethods]
+impl KeggTopologyManifest {
+    fn __repr__(&self) -> String {
+        format!(
+            "KeggTopologyManifest(n_pathways={}, n_nodes={}, n_edges={}, \
+             n_signed={}, n_unsigned={}, n_orphan_symbols={}, source_version={:?})",
+            self.n_pathways,
+            self.n_nodes,
+            self.n_edges,
+            self.n_signed,
+            self.n_unsigned,
+            self.n_orphan_symbols,
+            self.source_version,
+        )
+    }
+}
+
+/// Baixa as topologias KGML das vias KEGG listadas, parseia XML em uma passada,
+/// aplica §Sinal (subtype.name → sign ±1/0) e faz COPY UPSERT em
+/// `core_pathway` / `core_pathwaynode` / `core_pathwayedge`.
+///
+/// # Fonte (travada)
+///
+/// `https://rest.kegg.jp/get/<kegg_id>/kgml` para cada via.
+/// Host allowlist: apenas `rest.kegg.jp`. Rate limit: ≤ 3 req/s (3 vias = 3 chamadas).
+/// Cache local em `<dest_dir>/kegg/<kegg_id>.kgml`.
+///
+/// # §Sinal
+///
+/// | subtype.name | sign | interaction |
+/// |---|---|---|
+/// | activation, phosphorylation | +1 | activation |
+/// | expression | +1 | expression |
+/// | inhibition, dephosphorylation | -1 | inhibition |
+/// | repression | -1 | repression |
+/// | binding/association, state change | 0 | binding |
+/// | indirect effect | 0 | indirect |
+/// | (sem subtype) | 0 | unknown |
+/// | conflito (activation+inhibition) | 0 | unknown |
+///
+/// # Argumentos
+///
+/// | Parâmetro | Tipo | Descrição |
+/// |---|---|---|
+/// | `pathway_kegg_ids` | `list[str]` | IDs KEGG das vias (ex.: `["hsa04151","hsa04010","hsa04115"]`). |
+/// | `dest_dir` | `str` | Diretório de cache local (KGML raw, gitignored). |
+/// | `db_url` | `str` | PostgreSQL connection string. |
+///
+/// # Retorno
+///
+/// `KeggTopologyManifest` — ver campos acima. `readout_role` fica `none` em todos os
+/// nós (marcado pelo vitruvio no passo 3.4).
+#[pyfunction]
+#[pyo3(signature = (pathway_kegg_ids, dest_dir, db_url))]
+fn load_kegg_topology(
+    pathway_kegg_ids: Vec<String>,
+    dest_dir: String,
+    db_url: String,
+) -> PyResult<KeggTopologyManifest> {
+    match crate::omics::kegg_topology_loader::load_kegg_topology(
+        &pathway_kegg_ids,
+        &dest_dir,
+        &db_url,
+    ) {
+        Ok(m) => Ok(KeggTopologyManifest {
+            n_pathways: m.n_pathways,
+            n_nodes: m.n_nodes,
+            n_edges: m.n_edges,
+            n_signed: m.n_signed,
+            n_unsigned: m.n_unsigned,
+            n_orphan_symbols: m.n_orphan_symbols,
+            source_version: m.source_version,
+        }),
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
+// ─── CollecTRI regulon loader (Obj 2 — Fase 3, passo 3.3) ───────────────────
+
+/// Manifesto retornado por `load_collectri_regulons`.
+///
+/// | Campo | Tipo | Descrição |
+/// |---|---|---|
+/// | `n_tfs` | `int` | TFs únicos no arquivo de saída. |
+/// | `n_targets` | `int` | Alvos únicos. |
+/// | `n_edges` | `int` | Total de pares TF→alvo gravados no JSONL. |
+/// | `n_positive` | `int` | Pares com mode=+1 (estimulação). |
+/// | `n_negative` | `int` | Pares com mode=-1 (inibição). |
+/// | `n_neutral` | `int` | Pares com mode=0 (conflito ou neutro). |
+/// | `source_version` | `str` | Data do download. |
+/// | `regulon_path` | `str` | Caminho absoluto do arquivo JSONL de regulons. |
+#[pyclass]
+pub struct RegulonLoadManifest {
+    #[pyo3(get)]
+    pub n_tfs: usize,
+    #[pyo3(get)]
+    pub n_targets: usize,
+    #[pyo3(get)]
+    pub n_edges: usize,
+    #[pyo3(get)]
+    pub n_positive: usize,
+    #[pyo3(get)]
+    pub n_negative: usize,
+    #[pyo3(get)]
+    pub n_neutral: usize,
+    #[pyo3(get)]
+    pub source_version: String,
+    /// Caminho absoluto do JSONL de regulons (input do passo 3.4 do vitruvio).
+    #[pyo3(get)]
+    pub regulon_path: String,
+}
+
+#[pymethods]
+impl RegulonLoadManifest {
+    fn __repr__(&self) -> String {
+        format!(
+            "RegulonLoadManifest(n_tfs={}, n_targets={}, n_edges={}, \
+             n_positive={}, n_negative={}, n_neutral={}, \
+             source_version={:?}, regulon_path={:?})",
+            self.n_tfs,
+            self.n_targets,
+            self.n_edges,
+            self.n_positive,
+            self.n_negative,
+            self.n_neutral,
+            self.source_version,
+            self.regulon_path,
+        )
+    }
+}
+
+/// Baixa os regulons CollecTRI via OmniPath, filtra pelos TFs das 3 vias
+/// e grava arquivo JSONL intermediário (consumido pelo vitruvio no passo 3.4).
+///
+/// **NÃO** insere em tabela PG (Decisão 3.3: arquivo intermediário local —
+/// sem consumidor além do mapeamento 3.4).
+///
+/// # Fonte
+///
+/// `https://omnipathdb.org/interactions?datasets=collectri&genesymbols=1&fields=sources,references`
+/// TSV público (GPL/acadêmico). Host allowlist: apenas `omnipathdb.org`.
+/// Teto: 200 MB.
+///
+/// # Filtro
+///
+/// Apenas linhas onde `source_genesymbol` ∈ `tf_allowlist`. O vitruvio
+/// deriva a allowlist dos `gene_symbol` dos nós das 3 vias após 3.2.
+///
+/// # Formato JSONL de saída
+///
+/// `{"tf":"TP53","target":"MDM2","mode":1,"sources":"CollecTRI","n_references":3}`
+///
+/// # Argumentos
+///
+/// | Parâmetro | Tipo | Descrição |
+/// |---|---|---|
+/// | `tf_allowlist` | `list[str]` | Símbolos UPPERCASE dos TFs das 3 vias (derivado pelo vitruvio). |
+/// | `dest_dir` | `str` | Diretório onde o JSONL é gravado. |
+///
+/// # Retorno
+///
+/// `RegulonLoadManifest` com contagens e `regulon_path` (caminho do JSONL).
+#[pyfunction]
+#[pyo3(signature = (tf_allowlist, dest_dir))]
+fn load_collectri_regulons(
+    tf_allowlist: Vec<String>,
+    dest_dir: String,
+) -> PyResult<RegulonLoadManifest> {
+    match crate::omics::regulon_loader::load_collectri_regulons(
+        tf_allowlist,
+        &dest_dir,
+    ) {
+        Ok(m) => Ok(RegulonLoadManifest {
+            n_tfs: m.n_tfs,
+            n_targets: m.n_targets,
+            n_edges: m.n_edges,
+            n_positive: m.n_positive,
+            n_negative: m.n_negative,
+            n_neutral: m.n_neutral,
+            source_version: m.source_version,
+            regulon_path: m.regulon_path,
+        }),
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
 // ─── NER bindings ─────────────────────────────────────────────────────────────
 
 /// Extrai genes mencionados em `text` usando o dicionário HGNC canônico.
@@ -2447,5 +2769,14 @@ fn rust_engine(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SomaticMafSampleColumn>()?;
     m.add_class::<SomaticMafManifest>()?;
     m.add_function(wrap_pyfunction!(load_somatic_maf, m)?)?;
+    // Fosfoproteoma loader (Obj 2 — Fase 3, passo 3.1)
+    m.add_class::<PhosphoMatrixManifest>()?;
+    m.add_function(wrap_pyfunction!(load_cptac_phospho_matrix, m)?)?;
+    // KEGG topology loader (Obj 2 — Fase 3, passo 3.2)
+    m.add_class::<KeggTopologyManifest>()?;
+    m.add_function(wrap_pyfunction!(load_kegg_topology, m)?)?;
+    // CollecTRI regulon loader (Obj 2 — Fase 3, passo 3.3)
+    m.add_class::<RegulonLoadManifest>()?;
+    m.add_function(wrap_pyfunction!(load_collectri_regulons, m)?)?;
     Ok(())
 }

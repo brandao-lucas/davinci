@@ -2091,6 +2091,453 @@ class VariantEffectSeed(models.Model):
 
 
 # =============================================================================
+# SEÇÃO 3B: GRAFO DE VIA ASSINADO (OmnisPathway Obj 2, Fase 3)
+# =============================================================================
+# Backbone de via: topologia KEGG DIRECIONADA + ASSINADA (Pathway/PathwayNode/
+# PathwayEdge) e o mapeamento readout→feature (PathwayReadoutFeature) que a
+# Fase 4 (RWR assinado) consome. CATÁLOGO GLOBAL — sem FK de projeto (como
+# GeneRole/VariantEffectRaw). Isolamento por usuário vive na leitura futura via
+# a matriz (matrix__dataset__in_projects__project), como as seeds.
+# Gravação do grafo é do ferris/Rust (COPY/UPSERT nas natural keys); o
+# mapeamento readout é do vitruvio (set-based em PG) — NÃO destes models.
+
+
+class Pathway(models.Model):
+    """
+    Uma VIA de sinalização — CATÁLOGO GLOBAL (OmnisPathway Obj 2, Fase 3).
+
+    v1 = 3 vias KEGG (hsa04151 PI3K-Akt, hsa04010 MAPK, hsa04115 p53). A
+    natural key é o `kegg_id`; `source`/`source_version` guardam proveniência
+    (release KEGG) para reprodutibilidade. `n_nodes`/`n_edges` são preenchidos
+    ao concluir a carga do grafo (loader Rust).
+
+    Carga (responsabilidade do ferris/Rust): COPY/UPSERT ON CONFLICT (kegg_id)
+    DO UPDATE durante o load da topologia KGML — NÃO deste model.
+    """
+
+    class Source(models.TextChoices):
+        KEGG = 'kegg', 'KEGG'
+
+    kegg_id = models.CharField(
+        'ID KEGG da Via',
+        max_length=20,
+        help_text='ex.: hsa04151/hsa04010/hsa04115 — NATURAL KEY.'
+    )
+    name = models.CharField(
+        'Nome da Via',
+        max_length=255,
+        blank=True,
+        default='',
+        help_text='Nome KEGG (ex.: "PI3K-Akt signaling pathway").'
+    )
+    source = models.CharField(
+        'Fonte',
+        max_length=20,
+        choices=Source.choices,
+        default=Source.KEGG,
+        help_text='kegg (v1) — reservado p/ Reactome/WikiPathways futuros.'
+    )
+    source_version = models.CharField(
+        'Versão/Release da Fonte',
+        max_length=100,
+        blank=True,
+        default='',
+        help_text='Release KEGG (data do download) — proveniência/'
+                  'reprodutibilidade.'
+    )
+    n_nodes = models.PositiveIntegerField(
+        'Nº de Nós',
+        blank=True,
+        null=True,
+        help_text='Preenchido ao concluir a carga do grafo.'
+    )
+    n_edges = models.PositiveIntegerField(
+        'Nº de Arestas',
+        blank=True,
+        null=True,
+        help_text='Preenchido ao concluir a carga do grafo.'
+    )
+    loaded_at = models.DateTimeField('Carregado em', auto_now=True)
+
+    class Meta:
+        constraints = [
+            # Natural key: uma via por kegg_id → ON CONFLICT DO UPDATE do COPY
+            # do Rust e idempotência da carga.
+            models.UniqueConstraint(
+                fields=['kegg_id'],
+                name='pathway_kegg_id_uniq',
+            ),
+            models.CheckConstraint(
+                name='pathway_source_valid',
+                condition=models.Q(source__in=['kegg']),
+            ),
+        ]
+        verbose_name = 'Pathway'
+        verbose_name_plural = 'Pathways'
+
+    def __str__(self):
+        return f"{self.kegg_id} · {self.name}"
+
+
+class PathwayNode(models.Model):
+    """
+    Um NÓ da via (entry do KGML) — OmnisPathway Obj 2, Fase 3.
+
+    Mapeia um `<entry>` do KGML. `kegg_ids` guarda os IDs KEGG crus do entry
+    (`hsa:5290` etc. — um entry pode agrupar vários genes); `gene_symbol` é o
+    símbolo UPPERCASE extraído do `graphics name` (Decisão 6), com
+    `graphics_name` cru preservado para auditoria/fallback. `readout_role`
+    marca (na Fase 3, passo de mapeamento) se o nó é readout de fosforilação/
+    alvo de TF/metabólito; `is_seed_target` é reservado p/ a Fase 4 (nó que
+    recebe semente genômica).
+
+    Carga (responsabilidade do ferris/Rust): COPY/UPSERT ON CONFLICT
+    (pathway, kegg_entry_id) DO UPDATE — NÃO deste model.
+    """
+
+    class NodeType(models.TextChoices):
+        GENE = 'gene', 'Gene'
+        COMPOUND = 'compound', 'Composto'
+        GROUP = 'group', 'Grupo (complexo)'
+        MAP = 'map', 'Mapa (via ligada)'
+        ORTHOLOG = 'ortholog', 'Ortólogo'
+
+    class ReadoutRole(models.TextChoices):
+        NONE = 'none', 'Nenhum'
+        PHOSPHO = 'phospho', 'Fosforilação (Regra 1)'
+        TF_TARGET = 'tf_target', 'Alvo de TF (Regra 2)'
+        METABOLITE = 'metabolite', 'Metabólito (Regra 3, reservado)'
+
+    pathway = models.ForeignKey(
+        Pathway,
+        on_delete=models.CASCADE,
+        related_name='nodes',
+        help_text='Via a que este nó pertence.'
+    )
+    kegg_entry_id = models.CharField(
+        'ID do Entry KGML',
+        max_length=32,
+        help_text='ID do <entry id="…"> no KGML (único no escopo da via).'
+    )
+    node_type = models.CharField(
+        'Tipo do Nó',
+        max_length=20,
+        choices=NodeType.choices,
+        help_text='Do atributo <entry type> (gene/compound/group/map/ortholog).'
+    )
+    kegg_ids = ArrayField(
+        models.CharField(max_length=32),
+        default=list,
+        blank=True,
+        help_text='IDs KEGG crus do entry (hsa:5290 etc.; pode agrupar genes).'
+    )
+    gene_symbol = models.CharField(
+        'Símbolo do Gene',
+        max_length=50,
+        blank=True,
+        default='',
+        help_text='Símbolo UPPERCASE do graphics name (Decisão 6). Vazio p/ '
+                  'compound/map. Chave de junção com features da matriz.'
+    )
+    graphics_name = models.CharField(
+        'Graphics Name (cru)',
+        max_length=255,
+        blank=True,
+        default='',
+        help_text='graphics name cru do KGML — proveniência do símbolo.'
+    )
+    readout_role = models.CharField(
+        'Papel de Readout',
+        max_length=20,
+        choices=ReadoutRole.choices,
+        default=ReadoutRole.NONE,
+        help_text='none/phospho/tf_target/metabolite — marcado no mapeamento '
+                  'readout (Regra 1/2/3).'
+    )
+    is_seed_target = models.BooleanField(
+        'É Alvo de Semente',
+        default=False,
+        help_text='Reservado p/ Fase 4 (nó que recebe semente genômica).'
+    )
+
+    class Meta:
+        constraints = [
+            # Natural key: um nó por (via, entry KGML) → ON CONFLICT DO UPDATE
+            # do COPY do Rust e idempotência. Cobre a query "nós desta via"
+            # (prefixo pathway).
+            models.UniqueConstraint(
+                fields=['pathway', 'kegg_entry_id'],
+                name='pathwaynode_pathway_entry_uniq',
+            ),
+            models.CheckConstraint(
+                name='pathwaynode_node_type_valid',
+                condition=models.Q(node_type__in=[
+                    'gene', 'compound', 'group', 'map', 'ortholog',
+                ]),
+            ),
+            models.CheckConstraint(
+                name='pathwaynode_readout_role_valid',
+                condition=models.Q(readout_role__in=[
+                    'none', 'phospho', 'tf_target', 'metabolite',
+                ]),
+            ),
+        ]
+        indexes = [
+            # Cruzamento readout×feature: "nós desta via por símbolo de gene".
+            models.Index(
+                fields=['pathway', 'gene_symbol'],
+                name='pnode_pathway_symbol_idx',
+            ),
+            # Filtro "nós de readout desta via" (por papel de readout).
+            models.Index(
+                fields=['pathway', 'readout_role'],
+                name='pnode_pathway_readout_idx',
+            ),
+        ]
+        verbose_name = 'Pathway node'
+        verbose_name_plural = 'Pathway nodes'
+
+    def __str__(self):
+        label = self.gene_symbol or self.kegg_entry_id
+        return f"{self.pathway_id} · {label} [{self.node_type}]"
+
+
+class PathwayEdge(models.Model):
+    """
+    Uma ARESTA da via (relation do KGML) — DIRECIONADA + ASSINADA.
+    OmnisPathway Obj 2, Fase 3.
+
+    Direção sai da relation (`source_node` = entry1 → `target_node` = entry2);
+    o `sign` (+1/−1/0) sai do subtype (tabela §Sinal do plano), aplicado no
+    parse Rust. `subtypes` preserva os `subtype.name` crus (proveniência do
+    sinal); `interaction` é o rótulo derivado. É o `sign` inteiro que o RWR
+    assinado da Fase 4 consome — coração do "grafo assinado".
+
+    Carga (responsabilidade do ferris/Rust): COPY/UPSERT ON CONFLICT
+    (pathway, source_node, target_node, interaction) DO UPDATE — NÃO deste
+    model.
+    """
+
+    class RelationType(models.TextChoices):
+        ECREL = 'ecrel', 'Enzyme-enzyme relation'
+        PPREL = 'pprel', 'Protein-protein relation'
+        GEREL = 'gerel', 'Gene expression relation'
+        PCREL = 'pcrel', 'Protein-compound relation'
+        MAPLINK = 'maplink', 'Link to another map'
+
+    class Interaction(models.TextChoices):
+        ACTIVATION = 'activation', 'Ativação'
+        INHIBITION = 'inhibition', 'Inibição'
+        EXPRESSION = 'expression', 'Expressão'
+        REPRESSION = 'repression', 'Repressão'
+        BINDING = 'binding', 'Ligação/associação'
+        INDIRECT = 'indirect', 'Efeito indireto'
+        UNKNOWN = 'unknown', 'Desconhecido'
+
+    pathway = models.ForeignKey(
+        Pathway,
+        on_delete=models.CASCADE,
+        related_name='edges',
+        help_text='Via a que esta aresta pertence.'
+    )
+    source_node = models.ForeignKey(
+        PathwayNode,
+        on_delete=models.CASCADE,
+        related_name='out_edges',
+        help_text='entry1 do <relation> — origem da aresta direcionada.'
+    )
+    target_node = models.ForeignKey(
+        PathwayNode,
+        on_delete=models.CASCADE,
+        related_name='in_edges',
+        help_text='entry2 do <relation> — destino da aresta direcionada.'
+    )
+    sign = models.SmallIntegerField(
+        'Sinal',
+        help_text='+1 (ativante) / −1 (inibitório) / 0 (associação/sem sinal) '
+                  '— derivado do subtype.name (§Sinal). Coração do grafo '
+                  'assinado; consumido pelo RWR da Fase 4.'
+    )
+    relation_type = models.CharField(
+        'Tipo da Relation',
+        max_length=20,
+        choices=RelationType.choices,
+        help_text='Do <relation type> (ecrel/pprel/gerel/pcrel/maplink).'
+    )
+    subtypes = ArrayField(
+        models.CharField(max_length=40),
+        default=list,
+        blank=True,
+        help_text='subtype.name crus (activation/inhibition/phosphorylation/…) '
+                  '— proveniência do sinal.'
+    )
+    interaction = models.CharField(
+        'Interação (derivada)',
+        max_length=20,
+        choices=Interaction.choices,
+        help_text='Rótulo derivado do subtype (§Sinal). PARTE DA NATURAL KEY '
+                  '(evita colisão de arestas multi-relation no mesmo par).'
+    )
+
+    class Meta:
+        constraints = [
+            # Natural key: uma aresta por (via, origem, destino, interação).
+            # `interaction` na chave evita colisão quando o KGML tem múltiplas
+            # relations entre o MESMO par com interações distintas — sem perder
+            # aresta. → ON CONFLICT DO UPDATE do COPY do Rust e idempotência.
+            models.UniqueConstraint(
+                fields=['pathway', 'source_node', 'target_node', 'interaction'],
+                name='pathwayedge_natural_key_uniq',
+            ),
+            models.CheckConstraint(
+                name='pathwayedge_relation_type_valid',
+                condition=models.Q(relation_type__in=[
+                    'ecrel', 'pprel', 'gerel', 'pcrel', 'maplink',
+                ]),
+            ),
+            models.CheckConstraint(
+                name='pathwayedge_interaction_valid',
+                condition=models.Q(interaction__in=[
+                    'activation', 'inhibition', 'expression', 'repression',
+                    'binding', 'indirect', 'unknown',
+                ]),
+            ),
+        ]
+        indexes = [
+            # Travessia do grafo a partir de um nó (out-edges): caminho quente
+            # do RWR. O prefixo da natural key cobre (pathway, source_node),
+            # mas o índice dedicado serve a travessia sem o resto da chave.
+            models.Index(
+                fields=['pathway', 'source_node'],
+                name='pathwayedge_pathway_source_idx',
+            ),
+            # Travessia reversa (in-edges) a partir de um nó.
+            models.Index(
+                fields=['pathway', 'target_node'],
+                name='pathwayedge_pathway_target_idx',
+            ),
+        ]
+        verbose_name = 'Pathway edge'
+        verbose_name_plural = 'Pathway edges'
+
+    def __str__(self):
+        return (
+            f"{self.source_node_id} →[{self.sign:+d}/{self.interaction}]→ "
+            f"{self.target_node_id}"
+        )
+
+
+class PathwayReadoutFeature(models.Model):
+    """
+    Mapeamento READOUT→FEATURE — produto da Fase 3, consumido pela Fase 4.
+    OmnisPathway Obj 2, Fase 3.
+
+    Liga um nó de readout do grafo (fosfo / alvo de TF / metabólito) à feature
+    concreta da matriz (`feature_key` = símbolo de gene `TP53` ou fosfo-sítio
+    `TP53_S15`). Só materializa onde a feature DE FATO existe na matriz alvo
+    (validação de existência no mapeamento). `regulon_source`/`regulon_sign`
+    guardam o modo de regulação TF→alvo do CollecTRI (Regra 2); vazio/NULL p/
+    fosfo (Regra 1). `mapping_version` versiona o mapeamento (ex.:
+    fase3-readout-v1) e integra a natural key p/ coexistência de versões.
+
+    Materialização (responsabilidade do vitruvio, set-based em PG) — NÃO deste
+    model. É derivado: delete/regeração permitidos.
+    """
+
+    class Rule(models.TextChoices):
+        PHOSPHO = 'phospho', 'Fosforilação (Regra 1)'
+        TF_TARGET = 'tf_target', 'Alvo de TF (Regra 2)'
+        METABOLITE = 'metabolite', 'Metabólito (Regra 3, reservado)'
+
+    node = models.ForeignKey(
+        PathwayNode,
+        on_delete=models.CASCADE,
+        related_name='readout_features',
+        help_text='Nó de readout do grafo mapeado a esta feature.'
+    )
+    matrix = models.ForeignKey(
+        OmicMatrix,
+        on_delete=models.CASCADE,
+        related_name='readout_features',
+        help_text='Matriz onde a feature vive (fosfoproteoma p/ Regra 1; '
+                  'expressão/proteoma p/ Regra 2).'
+    )
+    feature_key = models.CharField(
+        'Chave da Feature',
+        max_length=128,
+        help_text='Feature na matriz: símbolo de gene (TP53) ou fosfo-sítio '
+                  '(TP53_S15).'
+    )
+    rule = models.CharField(
+        'Regra de Mapeamento',
+        max_length=20,
+        choices=Rule.choices,
+        help_text='phospho (Regra 1) / tf_target (Regra 2) / metabolite '
+                  '(Regra 3, reservado).'
+    )
+    regulon_source = models.CharField(
+        'Fonte do Regulon',
+        max_length=20,
+        blank=True,
+        default='',
+        help_text='p/ Regra 2: collectri (via OmniPath); vazio p/ Regra 1.'
+    )
+    regulon_sign = models.SmallIntegerField(
+        'Sinal do Regulon',
+        blank=True,
+        null=True,
+        help_text='p/ Regra 2: modo de regulação TF→alvo (+1/−1) do '
+                  'CollecTRI; NULL p/ Regra 1.'
+    )
+    confidence = models.FloatField(
+        'Confiança',
+        default=0.0,
+        help_text='Confiança do mapeamento (DoRothEA A-E → escala; Regra 1 = '
+                  '1.0 se o sítio bate).'
+    )
+    mapping_version = models.CharField(
+        'Versão do Mapeamento',
+        max_length=50,
+        help_text='ex.: fase3-readout-v1 — PARTE DA NATURAL KEY (versões '
+                  'coexistem sem sobrescrever).'
+    )
+
+    class Meta:
+        constraints = [
+            # Natural key: um mapeamento por (nó, matriz, feature, regra,
+            # VERSÃO). `mapping_version` na chave faz versões coexistirem sem
+            # sobrescrever. → ON CONFLICT (idempotente por bulk_create
+            # ignore_conflicts / UPSERT).
+            models.UniqueConstraint(
+                fields=['node', 'matrix', 'feature_key', 'rule',
+                        'mapping_version'],
+                name='pathwayreadoutfeature_natural_key_uniq',
+            ),
+            models.CheckConstraint(
+                name='pathwayreadoutfeature_rule_valid',
+                condition=models.Q(rule__in=[
+                    'phospho', 'tf_target', 'metabolite',
+                ]),
+            ),
+        ]
+        indexes = [
+            # Leitura da Fase 4: "features de readout desta matriz".
+            models.Index(
+                fields=['matrix', 'feature_key'],
+                name='pathwayrf_matrix_feature_idx',
+            ),
+        ]
+        verbose_name = 'Pathway readout feature'
+        verbose_name_plural = 'Pathway readout features'
+
+    def __str__(self):
+        return (
+            f"{self.node_id} · {self.feature_key} [{self.rule}] "
+            f"→ matrix {self.matrix_id}"
+        )
+
+
+# =============================================================================
 # SEÇÃO 4: CATEGORIZAÇÃO ÔMICA (Configuração global)
 # =============================================================================
 
@@ -2896,6 +3343,10 @@ class IngestionJob(models.Model):
         VARIANT_EFFECT_RAW_LOAD = 'variant_effect_raw_load', 'Carga de Efeito Cru de Variante (ClinVar/AlphaMissense) (OmnisPathway Obj 2)'
         SOMATIC_MAF_LOAD = 'somatic_maf_load', 'Carga de MAF Somático GDC (OmnisPathway Obj 2)'
         SNV_SEED_LOAD = 'snv_seed_load', 'Derivação de Seed SNV (OmnisPathway Obj 2)'
+        PATHWAY_TOPOLOGY_LOAD = 'pathway_topology_load', 'Carga de Topologia KEGG (OmnisPathway Obj 2)'
+        REGULON_LOAD = 'regulon_load', 'Carga de Regulons CollecTRI/OmniPath (OmnisPathway Obj 2)'
+        PHOSPHO_MATRIX_LOAD = 'phospho_matrix_load', 'Carga de Matriz de Fosfoproteoma (OmnisPathway Obj 2)'
+        READOUT_MAPPING = 'readout_mapping', 'Mapeamento Readout→Feature (OmnisPathway Obj 2)'
 
     class JobStatus(models.TextChoices):
         PENDING = 'pending', 'Pendente'

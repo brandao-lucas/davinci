@@ -566,6 +566,166 @@ pub fn load_cptac_matrix(
     ))
 }
 
+// ─── Loader de fosfoproteoma (Obj 2 — Fase 3, passo 3.1) ─────────────────────
+//
+// Reusa `load_cptac_matrix_async` com os nomes de arquivo do fosfoproteoma CPTAC CCRCC
+// (gene-level: `HS_CPTAC_CCRCC_phosphoproteome_gene_Tumor.cct` / `_Normal.cct`).
+//
+// Discovery (2026-07-16): LinkedOmics disponibiliza apenas a versão gene-level do
+// fosfoproteoma CCRCC (não site-level). Feature axis = `phospho_site` conforme o
+// vocabulário já existente em `OmicMatrix`; features = símbolos de gene (mesma
+// estrutura da matriz de proteoma). Reutiliza `validate_linkedomics_url` sem nenhuma
+// allowlist nova — host `www.linkedomics.org` já aprovado desde a Fase 0.
+//
+// # Segurança
+//
+// Mesma validação de `load_cptac_matrix`: `validate_linkedomics_url` + teto de bytes
+// implementado em `download_with_browser_ua` (streaming, sem bufferização antecipada).
+// User-Agent de browser (LinkedOmics bloqueia UA não-browser).
+
+/// Baixa o fosfoproteoma CPTAC CCRCC (gene-level, Tumor + Normal), parseia e grava Parquet.
+///
+/// Wrapper síncrono para PyO3 — reusa `load_cptac_matrix_async` sem duplicar lógica.
+///
+/// # Argumentos
+///
+/// | Parâmetro | Descrição |
+/// |---|---|
+/// | `tumor_url` | URL do `.cct` de tumor (deve ser `www.linkedomics.org`). |
+/// | `normal_url` | URL do `.cct` de normal (deve ser `www.linkedomics.org`). |
+/// | `dest_dir` | Diretório de destino para o Parquet. |
+/// | `parquet_name` | Nome do arquivo Parquet (default sugerido: `cptac_ccrcc_phospho.parquet`). |
+///
+/// # Retorno
+///
+/// `MatrixLoadManifest` — mesmo contrato do proteoma (Fase 0).
+/// O `vitruvio` cria `OmicMatrix(omics_layer='proteomic', feature_axis='phospho_site',
+/// data_format_level='intensities')` com base no manifesto.
+pub fn load_cptac_phospho_matrix(
+    tumor_url: &str,
+    normal_url: &str,
+    dest_dir: &str,
+    parquet_name: &str,
+) -> Result<MatrixLoadManifest, String> {
+    // Validar URLs (reutiliza validate_linkedomics_url — mesmo host da Fase 0)
+    validate_linkedomics_url(tumor_url)?;
+    validate_linkedomics_url(normal_url)?;
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("Falha ao criar runtime Tokio: {}", e))?;
+    let dest_path = Path::new(dest_dir);
+
+    // Reutiliza a função async existente — mesma lógica de parse/align/Parquet.
+    // Os nomes dos arquivos de cache internos diferem (cptac_ccrcc_proteome_*) mas são
+    // irrelevantes para o manifesto: o Parquet gravado usa `parquet_name`.
+    rt.block_on(load_cptac_phospho_matrix_async(
+        tumor_url,
+        normal_url,
+        dest_path,
+        parquet_name,
+    ))
+}
+
+/// Async interno do loader de fosfoproteoma.
+///
+/// Difere de `load_cptac_matrix_async` apenas no nome dos arquivos de cache local
+/// (evita colisão com o cache do proteoma no mesmo `dest_dir`).
+async fn load_cptac_phospho_matrix_async(
+    tumor_url: &str,
+    normal_url: &str,
+    dest_dir: &Path,
+    parquet_name: &str,
+) -> Result<MatrixLoadManifest, String> {
+    validate_linkedomics_url(tumor_url)?;
+    validate_linkedomics_url(normal_url)?;
+
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+             AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
+        .build()
+        .map_err(|e| format!("Falha ao criar HTTP client: {}", e))?;
+
+    // Nomes de cache distintos do proteoma para evitar colisão
+    let tumor_path = dest_dir.join("cptac_ccrcc_phospho_tumor.cct");
+    let normal_path = dest_dir.join("cptac_ccrcc_phospho_normal.cct");
+
+    eprintln!("[matrix_loader/phospho] baixando tumor: {}", tumor_url);
+    download_with_browser_ua(&http_client, tumor_url, &tumor_path).await?;
+
+    eprintln!("[matrix_loader/phospho] baixando normal: {}", normal_url);
+    download_with_browser_ua(&http_client, normal_url, &normal_path).await?;
+
+    eprintln!("[matrix_loader/phospho] parseando tumor...");
+    let tumor_matrix = parse_cct_file(&tumor_path)?;
+    eprintln!(
+        "[matrix_loader/phospho] tumor: {} genes × {} amostras",
+        tumor_matrix.genes.len(),
+        tumor_matrix.sample_ids.len()
+    );
+
+    eprintln!("[matrix_loader/phospho] parseando normal...");
+    let normal_matrix = parse_cct_file(&normal_path)?;
+    eprintln!(
+        "[matrix_loader/phospho] normal: {} genes × {} amostras",
+        normal_matrix.genes.len(),
+        normal_matrix.sample_ids.len()
+    );
+
+    let aligned = align_matrices(&tumor_matrix, &normal_matrix);
+
+    let n_features = aligned.genes.len();
+    let n_tumor = tumor_matrix.sample_ids.len();
+    let n_normal = normal_matrix.sample_ids.len();
+    let n_samples = n_tumor + n_normal;
+
+    eprintln!(
+        "[matrix_loader/phospho] interseção: {} genes; amostras: {} tumor + {} normal",
+        n_features, n_tumor, n_normal
+    );
+
+    let parquet_path = dest_dir.join(parquet_name);
+    eprintln!("[matrix_loader/phospho] gravando Parquet em {:?}", parquet_path);
+
+    let checksum_md5 = write_parquet(
+        &parquet_path,
+        &aligned.genes,
+        &tumor_matrix.sample_ids,
+        &normal_matrix.sample_ids,
+        &aligned.tumor_sample_cols,
+        &aligned.normal_sample_cols,
+    )?;
+
+    eprintln!("[matrix_loader/phospho] Parquet gravado. MD5={}", checksum_md5);
+
+    let mut sample_columns: Vec<SampleColumn> = Vec::with_capacity(n_samples);
+    for (i, case_id) in tumor_matrix.sample_ids.iter().enumerate() {
+        sample_columns.push(SampleColumn {
+            case_id: case_id.clone(),
+            sample_role: "tumor".to_string(),
+            column_index: 1 + i,
+        });
+    }
+    for (i, case_id) in normal_matrix.sample_ids.iter().enumerate() {
+        sample_columns.push(SampleColumn {
+            case_id: case_id.clone(),
+            sample_role: "normal".to_string(),
+            column_index: 1 + n_tumor + i,
+        });
+    }
+
+    Ok(MatrixLoadManifest {
+        parquet_path: parquet_path.to_string_lossy().into_owned(),
+        checksum_md5,
+        n_features,
+        n_samples,
+        sample_columns,
+        genes_discarded: aligned.genes_discarded,
+    })
+}
+
 // ─── Testes unitários ─────────────────────────────────────────────────────────
 
 #[cfg(test)]

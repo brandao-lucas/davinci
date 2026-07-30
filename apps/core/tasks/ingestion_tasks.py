@@ -1810,3 +1810,421 @@ def run_somatic_maf_load(self, job_id: str, project_id: str):
         except Exception:
             pass
         raise self.retry(exc=exc, countdown=120)
+
+
+@shared_task(
+    bind=True,
+    max_retries=2,
+    # Carga do fosfoproteoma CPTAC: download de dois arquivos CCT (~100–200 MB
+    # cada) + parse streaming + escrita de Parquet local + upload via
+    # default_storage. Estimativa conservadora: 2 horas. 4 horas é margem folgada.
+    time_limit=4 * 3600,
+    soft_time_limit=3 * 3600 + 50 * 60,
+    acks_late=True,
+)
+def run_phospho_matrix_load(self, job_id: str, project_id: str):
+    """
+    Orquestra a carga da matriz de fosfoproteoma CPTAC CCRCC
+    (OmnisPathway Obj 2, Fase 3, Passo 3.1).
+
+    Wrapper fino que delega ao PhosphoMatrixLoadService.run(). A task resolve
+    o projeto e o job pelo ID antes de processar, garantindo isolamento (o job
+    foi criado pelo PhosphoMatrixLoadService.dispatch, que verificou que o
+    projeto pertence ao usuário autenticado).
+
+    Fluxo:
+      1. Resolve DaVinciProject e IngestionJob pelos IDs recebidos.
+      2. Valida isolamento: job.project_id == project_id.
+      3. Delega a PhosphoMatrixLoadService.run(job=job), que:
+           - Resolve/cria OmicDataset CPTAC-CCRCC-PHOSPHO.
+           - Gate de idempotência (OmicMatrix/job ativo).
+           - rust_engine.load_cptac_phospho_matrix -> manifest.
+           - Upload do Parquet via shared_omics_storage_key.
+           - Cria OmicMatrix + OmicSample (get_or_create) + OmicMatrixSample.
+           - Marca job COMPLETED.
+
+    Regra #1: task apenas orquestra - nao faz HTTP nem parse de dados.
+    Sensitive-data-handling: db_url nunca logada nem gravada em parameters.
+    """
+    from apps.core.models import DaVinciProject
+    from apps.core.services.phospho_matrix_load_service import (
+        PhosphoMatrixAlreadyLoadedError,
+        PhosphoMatrixLoadService,
+    )
+
+    try:
+        import rust_engine  # noqa: F401 — valida disponibilidade antes de iniciar
+    except ImportError:
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=(
+                    'rust_engine not installed — compile with '
+                    '`maturin develop --release`'
+                ),
+            )
+        except Exception:
+            pass
+        return {'n_features': 0, 'n_samples': 0, 'errors': ['rust_engine not installed']}
+
+    try:
+        try:
+            project = DaVinciProject.objects.select_related('user').get(id=project_id)
+        except DaVinciProject.DoesNotExist:
+            logger.warning(
+                'run_phospho_matrix_load: DaVinciProject %s nao encontrado '
+                '— task abortada',
+                project_id,
+            )
+            return {'n_features': 0, 'n_samples': 0, 'errors': ['project not found']}
+
+        try:
+            job = IngestionJob.objects.get(id=job_id)
+        except IngestionJob.DoesNotExist:
+            logger.warning(
+                'run_phospho_matrix_load: IngestionJob %s nao encontrado '
+                '— task abortada',
+                job_id,
+            )
+            return {'n_features': 0, 'n_samples': 0, 'errors': ['job not found']}
+
+        if str(job.project_id) != str(project_id):
+            logger.error(
+                'run_phospho_matrix_load: job %s nao pertence ao projeto %s '
+                '— task abortada (isolamento)',
+                job_id,
+                project_id,
+            )
+            IngestionJob.objects.filter(id=job.id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message='Isolamento: job nao pertence ao projeto informado.',
+            )
+            return {'n_features': 0, 'n_samples': 0, 'errors': ['isolation violation']}
+
+        service = PhosphoMatrixLoadService(project)
+        result = service.run(job=job)
+
+        return {
+            'n_features': result['n_features'],
+            'n_samples': result['n_samples'],
+            'storage_key': result['storage_key'],
+            'genes_discarded': result['genes_discarded'],
+            'roles': result['roles'],
+            'errors': [],
+        }
+
+    except PhosphoMatrixAlreadyLoadedError as exc:
+        logger.info(
+            'run_phospho_matrix_load: idempotencia (job %s / projeto %s): %s',
+            job_id,
+            project_id,
+            exc,
+        )
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.COMPLETED,
+                error_message=f'Idempotencia: {exc}',
+            )
+        except Exception:
+            pass
+        return {'n_features': 0, 'n_samples': 0, 'errors': []}
+
+    except Exception as exc:
+        logger.error(
+            'run_phospho_matrix_load falhou para projeto %s / job %s: %s',
+            project_id,
+            job_id,
+            exc,
+        )
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=str(exc),
+            )
+        except Exception:
+            pass
+        raise self.retry(exc=exc, countdown=120)
+
+
+@shared_task(
+    bind=True,
+    max_retries=2,
+    # Carga de topologia KEGG: fetch de 3 KGMLs (pequenos, rest.kegg.jp) +
+    # parse XML + COPY Pathway/PathwayNode/PathwayEdge em PG via Rust.
+    # Estimativa: alguns minutos (3 vias, KGMLs pequenos). 1 hora e folgado.
+    time_limit=1 * 3600,
+    soft_time_limit=55 * 60,
+    acks_late=True,
+)
+def run_pathway_topology_load(self, job_id: str, project_id: str):
+    """
+    Orquestra a carga de topologia KEGG das vias de sinalizacao
+    (OmnisPathway Obj 2, Fase 3, Passo 3.2).
+
+    Wrapper fino que delega ao PathwayTopologyLoadService.run(). A task
+    resolve o projeto e o job pelo ID antes de processar.
+
+    Catalogo global: Pathway/PathwayNode/PathwayEdge sao catalogo global de
+    referencia (sem FK de projeto). O job e de tracking — a carga afeta as
+    tabelas globais.
+
+    Fluxo:
+      1. Resolve DaVinciProject e IngestionJob pelos IDs recebidos.
+      2. Valida isolamento do job (job.project_id == project_id).
+      3. Delega a PathwayTopologyLoadService.run(job=job), que:
+           - rust_engine.load_kegg_topology -> manifest (COPY em PG via Rust).
+           - Marca job COMPLETED com contadores (n_pathways, n_nodes, n_edges).
+
+    Regra #1: task apenas orquestra — Rust faz fetch KGML, parse XML e COPY.
+    Sensitive-data-handling: db_url nunca logada nem gravada em parameters.
+    """
+    from apps.core.models import DaVinciProject
+    from apps.core.services.pathway_topology_load_service import (
+        PathwayTopologyJobActiveError,
+        PathwayTopologyLoadService,
+    )
+
+    try:
+        import rust_engine  # noqa: F401 — valida disponibilidade antes de iniciar
+    except ImportError:
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=(
+                    'rust_engine not installed — compile with '
+                    '`maturin develop --release`'
+                ),
+            )
+        except Exception:
+            pass
+        return {
+            'n_pathways': 0,
+            'n_nodes': 0,
+            'n_edges': 0,
+            'errors': ['rust_engine not installed'],
+        }
+
+    try:
+        try:
+            project = DaVinciProject.objects.select_related('user').get(id=project_id)
+        except DaVinciProject.DoesNotExist:
+            logger.warning(
+                'run_pathway_topology_load: DaVinciProject %s nao encontrado '
+                '— task abortada',
+                project_id,
+            )
+            return {'n_pathways': 0, 'n_nodes': 0, 'n_edges': 0, 'errors': ['project not found']}
+
+        try:
+            job = IngestionJob.objects.get(id=job_id)
+        except IngestionJob.DoesNotExist:
+            logger.warning(
+                'run_pathway_topology_load: IngestionJob %s nao encontrado '
+                '— task abortada',
+                job_id,
+            )
+            return {'n_pathways': 0, 'n_nodes': 0, 'n_edges': 0, 'errors': ['job not found']}
+
+        if str(job.project_id) != str(project_id):
+            logger.error(
+                'run_pathway_topology_load: job %s nao pertence ao projeto %s '
+                '— task abortada (isolamento)',
+                job_id,
+                project_id,
+            )
+            IngestionJob.objects.filter(id=job.id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message='Isolamento: job nao pertence ao projeto informado.',
+            )
+            return {'n_pathways': 0, 'n_nodes': 0, 'n_edges': 0, 'errors': ['isolation violation']}
+
+        service = PathwayTopologyLoadService(project)
+        result = service.run(job=job)
+
+        return {
+            'n_pathways': result['n_pathways'],
+            'n_nodes': result['n_nodes'],
+            'n_edges': result['n_edges'],
+            'n_signed': result['n_signed'],
+            'n_unsigned': result['n_unsigned'],
+            'n_orphan_symbols': result['n_orphan_symbols'],
+            'source_version': result['source_version'],
+            'errors': [],
+        }
+
+    except PathwayTopologyJobActiveError as exc:
+        logger.info(
+            'run_pathway_topology_load: idempotencia (job %s / projeto %s): %s',
+            job_id,
+            project_id,
+            exc,
+        )
+        return {'n_pathways': 0, 'n_nodes': 0, 'n_edges': 0, 'errors': []}
+
+    except Exception as exc:
+        logger.error(
+            'run_pathway_topology_load falhou para projeto %s / job %s: %s',
+            project_id,
+            job_id,
+            exc,
+        )
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=str(exc),
+            )
+        except Exception:
+            pass
+        raise self.retry(exc=exc, countdown=120)
+
+
+@shared_task(
+    bind=True,
+    max_retries=2,
+    # Carga de regulons CollecTRI via OmniPath: fetch HTTP + filtro por
+    # tf_allowlist em streaming + escrita JSONL local. Estimativa: minutos
+    # (dados filtrados, volume modesto). 30 min e folgado.
+    # RISCO: OmniPath estava com 502 em 2026-07-15 — confirmar na 1a execucao.
+    time_limit=30 * 60,
+    soft_time_limit=25 * 60,
+    acks_late=True,
+)
+def run_regulon_load(self, job_id: str, project_id: str):
+    """
+    Orquestra a carga de regulons CollecTRI (OmniPath) para os TFs das vias
+    (OmnisPathway Obj 2, Fase 3, Passo 3.3).
+
+    Wrapper fino que delega ao RegulonLoadService.run(). A task resolve o
+    projeto e o job pelo ID antes de processar.
+
+    tf_allowlist: derivada automaticamente dos PathwayNode(node_type='gene')
+    do grafo ja carregado em PG (passo 3.2). O Rust baixa e filtra regulons
+    em streaming; grava JSONL local em diagnostics/cache/omnipath/.
+
+    Pre-condicao: passo 3.2 (load_kegg_topology) deve ter sido executado.
+    Se nao existirem PathwayNode nas vias, RegulonGraphNotLoadedError e
+    levantado sem retry (erro de configuracao).
+
+    Fluxo:
+      1. Resolve DaVinciProject e IngestionJob pelos IDs recebidos.
+      2. Valida isolamento do job.
+      3. Delega a RegulonLoadService.run(job=job), que:
+           - Deriva tf_allowlist via ORM set-based.
+           - rust_engine.load_collectri_regulons -> manifest + JSONL local.
+           - Persiste regulon_path em IngestionJob.parameters.
+           - Marca job COMPLETED.
+
+    Regra #1: task apenas orquestra — Rust faz fetch HTTP e parse.
+    Sensitive-data-handling: db_url nao necessaria (sem COPY em PG).
+    RISCO: OmniPath pode retornar 502 — confirmar endpoint na 1a execucao.
+    """
+    from apps.core.models import DaVinciProject
+    from apps.core.services.regulon_load_service import (
+        RegulonGraphNotLoadedError,
+        RegulonJobActiveError,
+        RegulonLoadService,
+    )
+
+    try:
+        import rust_engine  # noqa: F401 — valida disponibilidade antes de iniciar
+    except ImportError:
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=(
+                    'rust_engine not installed — compile with '
+                    '`maturin develop --release`'
+                ),
+            )
+        except Exception:
+            pass
+        return {'n_tfs': 0, 'n_edges': 0, 'errors': ['rust_engine not installed']}
+
+    try:
+        try:
+            project = DaVinciProject.objects.select_related('user').get(id=project_id)
+        except DaVinciProject.DoesNotExist:
+            logger.warning(
+                'run_regulon_load: DaVinciProject %s nao encontrado — task abortada',
+                project_id,
+            )
+            return {'n_tfs': 0, 'n_edges': 0, 'errors': ['project not found']}
+
+        try:
+            job = IngestionJob.objects.get(id=job_id)
+        except IngestionJob.DoesNotExist:
+            logger.warning(
+                'run_regulon_load: IngestionJob %s nao encontrado — task abortada',
+                job_id,
+            )
+            return {'n_tfs': 0, 'n_edges': 0, 'errors': ['job not found']}
+
+        if str(job.project_id) != str(project_id):
+            logger.error(
+                'run_regulon_load: job %s nao pertence ao projeto %s '
+                '— task abortada (isolamento)',
+                job_id,
+                project_id,
+            )
+            IngestionJob.objects.filter(id=job.id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message='Isolamento: job nao pertence ao projeto informado.',
+            )
+            return {'n_tfs': 0, 'n_edges': 0, 'errors': ['isolation violation']}
+
+        service = RegulonLoadService(project)
+        result = service.run(job=job)
+
+        return {
+            'n_tfs': result['n_tfs'],
+            'n_targets': result['n_targets'],
+            'n_edges': result['n_edges'],
+            'n_positive': result['n_positive'],
+            'n_negative': result['n_negative'],
+            'n_neutral': result['n_neutral'],
+            'source_version': result['source_version'],
+            'tf_allowlist_size': result['tf_allowlist_size'],
+            'errors': [],
+        }
+
+    except RegulonGraphNotLoadedError as exc:
+        logger.error(
+            'run_regulon_load: grafo nao carregado (projeto %s / job %s) '
+            '— task abortada sem retry: %s',
+            project_id,
+            job_id,
+            exc,
+        )
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=str(exc),
+            )
+        except Exception:
+            pass
+        return {'n_tfs': 0, 'n_edges': 0, 'errors': [str(exc)]}
+
+    except RegulonJobActiveError as exc:
+        logger.info(
+            'run_regulon_load: idempotencia (job %s / projeto %s): %s',
+            job_id,
+            project_id,
+            exc,
+        )
+        return {'n_tfs': 0, 'n_edges': 0, 'errors': []}
+
+    except Exception as exc:
+        logger.error(
+            'run_regulon_load falhou para projeto %s / job %s: %s',
+            project_id,
+            job_id,
+            exc,
+        )
+        try:
+            IngestionJob.objects.filter(id=job_id).update(
+                status=IngestionJob.JobStatus.FAILED,
+                error_message=str(exc),
+            )
+        except Exception:
+            pass
+        raise self.retry(exc=exc, countdown=120)
