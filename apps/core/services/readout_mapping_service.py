@@ -20,34 +20,47 @@ Regra 2 (TF):
   Para cada nó cujo gene_symbol é TF (source) no JSONL de regulon (caminho
   do IngestionJob mais recente de REGULON_LOAD), para cada alvo do regulon
   cruzar com features da matriz proteoma da Fase 0 (CPTAC-CCRCC proteome,
-  feature_axis='gene'). Onde bate (alvo ∈ símbolos da matriz): nó do TF
-  recebe readout_role='tf_target' + PathwayReadoutFeature(rule='tf_target',
-  regulon_source='collectri', regulon_sign=±1, confidence=<conf>,
+  feature_axis='gene'). Onde bate (alvo ∈ features da matriz proteoma): nó
+  do TF recebe readout_role='tf_target' + PathwayReadoutFeature(
+  rule='tf_target', regulon_source='collectri', regulon_sign=±1/0 (lido do
+  campo `mode` do JSONL — ver Regra 2 abaixo para o contrato real),
+  confidence=CONFIDENCE_TF_TARGET (fixo, sem calibração no v1 — ver Regra 2),
   mapping_version=<ver>).
 
-Validação de existência de feature (Decisão 5 — A→C adiada):
-  NÃO abre Parquet no Django. Estratégia por camada:
+Validação de existência de feature (A→C concluída — migration 0036):
+  NÃO abre Parquet no Django. A validação é feita em PG contra
+  `OmicMatrixFeature` (catálogo de linhas do Parquet, populado pelo
+  management command `backfill_matrix_features` — ver
+  matrix_feature_catalog_service.py). O bug original (medido na ingestão
+  live) era validar candidatos contra os símbolos do GRAFO KEGG
+  (`PathwayNode.gene_symbol`) em vez de contra as features REAIS da matriz
+  alvo — semanticamente errado, porque os alvos de TF são por definição
+  genes FORA da via (validar contra o grafo descartava ~95% deles).
 
-  - Regra 1: não há OmicMatrixFeature (A→C adiada). OmicMatrixSample guarda
-    amostras, não features. O cruzamento gene_symbol é entre PG×PG — nós do
-    grafo × símbolos derivados do próprio loader (o KGML traz gene_symbol que
-    o Rust gravou em PathwayNode.gene_symbol). A validação "este símbolo existe
-    no Parquet do fosfoproteoma" NÃO é possível sem abrir o Parquet.
-    DECISÃO: materializa PathwayReadoutFeature para todos os nós cujo
-    gene_symbol é não-vazio, registrando n_features_not_found=0 (sem
-    validação) e sinalizando no relatório que a validação completa exige A→C.
-    Gatilho A→C: se a Fase 4 precisar verificar que a feature realmente existe
-    no Parquet antes de ler o valor → handoff para cartografo (OmicMatrixFeature).
+  - Regra 1 (fosfo): feature_key = gene_symbol do nó (UPPERCASE) validado
+    contra `OmicMatrixFeature.objects.filter(matrix=phospho_matrix,
+    feature_key__in=candidatos)`. Só materializa PathwayReadoutFeature para
+    os símbolos que EXISTEM na matriz de fosfo. n_features_not_found agora é
+    real (nós cujo símbolo não está catalogado na matriz).
 
-  - Regra 2: os alvos dos regulons (target_symbol) são cruzados com os
-    gene_symbol dos PathwayNode da mesma via (conjunto em PG). Se o alvo
-    coincide com um gene_symbol de nó, considera-se "conhecido na via". Para
-    cruzar com a matriz proteoma (features do Parquet), mesma limitação:
-    sem OmicMatrixFeature não é possível verificar presença na linha do
-    Parquet sem abrir o arquivo. DECISÃO: materializa PathwayReadoutFeature
-    para todos os alvos cujos símbolos estão presentes nos PathwayNode das
-    3 vias (validação intra-grafo, que é barata e em PG). Registra
-    n_features_not_found e sinaliza limitação no relatório.
+  - Regra 2 (TF): target_symbol do regulon validado contra
+    `OmicMatrixFeature.objects.filter(matrix=proteome_matrix,
+    feature_key__in=candidatos)` — a matriz PROTEOMA (matriz alvo do
+    readout), não mais contra o conjunto de símbolos do grafo. Os alvos de
+    um TF são majoritariamente externos à via; validar contra a matriz real
+    é o que os torna aceitáveis (medido: 70% dos alvos aceitos vs. 5% da
+    validação intra-grafo antiga).
+
+  Degradação graciosa (decisão deliberada): se `OmicMatrixFeature` estiver
+  VAZIO para a matriz que precisa ser validada (backfill ainda não rodou),
+  o service FALHA ALTO (`OmicMatrixFeatureNotCataloguedError`) em vez de
+  cair de volta na validação intra-grafo antiga. Cair silenciosamente
+  reintroduziria o mesmo bug sem avisar o operador — pior que falhar, porque
+  o comando "funcionaria" e materializaria readouts fantasma de novo. O erro
+  instrui a rodar `backfill_matrix_features` antes de (re)executar
+  map_readouts. A checagem só dispara quando há candidatos reais a validar
+  (matriz presente E há símbolos para checar) — matriz ausente já é tratada
+  separadamente (regra pulada, não é o mesmo caminho de erro).
 
 Idempotência:
   bulk_create(ignore_conflicts=True) — NK (node, matrix, feature_key, rule,
@@ -74,6 +87,7 @@ from django.utils import timezone
 from apps.core.models import (
     IngestionJob,
     OmicMatrix,
+    OmicMatrixFeature,
     PathwayNode,
     PathwayReadoutFeature,
 )
@@ -94,10 +108,54 @@ PHOSPHO_LOADER_VERSION = 'phospho-v1'
 # Versão padrão do mapeamento
 DEFAULT_MAPPING_VERSION = 'fase3-readout-v1'
 
+# Confidence fixo para PathwayReadoutFeature(rule='tf_target') — Regra 2.
+#
+# O JSONL de regulon (produzido por rust_src/src/omics/regulon_loader.rs) NÃO
+# tem campo de confiança/score contínuo — apenas `mode` (sinal) e
+# `n_references` (contagem de referências de literatura, cru). O plano da
+# Fase 4 (item S-7) já registra que no v1 a confiança do regulon é lida mas
+# NÃO pondera o footprint (sem cálculo posterior que dependa de calibração
+# fina). Diante disso, gravar confidence=0.0 seria enganoso — sugeriria
+# confiança nula quando na verdade não há informação de confiança nenhuma
+# capturada. DECISÃO: 1.0 fixo, sinalizando "par aceito, sem grau calculado"
+# em vez de fabricar uma normalização de n_references sem calibração
+# validada. Se uma Fase futura precisar ponderar por n_references, essa
+# derivação deve ser decidida e documentada explicitamente ali (não aqui).
+CONFIDENCE_TF_TARGET = 1.0
+
 
 class ReadoutMappingError(Exception):
     """Levantado quando pré-condição do mapeamento não é satisfeita."""
     pass
+
+
+class OmicMatrixFeatureNotCataloguedError(ReadoutMappingError):
+    """
+    Levantado quando `OmicMatrixFeature` está vazio para a matriz que precisa
+    ser validada (o backfill `backfill_matrix_features` ainda não rodou para
+    esta matriz).
+
+    Decisão A→C (deliberada): falhar alto aqui em vez de degradar
+    silenciosamente para a validação intra-grafo antiga. Essa validação
+    antiga é exatamente o bug que motivou a promoção A→C — validar contra
+    `PathwayNode.gene_symbol` (símbolos do grafo) descarta ~95% dos alvos
+    reais de TF, que por definição ficam FORA da via. Cair de volta nela
+    silenciosamente reintroduziria o bug sem qualquer aviso ao operador.
+    """
+
+    def __init__(self, matrix: OmicMatrix):
+        self.matrix = matrix
+        super().__init__(
+            f"OmicMatrixFeature vazio para matrix_id={matrix.id} "
+            f"(dataset_id={matrix.dataset_id}, omics_layer={matrix.omics_layer}, "
+            f"feature_axis={matrix.feature_axis}). O catálogo de features desta "
+            f"matriz ainda não foi populado. Rode "
+            f"`manage.py backfill_matrix_features --matrix-id {matrix.id}` "
+            f"antes de (re)executar map_readouts. Validar contra o grafo KEGG "
+            f"(estratégia intra-grafo antiga) reintroduziria silenciosamente o "
+            f"bug corrigido na promoção A→C — por isso o mapeamento é abortado "
+            f"em vez de degradar."
+        )
 
 
 class ReadoutMappingService:
@@ -121,7 +179,6 @@ class ReadoutMappingService:
             'n_unmapped_nodes': int,
             'n_features_not_found': int,
             'validation_strategy': str,   # documentação da estratégia usada
-            'gatilho_ac': bool,           # True se A→C é necessária p/ validação completa
             'mapping_version': str,
             'dry_run': bool,
             'duration_s': float,
@@ -162,6 +219,8 @@ class ReadoutMappingService:
 
         Raises:
             ReadoutMappingError: pré-condição não satisfeita.
+            OmicMatrixFeatureNotCataloguedError: a matriz a validar não tem
+                nenhuma OmicMatrixFeature catalogada (backfill não rodou).
         """
         import time
         self._start = time.monotonic()
@@ -170,19 +229,11 @@ class ReadoutMappingService:
         proteome_matrix = self._resolve_proteome_matrix()
         regulon_path = self._resolve_regulon_path()
 
-        # Símbolos conhecidos na via (validação intra-grafo, barata)
-        all_pathway_symbols = self._get_pathway_symbols(
-            self.pathway_ids_phospho + [
-                p for p in self.pathway_ids_tf
-                if p not in self.pathway_ids_phospho
-            ]
-        )
-
         phospho_features, n_phospho_not_found = self._apply_rule_phospho(
-            phospho_matrix, all_pathway_symbols
+            phospho_matrix
         )
         tf_features, n_tf_not_found = self._apply_rule_tf(
-            proteome_matrix, regulon_path, all_pathway_symbols
+            proteome_matrix, regulon_path
         )
 
         all_features = phospho_features + tf_features
@@ -213,14 +264,19 @@ class ReadoutMappingService:
             'mapping_version': self.mapping_version,
             'dry_run': self.dry_run,
             'duration_s': round(duration_s, 2),
-            # Estratégia de validação e gatilho A→C (Decisão 5 do plano)
+            # Estratégia de validação (A→C concluída — migration 0036)
             'validation_strategy': (
-                'intra-grafo: feature_key validada contra PathwayNode.gene_symbol '
-                'em PG (conjunto de simbolos das vias). Validacao completa '
-                '(existencia no Parquet da matriz) exige promocao A->C '
-                '(OmicMatrixFeature). Gatilho A->C disparado: ver gatilho_ac.'
+                'OmicMatrixFeature: feature_key validada contra o catalogo de '
+                'features da MATRIZ ALVO (Regra 1: matriz de fosfo; Regra 2: '
+                'matriz de proteoma) via '
+                'OmicMatrixFeature.objects.filter(matrix=..., '
+                'feature_key__in=candidatos). Substitui a validacao intra-grafo '
+                'antiga (contra PathwayNode.gene_symbol), que descartava ~95% '
+                'dos alvos de TF por validar contra o grafo em vez da matriz. '
+                'Se a matriz nao tem OmicMatrixFeature catalogada, o mapeamento '
+                'falha alto (OmicMatrixFeatureNotCataloguedError) em vez de '
+                'degradar silenciosamente para a estrategia antiga.'
             ),
-            'gatilho_ac': True,  # Sempre True para a Fase 3 (A→C adiada)
             'phospho_matrix_id': phospho_matrix.id if phospho_matrix else None,
             'proteome_matrix_id': proteome_matrix.id if proteome_matrix else None,
             'regulon_path_found': bool(regulon_path),
@@ -350,28 +406,44 @@ class ReadoutMappingService:
         )
         return regulon_path
 
-    def _get_pathway_symbols(self, pathway_ids: list[str]) -> set[str]:
+    def _get_existing_feature_keys(
+        self,
+        matrix: OmicMatrix,
+        candidate_keys: set[str],
+    ) -> set[str]:
         """
-        Retorna o conjunto de gene_symbol dos PathwayNode das vias especificadas.
+        Retorna o subconjunto de `candidate_keys` que EXISTE em
+        `OmicMatrixFeature` para a `matrix` dada — validação real de
+        existência no Parquet (via catálogo A→C), sem abrir o arquivo.
 
-        Usado como "conjunto de features conhecidas em PG" para validação
-        intra-grafo (Decisão 5 — A→C adiada). Excluindo símbolos vazios.
+        `candidate_keys` já deve estar normalizado (UPPERCASE) — a NK de
+        OmicMatrixFeature (matrix, feature_key) é case-sensitive.
+
+        Levanta OmicMatrixFeatureNotCataloguedError se a matriz não tem
+        NENHUMA feature catalogada (backfill_matrix_features não rodou para
+        ela). Ver docstring do módulo / da exceção para a justificativa de
+        falhar alto em vez de degradar para a validação intra-grafo antiga.
         """
-        symbols = set(
-            PathwayNode.objects.filter(
-                pathway__kegg_id__in=pathway_ids,
-                node_type=PathwayNode.NodeType.GENE,
-            )
-            .exclude(gene_symbol='')
-            .values_list('gene_symbol', flat=True)
-            .distinct()
+        if not candidate_keys:
+            return set()
+
+        if not OmicMatrixFeature.objects.filter(matrix=matrix).exists():
+            raise OmicMatrixFeatureNotCataloguedError(matrix)
+
+        existing = set(
+            OmicMatrixFeature.objects.filter(
+                matrix=matrix,
+                feature_key__in=candidate_keys,
+            ).values_list('feature_key', flat=True)
         )
         logger.info(
-            'ReadoutMappingService: %d simbolos distintos nas vias %s',
-            len(symbols),
-            pathway_ids,
+            'ReadoutMappingService: %d/%d candidatos existem em '
+            'OmicMatrixFeature (matrix_id=%d).',
+            len(existing),
+            len(candidate_keys),
+            matrix.id,
         )
-        return symbols
+        return existing
 
     # ─────────────────────────────────────────────────────────────────────────
     # Regra 1 — fosfo
@@ -380,7 +452,6 @@ class ReadoutMappingService:
     def _apply_rule_phospho(
         self,
         phospho_matrix: OmicMatrix | None,
-        all_pathway_symbols: set[str],
     ) -> tuple[list[PathwayReadoutFeature], int]:
         """
         Regra 1: nós gene das vias de fosfo × matriz de fosfoproteoma.
@@ -388,17 +459,20 @@ class ReadoutMappingService:
         feature_key = gene_symbol do nó (UPPERCASE).
         Confidence = 1.0 (gene-level — nó está na via e a feature é o símbolo).
 
-        Estratégia de validação (Decisão 5 — A→C adiada):
-          Não há OmicMatrixFeature nem índice de features em PG. O gene_symbol
-          do nó é UPPERCASE (do KGML graphics name). A existência do símbolo
-          no Parquet NÃO é verificável sem abrir o arquivo. Materializa para
-          todos os nós com gene_symbol não-vazio nas vias de fosfo. Registra
-          n_not_found=0 (sem validação) e sinaliza necessidade de A→C no
-          relatório. Gatilho A→C: a Fase 4 precisará de OmicMatrixFeature para
-          verificar valor real.
+        Estratégia de validação (A→C concluída):
+          feature_key validada contra `OmicMatrixFeature.objects.filter(
+          matrix=phospho_matrix, feature_key__in=candidatos)` — a matriz de
+          fosfo é a matriz ALVO deste readout, então validar contra ela (em
+          vez do grafo) é o correto por construção. Só materializa
+          PathwayReadoutFeature para os símbolos que EXISTEM na matriz.
+          n_not_found é real: nós cujo gene_symbol não está catalogado.
 
         Returns:
             (lista de PathwayReadoutFeature não persistidos, n_not_found)
+
+        Raises:
+            OmicMatrixFeatureNotCataloguedError: matriz de fosfo sem nenhuma
+                OmicMatrixFeature catalogada (backfill não rodou).
         """
         if phospho_matrix is None:
             logger.info(
@@ -415,11 +489,22 @@ class ReadoutMappingService:
             .select_related('pathway')
         )
 
+        candidate_symbols = {node.gene_symbol.upper() for node in nodes}
+        existing_symbols = self._get_existing_feature_keys(
+            phospho_matrix, candidate_symbols
+        )
+
         features = []
         seen: set[tuple[int, int, str, str]] = set()
+        n_not_found = 0
 
         for node in nodes:
             symbol = node.gene_symbol.upper()
+
+            if symbol not in existing_symbols:
+                n_not_found += 1
+                continue
+
             key = (node.id, phospho_matrix.id, symbol, 'phospho')
             if key in seen:
                 continue
@@ -437,31 +522,16 @@ class ReadoutMappingService:
                 )
             )
 
-        # Validação intra-grafo (barata): conta quantos símbolos de fosfo NÃO
-        # aparecem no conjunto global de símbolos das vias. Isso é apenas uma
-        # verificação de consistência interna — não valida presença no Parquet.
-        # n_not_found real (no Parquet) exige A→C.
-        phospho_symbols = {f.feature_key for f in features}
-        n_not_found_intra = len(phospho_symbols - all_pathway_symbols)
-        # n_not_found reportado como 0 porque a validação completa não é feita.
-        # A discrepância intra-grafo é registrada em log para diagnóstico.
-        if n_not_found_intra > 0:
-            logger.info(
-                'ReadoutMappingService Regra 1: %d simbolos de fosfo nao '
-                'encontrados no conjunto de simbolos das vias (inconsistencia '
-                'intra-grafo) — nao afeta a materializacao.',
-                n_not_found_intra,
-            )
-
         logger.info(
             'ReadoutMappingService Regra 1 (fosfo): %d PathwayReadoutFeature '
-            'prontos para materializacao (vias=%s, matrix_id=%d). '
-            'NOTA: validacao de existencia no Parquet requer A->C (nao feita).',
+            'prontos para materializacao, %d nao encontrados na matriz '
+            '(vias=%s, matrix_id=%d).',
             len(features),
+            n_not_found,
             self.pathway_ids_phospho,
             phospho_matrix.id,
         )
-        return features, 0  # 0 = validacao completa nao feita (ver gatilho_ac)
+        return features, n_not_found
 
     # ─────────────────────────────────────────────────────────────────────────
     # Regra 2 — TF
@@ -471,31 +541,49 @@ class ReadoutMappingService:
         self,
         proteome_matrix: OmicMatrix | None,
         regulon_path: str | None,
-        all_pathway_symbols: set[str],
     ) -> tuple[list[PathwayReadoutFeature], int]:
         """
         Regra 2: TFs das vias × regulons CollecTRI × features da matriz proteoma.
 
         Para cada TF (gene_symbol de nó no grafo) que aparece como source no
         JSONL de regulon, para cada alvo (target_symbol) do regulon: se o alvo
-        está no conjunto de símbolos das vias (all_pathway_symbols, validação
-        intra-grafo barata), materializa PathwayReadoutFeature(
+        EXISTE na matriz proteoma (validação real via OmicMatrixFeature),
+        materializa PathwayReadoutFeature(
           node=<nó do TF>, matrix=<proteoma>, feature_key=<target_symbol>,
-          rule='tf_target', regulon_source='collectri', regulon_sign=±1,
-          confidence=<conf>).
+          rule='tf_target', regulon_source='collectri', regulon_sign=<mode>,
+          confidence=CONFIDENCE_TF_TARGET).
 
-        Estratégia de validação (Decisão 5 — A→C adiada):
-          Validação intra-grafo: alvo ∈ all_pathway_symbols (símbolos dos
-          PathwayNode das 3 vias). Não verifica presença na linha do Parquet
-          do proteoma (exigiria OmicMatrixFeature). n_features_not_found =
-          nº de alvos do regulon ausentes do all_pathway_symbols (fora das vias).
-          Gatilho A→C: validação completa (no Parquet) dispara na Fase 4.
+        Estratégia de validação (A→C concluída):
+          alvo validado contra `OmicMatrixFeature.objects.filter(
+          matrix=proteome_matrix, feature_key__in=candidatos)` — a matriz de
+          proteoma é a matriz ALVO deste readout. Os alvos de um TF são, por
+          definição, majoritariamente genes FORA da via — validar contra o
+          grafo (estratégia antiga) descartava ~95% deles; validar contra a
+          matriz real aceita ~70% (medido na ingestão live).
+          n_features_not_found = nº de alvos do regulon que NÃO existem na
+          matriz proteoma.
 
-        JSONL format esperado (produzido pelo Rust):
-          Cada linha: {"tf": "SYMBOL", "target": "SYMBOL", "sign": 1, "confidence": 0.9}
+        JSONL format REAL (produzido por
+        rust_src/src/omics/regulon_loader.rs — é lá que se confere o
+        contrato, não em exemplo de prompt/planejamento):
+          Cada linha: {"tf":"MYC","target":"TERT","mode":1,
+                       "sources":"TRRUST_CollecTRI2;NTNU...;CollecTRI",
+                       "n_references":178}
+          - `tf` (str), `target` (str): símbolos de gene.
+          - `mode` (i8): +1 estimulação / -1 inibição / 0 conflito-ou-neutro.
+            Mapeia 1:1 para PathwayReadoutFeature.regulon_sign — NÃO existe
+            campo `sign` no JSONL (nome anterior era um exemplo fictício).
+          - `sources` (str crua, `;`-delimitada): não consumida aqui.
+          - `n_references` (int): não consumida aqui — não existe campo
+            `confidence` no JSONL. Ver CONFIDENCE_TF_TARGET para a decisão
+            sobre o que gravar em PathwayReadoutFeature.confidence.
 
         Returns:
             (lista de PathwayReadoutFeature não persistidos, n_not_found)
+
+        Raises:
+            OmicMatrixFeatureNotCataloguedError: matriz proteoma sem nenhuma
+                OmicMatrixFeature catalogada (backfill não rodou).
         """
         if proteome_matrix is None or regulon_path is None:
             logger.info(
@@ -521,9 +609,10 @@ class ReadoutMappingService:
             if node.gene_symbol not in tf_nodes:
                 tf_nodes[node.gene_symbol] = node
 
-        features: list[PathwayReadoutFeature] = []
-        seen: set[tuple[int, int, str, str]] = set()
-        n_not_found = 0
+        # ── Passo 1: lê o JSONL inteiro, filtrando por TF conhecido na via ────
+        # (duas passadas: a 1ª coleta os alvos candidatos para uma única
+        # consulta batch a OmicMatrixFeature; a 2ª materializa.)
+        parsed_entries: list[tuple[PathwayNode, str, int, float]] = []
         n_regulon_lines = 0
 
         try:
@@ -546,8 +635,12 @@ class ReadoutMappingService:
 
                     tf_symbol = (entry.get('tf') or '').strip().upper()
                     target_symbol = (entry.get('target') or '').strip().upper()
-                    sign = entry.get('sign', 0)
-                    confidence = float(entry.get('confidence', 0.0))
+                    # `mode` (não `sign`) é o campo real do JSONL — ver
+                    # docstring acima / rust_src/src/omics/regulon_loader.rs.
+                    sign = entry.get('mode', 0)
+                    # Não há campo de confiança no JSONL (`n_references` é
+                    # cru, não normalizado) — usa o fixo declarado.
+                    confidence = CONFIDENCE_TF_TARGET
 
                     if not tf_symbol or not target_symbol:
                         continue
@@ -558,29 +651,7 @@ class ReadoutMappingService:
                         # TF não está nas vias (filtro tf_allowlist do loader)
                         continue
 
-                    # Validação intra-grafo: alvo ∈ all_pathway_symbols
-                    if target_symbol not in all_pathway_symbols:
-                        n_not_found += 1
-                        continue
-
-                    # Dedup por (node, matrix, feature_key, rule)
-                    key = (tf_node.id, proteome_matrix.id, target_symbol, 'tf_target')
-                    if key in seen:
-                        continue
-                    seen.add(key)
-
-                    features.append(
-                        PathwayReadoutFeature(
-                            node=tf_node,
-                            matrix=proteome_matrix,
-                            feature_key=target_symbol,
-                            rule=PathwayReadoutFeature.Rule.TF_TARGET,
-                            regulon_source='collectri',
-                            regulon_sign=int(sign),
-                            confidence=confidence,
-                            mapping_version=self.mapping_version,
-                        )
-                    )
+                    parsed_entries.append((tf_node, target_symbol, int(sign), confidence))
 
         except OSError as exc:
             logger.error(
@@ -591,11 +662,45 @@ class ReadoutMappingService:
             )
             return [], 0
 
+        # ── Passo 2: valida os alvos candidatos contra a matriz proteoma ──────
+        candidate_targets = {target for _tf_node, target, _sign, _conf in parsed_entries}
+        existing_targets = self._get_existing_feature_keys(
+            proteome_matrix, candidate_targets
+        )
+
+        # ── Passo 3: materializa apenas os alvos que existem na matriz ────────
+        features: list[PathwayReadoutFeature] = []
+        seen: set[tuple[int, int, str, str]] = set()
+        n_not_found = 0
+
+        for tf_node, target_symbol, sign, confidence in parsed_entries:
+            if target_symbol not in existing_targets:
+                n_not_found += 1
+                continue
+
+            # Dedup por (node, matrix, feature_key, rule)
+            key = (tf_node.id, proteome_matrix.id, target_symbol, 'tf_target')
+            if key in seen:
+                continue
+            seen.add(key)
+
+            features.append(
+                PathwayReadoutFeature(
+                    node=tf_node,
+                    matrix=proteome_matrix,
+                    feature_key=target_symbol,
+                    rule=PathwayReadoutFeature.Rule.TF_TARGET,
+                    regulon_source='collectri',
+                    regulon_sign=sign,
+                    confidence=confidence,
+                    mapping_version=self.mapping_version,
+                )
+            )
+
         logger.info(
             'ReadoutMappingService Regra 2 (TF): %d linhas JSONL lidas, '
-            '%d PathwayReadoutFeature prontos, %d alvos fora das vias '
-            '(n_not_found intra-grafo, vias=%s, matrix_id=%d). '
-            'NOTA: validacao no Parquet requer A->C (nao feita).',
+            '%d PathwayReadoutFeature prontos, %d alvos nao encontrados na '
+            'matriz proteoma (vias=%s, matrix_id=%d).',
             n_regulon_lines,
             len(features),
             n_not_found,

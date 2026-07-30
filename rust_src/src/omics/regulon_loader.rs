@@ -24,7 +24,7 @@
 /// | `target` | String | Símbolo UPPERCASE do alvo (`target_genesymbol`). |
 /// | `mode` | i8 | +1 (estimulação), -1 (inibição), 0 (conflito/neutro). |
 /// | `sources` | String | Coluna `sources` cru (ex.: "CollecTRI"). |
-/// | `n_references` | usize | Número de referências da coluna `references` (pipe-delimited). |
+/// | `n_references` | usize | Número de referências da coluna `references` (delimitada por `;`). |
 ///
 /// # Manifesto retornado
 ///
@@ -106,17 +106,29 @@ pub struct ReguloRow {
 
 // ─── Derivar mode_of_regulation ──────────────────────────────────────────────
 
+/// Parseia um valor booleano vindo do TSV OmniPath.
+///
+/// O OmniPath codifica booleanos de formas diferentes conforme o endpoint/versão:
+/// `"1"`/`"0"` (estilo numérico) ou `"True"`/`"False"` (estilo Python, capitalizado).
+/// Aceita ambas as codificações, case-insensitive, para não recair no bug de
+/// silenciosamente zerar todo o sinal quando a fonte muda de formato.
+///
+/// Qualquer valor não reconhecido (incluindo vazio) é tratado como falso.
+fn parse_omnipath_bool(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true")
+}
+
 /// Deriva `mode_of_regulation` das colunas `is_stimulation` e `is_inhibition`.
 ///
 /// | is_stimulation | is_inhibition | mode |
 /// |---|---|---|
-/// | 1 | 0 | +1 |
-/// | 0 | 1 | -1 |
-/// | 1 | 1 | 0 (conflito) |
-/// | 0 | 0 | 0 (neutro/desconhecido) |
+/// | 1 / True | 0 / False | +1 |
+/// | 0 / False | 1 / True | -1 |
+/// | 1 / True | 1 / True | 0 (conflito) |
+/// | 0 / False | 0 / False | 0 (neutro/desconhecido) |
 pub fn derive_mode(is_stimulation: &str, is_inhibition: &str) -> i8 {
-    let stim = is_stimulation.trim() == "1";
-    let inhib = is_inhibition.trim() == "1";
+    let stim = parse_omnipath_bool(is_stimulation);
+    let inhib = parse_omnipath_bool(is_inhibition);
     match (stim, inhib) {
         (true, false) => 1,
         (false, true) => -1,
@@ -134,7 +146,8 @@ pub fn derive_mode(is_stimulation: &str, is_inhibition: &str) -> i8 {
 /// - `is_stimulation` → contribui para mode
 /// - `is_inhibition` → contribui para mode
 /// - `sources` → cru
-/// - `references` → contagem pipe-delimited
+/// - `references` → contagem delimitada por `;` (real do OmniPath; `sources`
+///   também usa `;`, mas essa coluna é gravada crua, sem contagem)
 ///
 /// Filtra na origem: só linhas com `source_genesymbol` ∈ `tf_allowlist`.
 pub fn parse_collectri_tsv(
@@ -234,7 +247,9 @@ pub fn parse_collectri_tsv(
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
 
-        // Referências: contar pipe-delimited
+        // Referências: contam-se por ';' (delimitador real do OmniPath, ex.:
+        // "CollecTRI2:11562751;CollecTRI:10914736;..."). Entradas vazias
+        // (string vazia, ou geradas por ';' duplicado/trailing) são ignoradas.
         let n_references = refs_col
             .and_then(|c| fields.get(c))
             .map(|s| {
@@ -242,7 +257,7 @@ pub fn parse_collectri_tsv(
                 if s.is_empty() {
                     0
                 } else {
-                    s.split('|').count()
+                    s.split(';').filter(|part| !part.trim().is_empty()).count()
                 }
             })
             .unwrap_or(0);
@@ -440,16 +455,48 @@ mod tests {
 
     // ─── Fixture TSV sintética (NÃO é CollecTRI bruto — licença GPL/acadêmica) ─
     // Representa a estrutura real do endpoint OmniPath CollecTRI.
+    // Codificação numérica ("1"/"0") — mantida por retrocompatibilidade.
 
     const COLLECTRI_FIXTURE: &str = "\
 source\ttarget\tsource_genesymbol\ttarget_genesymbol\tis_directed\tis_stimulation\tis_inhibition\tconsensus_stimulation\tconsensus_inhibition\tsources\treferences\n\
-6667\t4193\tTP53\tMDM2\t1\t1\t0\t1\t0\tCollecTRI\tPMID:10000|PMID:10001|PMID:10002\n\
+6667\t4193\tTP53\tMDM2\t1\t1\t0\t1\t0\tCollecTRI\tPMID:10000;PMID:10001;PMID:10002\n\
 6667\t595\tTP53\tCCND1\t1\t0\t1\t0\t1\tCollecTRI\tPMID:20000\n\
-6667\t1026\tTP53\tCDKN1A\t1\t1\t0\t1\t0\tCollecTRI\tPMID:30000|PMID:30001\n\
+6667\t1026\tTP53\tCDKN1A\t1\t1\t0\t1\t0\tCollecTRI\tPMID:30000;PMID:30001\n\
 4609\t6667\tMYC\tTP53\t1\t0\t1\t0\t1\tCollecTRI\tPMID:40000\n\
 4609\t7157\tMYC\tTP53\t1\t1\t1\t0\t0\tCollecTRI\tPMID:50000\n\
 1387\t595\tCREBBP\tCCND1\t1\t1\t0\t1\t0\tCollecTRI\tPMID:60000\n\
 9999\t1234\tUNKNOWN_TF\tSOME_GENE\t1\t1\t0\t1\t0\tCollecTRI\tPMID:70000\n\
+";
+
+    // ─── Fixture TSV com a codificação REAL do OmniPath ("True"/"False") ──────
+    // Estrutura idêntica à fixture acima, mas com booleanos estilo Python.
+    // Regressão do bug: derive_mode comparava só contra "1"/"0" e zerava
+    // 100% do sinal quando a fonte retornava "True"/"False".
+
+    const COLLECTRI_FIXTURE_TRUE_FALSE: &str = "\
+source\ttarget\tsource_genesymbol\ttarget_genesymbol\tis_directed\tis_stimulation\tis_inhibition\tconsensus_stimulation\tconsensus_inhibition\tsources\treferences\n\
+6667\t4193\tTP53\tMDM2\tTrue\tTrue\tFalse\tTrue\tFalse\tCollecTRI\tPMID:10000;PMID:10001;PMID:10002\n\
+6667\t595\tTP53\tCCND1\tTrue\tFalse\tTrue\tFalse\tTrue\tCollecTRI\tPMID:20000\n\
+4609\t7157\tMYC\tTP53\tTrue\tTrue\tTrue\tFalse\tFalse\tCollecTRI\tPMID:50000\n\
+1387\t595\tCREBBP\tCCND1\tTrue\tFalse\tFalse\tFalse\tFalse\tCollecTRI\tPMID:60000\n\
+";
+
+    // ─── Linha real do OmniPath (dado público, 1 exemplo — não é recorte do
+    // dataset licenciado, apenas uma linha de amostra confirmada via curl) ───
+
+    const OMNIPATH_REAL_LINE_SMAD3_JUN: &str = "\
+source\ttarget\tsource_genesymbol\ttarget_genesymbol\tis_directed\tis_stimulation\tis_inhibition\tconsensus_direction\tconsensus_stimulation\tconsensus_inhibition\tsources\treferences\n\
+P84022\tP05412\tSMAD3\tJUN\tTrue\tTrue\tFalse\tTrue\tTrue\tFalse\tCollecTRI;TFactS_DoRothEA\tPMID:99999\n\
+";
+
+    // ─── Linha real do OmniPath: MYC→TERT (recorte de referências, formato
+    // real "recurso:pmid" delimitado por ';'; confirmado via curl live) ──────
+    // A resposta live completa tem ~180 referências; aqui usamos um recorte
+    // de 6 para travar a contagem correta com o delimitador real.
+
+    const OMNIPATH_REAL_LINE_MYC_TERT: &str = "\
+source\ttarget\tsource_genesymbol\ttarget_genesymbol\tis_directed\tis_stimulation\tis_inhibition\tconsensus_direction\tconsensus_stimulation\tconsensus_inhibition\tsources\treferences\n\
+P01106\tO14746\tMYC\tTERT\tTrue\tTrue\tFalse\tTrue\tTrue\tFalse\tCollecTRI;TRRUST_CollecTRI;TRRUST_DoRothEA;Pavlidis_CollecTRI2\tCollecTRI2:11562751;CollecTRI2:22617349;CollecTRI:10914736;TRRUST:22207128;TRRUST:9450935;Pavlidis:15489916\n\
 ";
 
     // ─── Testes de derive_mode ────────────────────────────────────────────────
@@ -478,6 +525,51 @@ source\ttarget\tsource_genesymbol\ttarget_genesymbol\tis_directed\tis_stimulatio
     fn test_derive_mode_whitespace() {
         assert_eq!(derive_mode(" 1 ", " 0 "), 1);
         assert_eq!(derive_mode(" 0 ", " 1 "), -1);
+    }
+
+    // ─── Regressão: codificação real "True"/"False" do OmniPath ─────────────
+
+    #[test]
+    fn test_derive_mode_true_false_stimulation() {
+        assert_eq!(derive_mode("True", "False"), 1);
+    }
+
+    #[test]
+    fn test_derive_mode_true_false_inhibition() {
+        assert_eq!(derive_mode("False", "True"), -1);
+    }
+
+    #[test]
+    fn test_derive_mode_true_false_conflict() {
+        assert_eq!(derive_mode("True", "True"), 0);
+    }
+
+    #[test]
+    fn test_derive_mode_true_false_neutral() {
+        assert_eq!(derive_mode("False", "False"), 0);
+    }
+
+    #[test]
+    fn test_derive_mode_true_false_case_insensitive() {
+        // Variações de capitalização (TRUE, true, tRuE) devem ser aceitas.
+        assert_eq!(derive_mode("TRUE", "FALSE"), 1);
+        assert_eq!(derive_mode("true", "false"), 1);
+        assert_eq!(derive_mode("FALSE", "TRUE"), -1);
+        assert_eq!(derive_mode("false", "true"), -1);
+    }
+
+    #[test]
+    fn test_derive_mode_true_false_whitespace() {
+        assert_eq!(derive_mode(" True ", " False "), 1);
+        assert_eq!(derive_mode(" False ", " True "), -1);
+    }
+
+    #[test]
+    fn test_derive_mode_empty_is_false() {
+        // Valor vazio/ausente não deve ser tratado como verdadeiro.
+        assert_eq!(derive_mode("", ""), 0);
+        assert_eq!(derive_mode("", "True"), -1);
+        assert_eq!(derive_mode("True", ""), 1);
     }
 
     // ─── Testes de parse_collectri_tsv ───────────────────────────────────────
@@ -570,13 +662,45 @@ source\ttarget\tsource_genesymbol\ttarget_genesymbol\tis_directed\tis_stimulatio
         let allowlist: HashSet<String> = HashSet::new();
         let rows = parse_collectri_tsv(COLLECTRI_FIXTURE.as_bytes(), &allowlist).unwrap();
 
-        // TP53→MDM2: "PMID:10000|PMID:10001|PMID:10002" → 3 referências
+        // TP53→MDM2: "PMID:10000;PMID:10001;PMID:10002" → 3 referências
         let tp53_mdm2 = rows.iter().find(|r| r.tf == "TP53" && r.target == "MDM2").unwrap();
         assert_eq!(tp53_mdm2.n_references, 3);
 
         // TP53→CCND1: "PMID:20000" → 1 referência
         let tp53_ccnd1 = rows.iter().find(|r| r.tf == "TP53" && r.target == "CCND1").unwrap();
         assert_eq!(tp53_ccnd1.n_references, 1);
+    }
+
+    // ─── Regressão: contagem de referências delimitadas por ';' (não '|') ────
+
+    #[test]
+    fn test_parse_collectri_n_references_semicolon_real_format() {
+        // Confirma a contagem correta com o delimitador real do OmniPath (';')
+        // e o formato real de entrada ("recurso:pmid"), usando o recorte
+        // MYC→TERT observado na ingestão live (6 referências no recorte).
+        let allowlist: HashSet<String> = HashSet::new();
+        let rows = parse_collectri_tsv(OMNIPATH_REAL_LINE_MYC_TERT.as_bytes(), &allowlist).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        let myc_tert = &rows[0];
+        assert_eq!(myc_tert.tf, "MYC");
+        assert_eq!(myc_tert.target, "TERT");
+        assert_eq!(myc_tert.n_references, 6);
+        // Sinal: is_stimulation=True, is_inhibition=False → mode=+1
+        assert_eq!(myc_tert.mode, 1);
+    }
+
+    #[test]
+    fn test_parse_collectri_n_references_ignores_empty_segments() {
+        // ';' duplicado ou trailing não deve inflar a contagem com entradas vazias.
+        let tsv = "\
+source\ttarget\tsource_genesymbol\ttarget_genesymbol\tis_directed\tis_stimulation\tis_inhibition\tsources\treferences\n\
+6667\t4193\tTP53\tMDM2\t1\t1\t0\tCollecTRI\tPMID:1;;PMID:2;\n\
+";
+        let allowlist: HashSet<String> = HashSet::new();
+        let rows = parse_collectri_tsv(tsv.as_bytes(), &allowlist).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].n_references, 2);
     }
 
     #[test]
@@ -593,6 +717,51 @@ source\ttarget\tsource_genesymbol\ttarget_genesymbol\tis_directed\tis_stimulatio
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tf, "TP53"); // normalizado
         assert_eq!(rows[0].target, "MDM2"); // normalizado
+    }
+
+    // ─── Testes ponta-a-ponta com a codificação real "True"/"False" ──────────
+    // Regressão do bug: 100% dos regulons saíam com mode=0 (n_neutral=5915)
+    // porque derive_mode só reconhecia "1"/"0".
+
+    #[test]
+    fn test_parse_collectri_true_false_encoding_end_to_end() {
+        let allowlist: HashSet<String> = HashSet::new();
+        let rows = parse_collectri_tsv(COLLECTRI_FIXTURE_TRUE_FALSE.as_bytes(), &allowlist).unwrap();
+
+        assert_eq!(rows.len(), 4);
+
+        let tp53_mdm2 = rows.iter().find(|r| r.tf == "TP53" && r.target == "MDM2").unwrap();
+        assert_eq!(tp53_mdm2.mode, 1, "is_stimulation=True/is_inhibition=False deve dar mode=+1");
+
+        let tp53_ccnd1 = rows.iter().find(|r| r.tf == "TP53" && r.target == "CCND1").unwrap();
+        assert_eq!(tp53_ccnd1.mode, -1, "is_stimulation=False/is_inhibition=True deve dar mode=-1");
+
+        let myc_tp53 = rows.iter().find(|r| r.tf == "MYC" && r.target == "TP53").unwrap();
+        assert_eq!(myc_tp53.mode, 0, "is_stimulation=True/is_inhibition=True (conflito) deve dar mode=0");
+
+        let crebbp_ccnd1 = rows.iter().find(|r| r.tf == "CREBBP" && r.target == "CCND1").unwrap();
+        assert_eq!(crebbp_ccnd1.mode, 0, "is_stimulation=False/is_inhibition=False (neutro) deve dar mode=0");
+
+        // Nenhuma linha deve virar mode=0 apenas por má-interpretação da codificação:
+        // das 4 linhas, 2 têm sinal (TP53→MDM2 e TP53→CCND1).
+        let n_signed = rows.iter().filter(|r| r.mode != 0).count();
+        assert_eq!(n_signed, 2);
+    }
+
+    #[test]
+    fn test_parse_collectri_real_smad3_jun_line() {
+        // Linha real do OmniPath (SMAD3→JUN), confirmada via curl live.
+        let allowlist: HashSet<String> = HashSet::new();
+        let rows = parse_collectri_tsv(OMNIPATH_REAL_LINE_SMAD3_JUN.as_bytes(), &allowlist).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.tf, "SMAD3");
+        assert_eq!(row.target, "JUN");
+        // is_stimulation=True, is_inhibition=False → mode=+1
+        assert_eq!(row.mode, 1);
+        assert_eq!(row.sources, "CollecTRI;TFactS_DoRothEA");
+        assert_eq!(row.n_references, 1);
     }
 
     // ─── Testes de JSONL ─────────────────────────────────────────────────────

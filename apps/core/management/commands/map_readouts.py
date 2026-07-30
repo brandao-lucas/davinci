@@ -20,11 +20,15 @@ Pré-condições (em ordem de execução):
 
 Sem endpoint HTTP (só management command).
 
-Estratégia de validação de existência (Decisão 5 — A→C adiada):
-  Validação intra-grafo: feature_key validada contra PathwayNode.gene_symbol
-  em PG. A validação completa (feature existe no Parquet) exige promoção A→C
-  (OmicMatrixFeature). O campo 'gatilho_ac' do relatório sempre é True na
-  Fase 3 — sinalizar ao cartografo se a Fase 4 exigir validação no Parquet.
+Estratégia de validação de existência (A→C concluída — migration 0036):
+  feature_key validada contra `OmicMatrixFeature` da MATRIZ ALVO (fosfo para
+  a Regra 1, proteoma para a Regra 2), não mais contra o grafo KEGG. Ver
+  readout_mapping_service.py para a justificativa completa.
+
+  Pré-condição adicional: a matriz alvo precisa ter `OmicMatrixFeature`
+  catalogado (rode `backfill_matrix_features` antes). Se estiver vazio, o
+  mapeamento falha alto (OmicMatrixFeatureNotCataloguedError) em vez de
+  degradar silenciosamente para a validação intra-grafo antiga.
 
 Idempotência:
   bulk_create(ignore_conflicts=True) — seguro re-rodar. PathwayNode.readout_role
@@ -113,9 +117,9 @@ class Command(BaseCommand):
         self.stdout.write('  3. load_pathway_topology (ambas as regras)')
         self.stdout.write('  4. load_regulons (Regra 2)')
         self.stdout.write(
-            '\nEstrategia de validacao: intra-grafo (PathwayNode.gene_symbol '
-            'em PG). Validacao no Parquet exige A->C — ver gatilho_ac no '
-            'relatorio.'
+            '\nEstrategia de validacao: OmicMatrixFeature da matriz alvo '
+            '(fosfo/proteoma). Requer backfill_matrix_features previamente '
+            'executado para as matrizes envolvidas.'
         )
         self.stdout.write('')
 
@@ -128,7 +132,12 @@ class Command(BaseCommand):
             )
             report = service.run()
         except ReadoutMappingError as exc:
-            raise CommandError(f'Pre-condicao nao satisfeita: {exc}') from exc
+            raise CommandError(
+                f'Pre-condicao nao satisfeita: {exc}\n'
+                f'Se o erro mencionar OmicMatrixFeature vazio, rode '
+                f'`manage.py backfill_matrix_features` para a matriz '
+                f'indicada antes de tentar novamente.'
+            ) from exc
         except Exception as exc:
             raise CommandError(f'Mapeamento falhou: {exc}') from exc
 
@@ -153,11 +162,6 @@ class Command(BaseCommand):
         self.stdout.write(f'  proteome_matrix_id:  {report["proteome_matrix_id"]}')
         self.stdout.write(f'  regulon_path_found:  {report["regulon_path_found"]}')
         self.stdout.write('')
-        self.stdout.write(
-            f'  gatilho_ac: {report["gatilho_ac"]} '
-            f'(validacao completa no Parquet requer OmicMatrixFeature — '
-            f'handoff para cartografo na Fase 4 se necessario)'
-        )
         self.stdout.write(f'  estrategia: {report["validation_strategy"]}')
 
         if not dry_run:

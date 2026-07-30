@@ -8,6 +8,7 @@ pub mod geo_parser;
 pub mod gwas_parser;
 pub mod kegg_topology_loader;
 pub mod maf_loader;
+pub mod matrix_feature_catalog;
 pub mod matrix_loader;
 pub mod models;
 pub mod pride_parser;

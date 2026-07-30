@@ -38,7 +38,16 @@
 /// # Manifesto retornado
 ///
 /// `KeygTopologyManifest { n_pathways, n_nodes, n_edges, n_signed, n_unsigned, n_orphan_symbols, source_version }`
-
+///
+/// # Tipos de PK/FK (bug de produção corrigido — Fase 3)
+///
+/// Django usa `BigAutoField` para todas as PKs. Logo `core_pathway.id`,
+/// `core_pathwaynode.id`/`pathway_id`, e `core_pathwayedge.id`/`pathway_id`/
+/// `source_node_id`/`target_node_id` são **`bigint`** no Postgres — nunca `int4`.
+/// `tokio-postgres` é estrito com tipos: ler uma coluna `int8` como `i32` causa
+/// `PanicException` em runtime (não é pego por `cargo check`/testes com mock).
+/// Toda leitura de PK/FK neste módulo **deve** usar `i64`, e qualquer tabela
+/// temp de staging que receba essas colunas deve ser `BIGINT`, não `INT`.
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
@@ -471,12 +480,19 @@ async fn download_kgml(
 /// Insere ou atualiza um `Pathway` em `core_pathway` (ON CONFLICT kegg_id).
 ///
 /// Retorna o `id` da linha (novo ou existente).
+///
+/// # Nota de tipo (bug de produção — Fase 3)
+///
+/// Django usa `BigAutoField` para PKs → todas as PKs/FKs de
+/// `core_pathway`/`core_pathwaynode`/`core_pathwayedge` são `bigint` no Postgres.
+/// `tokio-postgres` é estrito com tipos (`int8` não desserializa em `i32`, causa
+/// `PanicException`). Por isso este loader lê **todas** as PKs/FKs como `i64`.
 async fn upsert_pathway(
     client: &Client,
     kegg_id: &str,
     name: &str,
     source_version: &str,
-) -> Result<i32, String> {
+) -> Result<i64, String> {
     let row = client
         .query_one(
             r#"
@@ -493,7 +509,7 @@ async fn upsert_pathway(
         .await
         .map_err(|e| format!("upsert_pathway '{}': {}", kegg_id, e))?;
 
-    Ok(row.get::<_, i32>(0))
+    Ok(row.get::<_, i64>(0))
 }
 
 /// COPY UPSERT dos nós em `core_pathwaynode`.
@@ -502,14 +518,31 @@ async fn upsert_pathway(
 /// Retorna mapa `kegg_entry_id → node_pk (id)`.
 async fn copy_upsert_nodes(
     client: &Client,
-    pathway_id: i32,
+    pathway_id: i64,
     nodes: &[ParsedNode],
-) -> Result<HashMap<String, i32>, String> {
+) -> Result<HashMap<String, i64>, String> {
     if nodes.is_empty() {
         return Ok(HashMap::new());
     }
 
-    // Criar tabela temp para staging
+    // Criar tabela temp para staging.
+    //
+    // Sem `ON COMMIT DROP` (bug de produção — Fase 3): fora de uma transação
+    // explícita, `CREATE TEMP TABLE ... ON COMMIT DROP` roda em sua própria
+    // transação implícita e a tabela é descartada no commit implícito antes do
+    // `copy_in` seguinte, causando dessincronia de protocolo
+    // ("unexpected message from server"). Espelha o padrão comprovado em
+    // `cnv_seed_derivation.rs`: DROP + CREATE TEMP TABLE simples.
+    //
+    // `DROP TABLE IF EXISTS` também é essencial para o loop de múltiplas vias
+    // (`load_kegg_topology_async` processa N pathways na mesma sessão): sem
+    // dropar/recriar a cada iteração, a staging table persistiria entre vias
+    // e contaminaria o UPSERT da via seguinte com linhas da anterior.
+    client
+        .execute("DROP TABLE IF EXISTS _kegg_node_stage", &[])
+        .await
+        .map_err(|e| format!("DROP staging nodes: {}", e))?;
+
     client
         .execute(
             "CREATE TEMP TABLE _kegg_node_stage (
@@ -518,7 +551,7 @@ async fn copy_upsert_nodes(
                 kegg_ids TEXT,
                 gene_symbol VARCHAR(50),
                 graphics_name VARCHAR(255)
-            ) ON COMMIT DROP",
+            )",
             &[],
         )
         .await
@@ -563,9 +596,9 @@ async fn copy_upsert_nodes(
     sink.send(Bytes::from(data))
         .await
         .map_err(|e| format!("COPY send node stage: {}", e))?;
-    sink.close()
+    sink.finish()
         .await
-        .map_err(|e| format!("COPY close node stage: {}", e))?;
+        .map_err(|e| format!("COPY finish node stage: {}", e))?;
 
     // Upsert da staging → core_pathwaynode
     client
@@ -604,10 +637,10 @@ async fn copy_upsert_nodes(
         .await
         .map_err(|e| format!("SELECT node PKs: {}", e))?;
 
-    let mut map: HashMap<String, i32> = HashMap::with_capacity(rows.len());
+    let mut map: HashMap<String, i64> = HashMap::with_capacity(rows.len());
     for row in rows {
         let eid: String = row.get(0);
-        let pk: i32 = row.get(1);
+        let pk: i64 = row.get(1);
         map.insert(eid, pk);
     }
 
@@ -620,25 +653,35 @@ async fn copy_upsert_nodes(
 /// Arestas com entry_id não resolvido são logadas e descartadas.
 async fn copy_upsert_edges(
     client: &Client,
-    pathway_id: i32,
+    pathway_id: i64,
     edges: &[ParsedEdge],
-    node_id_map: &HashMap<String, i32>,
+    node_id_map: &HashMap<String, i64>,
 ) -> Result<usize, String> {
     if edges.is_empty() {
         return Ok(0);
     }
 
-    // Criar tabela temp
+    // Criar tabela temp.
+    // source_node_id/target_node_id são BIGINT: FKs para core_pathwaynode.id (BigAutoField).
+    //
+    // Sem `ON COMMIT DROP` — mesmo motivo do node stage acima (dessincronia de
+    // protocolo COPY fora de transação explícita) e mesmo `DROP TABLE IF EXISTS`
+    // para evitar contaminação entre vias no loop de múltiplas vias.
+    client
+        .execute("DROP TABLE IF EXISTS _kegg_edge_stage", &[])
+        .await
+        .map_err(|e| format!("DROP staging edges: {}", e))?;
+
     client
         .execute(
             "CREATE TEMP TABLE _kegg_edge_stage (
-                source_node_id INT,
-                target_node_id INT,
+                source_node_id BIGINT,
+                target_node_id BIGINT,
                 sign SMALLINT,
                 relation_type VARCHAR(20),
                 subtypes TEXT,
                 interaction VARCHAR(20)
-            ) ON COMMIT DROP",
+            )",
             &[],
         )
         .await
@@ -716,9 +759,9 @@ async fn copy_upsert_edges(
     sink.send(Bytes::from(data))
         .await
         .map_err(|e| format!("COPY send edge stage: {}", e))?;
-    sink.close()
+    sink.finish()
         .await
-        .map_err(|e| format!("COPY close edge stage: {}", e))?;
+        .map_err(|e| format!("COPY finish edge stage: {}", e))?;
 
     // Upsert da staging → core_pathwayedge
     let n_inserted = client
@@ -751,7 +794,7 @@ async fn copy_upsert_edges(
 /// Atualiza contagens em `core_pathway` após inserção de nós/arestas.
 async fn update_pathway_counts(
     client: &Client,
-    pathway_id: i32,
+    pathway_id: i64,
 ) -> Result<(), String> {
     client
         .execute(
@@ -953,6 +996,297 @@ mod tests {
         <subtype name="inhibition" value="--|"/>
     </relation>
 </pathway>"##;
+
+    // ─── Regressão de tipo PK/FK: bigint (Django BigAutoField) → i64 ─────────
+    //
+    // Bug de produção (primeira ingestão live da Fase 3): ler colunas `int8`
+    // (bigint) do Postgres como `i32` faz `tokio-postgres` estourar
+    // `pyo3_runtime::PanicException` em runtime — testes com mock não pegam
+    // isso porque nunca tocam um Postgres de verdade.
+    //
+    // Esta função nunca é chamada em nenhum teste (`#[allow(dead_code)]`):
+    // ela existe só para fixar o contrato de tipo por checagem estática do
+    // compilador. Se alguém reintroduzir `i32` em qualquer leitura/parâmetro
+    // de PK/FK de `upsert_pathway` / `copy_upsert_nodes` / `copy_upsert_edges`
+    // / `update_pathway_counts`, `cargo test` deixa de compilar aqui.
+    #[allow(dead_code)]
+    async fn _typecheck_kegg_pk_fk_are_i64(client: &Client, edges: &[ParsedEdge]) {
+        let pathway_id: i64 = upsert_pathway(client, "hsa00000", "title", "2026-01-01")
+            .await
+            .unwrap();
+        let node_id_map: HashMap<String, i64> =
+            copy_upsert_nodes(client, pathway_id, &[]).await.unwrap();
+        let _n_edges: usize = copy_upsert_edges(client, pathway_id, edges, &node_id_map)
+            .await
+            .unwrap();
+        update_pathway_counts(client, pathway_id).await.unwrap();
+    }
+
+    // ─── Teste de integração (requer Postgres real com schema Django) ───────
+    //
+    // Roda contra um `DATABASE_URL` com o schema Django migrado
+    // (`core_pathway`/`core_pathwaynode`/`core_pathwayedge`). Reproduz o bug
+    // original ponta-a-ponta: se as PKs/FKs voltarem a ser lidas como `i32`,
+    // este teste panica com o mesmo `PanicException` visto em produção.
+    //
+    // Exemplo de execução local:
+    // ```
+    // DATABASE_URL="postgres://user:pass@localhost:5432/davinci" \
+    //     cargo test --lib omics::kegg_topology_loader -- --ignored
+    // ```
+    #[tokio::test]
+    #[ignore = "requer DATABASE_URL apontando para Postgres com schema Django migrado"]
+    async fn integration_pk_fk_roundtrip_against_real_db() {
+        let db_url = std::env::var("DATABASE_URL")
+            .expect("defina DATABASE_URL para rodar este teste de integração");
+
+        let (client, connection) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+            .await
+            .expect("falha ao conectar em DATABASE_URL");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        // kegg_id é VARCHAR(20) no schema (migration 0035) — manter curto.
+        let kegg_id = "test_i64regr";
+
+        let pathway_id = upsert_pathway(&client, kegg_id, "i64 regression test pathway", "test")
+            .await
+            .expect("upsert_pathway não deve panicar ao ler o id bigint de core_pathway");
+
+        let node = ParsedNode {
+            kegg_entry_id: "1".to_string(),
+            node_type: "gene".to_string(),
+            kegg_ids: vec!["hsa:0".to_string()],
+            gene_symbol: "TESTGENE".to_string(),
+            graphics_name: "TESTGENE".to_string(),
+        };
+        let node_id_map = copy_upsert_nodes(&client, pathway_id, std::slice::from_ref(&node))
+            .await
+            .expect("copy_upsert_nodes não deve panicar ao ler PKs bigint de core_pathwaynode");
+        assert!(node_id_map.contains_key("1"));
+
+        let edge = ParsedEdge {
+            source_entry_id: "1".to_string(),
+            target_entry_id: "1".to_string(),
+            relation_type: "pprel".to_string(),
+            subtypes: vec!["activation".to_string()],
+            sign: 1,
+            interaction: "activation".to_string(),
+        };
+        copy_upsert_edges(&client, pathway_id, &[edge], &node_id_map)
+            .await
+            .expect("copy_upsert_edges não deve panicar com FKs bigint");
+
+        update_pathway_counts(&client, pathway_id)
+            .await
+            .expect("update_pathway_counts não deve panicar com id bigint");
+
+        // Limpeza. `on_delete=CASCADE` no model Django é só ORM-level (não é
+        // `ON DELETE CASCADE` no schema do Postgres) — DELETE direto via SQL
+        // precisa apagar edges/nodes antes do pathway ou a FK rejeita e o
+        // `let _ =` engoliria o erro, deixando lixo de teste no banco.
+        let _ = client
+            .execute(
+                "DELETE FROM core_pathwayedge WHERE pathway_id = $1",
+                &[&pathway_id],
+            )
+            .await;
+        let _ = client
+            .execute(
+                "DELETE FROM core_pathwaynode WHERE pathway_id = $1",
+                &[&pathway_id],
+            )
+            .await;
+        let _ = client
+            .execute("DELETE FROM core_pathway WHERE kegg_id = $1", &[&kegg_id])
+            .await;
+    }
+
+    // ─── Teste de integração: duas vias em sequência, mesma sessão ──────────
+    //
+    // Reproduz o segundo bug de runtime (Fase 3, ingestão live): `ON COMMIT DROP`
+    // fora de transação explícita causava dessincronia de protocolo COPY logo na
+    // primeira via. O fix (DROP TABLE IF EXISTS + CREATE TEMP TABLE simples a
+    // cada chamada) também precisa garantir que a staging table não vaze linhas
+    // de uma via para a próxima dentro do mesmo `client` — exatamente o padrão
+    // do loop real em `load_kegg_topology_async` (N vias, uma conexão).
+    //
+    // Exemplo de execução local:
+    // ```
+    // DATABASE_URL="postgres://user:pass@localhost:5432/davinci" \
+    //     cargo test --lib omics::kegg_topology_loader -- --ignored
+    // ```
+    #[tokio::test]
+    #[ignore = "requer DATABASE_URL apontando para Postgres com schema Django migrado"]
+    async fn integration_two_pathways_sequential_no_staging_contamination_against_real_db() {
+        let db_url = std::env::var("DATABASE_URL")
+            .expect("defina DATABASE_URL para rodar este teste de integração");
+
+        let (client, connection) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+            .await
+            .expect("falha ao conectar em DATABASE_URL");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        // kegg_id é VARCHAR(20) no schema (migration 0035) — manter curto.
+        let kegg_id_a = "test_stage_a";
+        let kegg_id_b = "test_stage_b";
+
+        // Limpeza prévia best-effort (idempotência caso uma execução anterior
+        // tenha falhado no meio e deixado dados residuais). Apaga edges/nodes
+        // antes do pathway — a FK não tem `ON DELETE CASCADE` no schema
+        // (Django `on_delete=CASCADE` é só ORM-level).
+        let _ = client
+            .execute(
+                "DELETE FROM core_pathwayedge WHERE pathway_id IN
+                    (SELECT id FROM core_pathway WHERE kegg_id IN ($1, $2))",
+                &[&kegg_id_a, &kegg_id_b],
+            )
+            .await;
+        let _ = client
+            .execute(
+                "DELETE FROM core_pathwaynode WHERE pathway_id IN
+                    (SELECT id FROM core_pathway WHERE kegg_id IN ($1, $2))",
+                &[&kegg_id_a, &kegg_id_b],
+            )
+            .await;
+        let _ = client
+            .execute(
+                "DELETE FROM core_pathway WHERE kegg_id IN ($1, $2)",
+                &[&kegg_id_a, &kegg_id_b],
+            )
+            .await;
+
+        // ── Via A: 1 nó, 1 aresta (self-loop) ──
+        let pathway_id_a = upsert_pathway(&client, kegg_id_a, "via A", "test")
+            .await
+            .expect("upsert_pathway via A");
+
+        let node_a = ParsedNode {
+            kegg_entry_id: "1".to_string(),
+            node_type: "gene".to_string(),
+            kegg_ids: vec!["hsa:100".to_string()],
+            gene_symbol: "GENEA".to_string(),
+            graphics_name: "GENEA".to_string(),
+        };
+        let node_map_a = copy_upsert_nodes(&client, pathway_id_a, std::slice::from_ref(&node_a))
+            .await
+            .expect("copy_upsert_nodes via A");
+        assert_eq!(node_map_a.len(), 1);
+
+        let edge_a = ParsedEdge {
+            source_entry_id: "1".to_string(),
+            target_entry_id: "1".to_string(),
+            relation_type: "pprel".to_string(),
+            subtypes: vec!["activation".to_string()],
+            sign: 1,
+            interaction: "activation".to_string(),
+        };
+        let n_edges_a = copy_upsert_edges(&client, pathway_id_a, &[edge_a], &node_map_a)
+            .await
+            .expect("copy_upsert_edges via A");
+        assert_eq!(n_edges_a, 1);
+        update_pathway_counts(&client, pathway_id_a)
+            .await
+            .expect("update_pathway_counts via A");
+
+        // ── Via B: 2 nós, 1 aresta — mesma conexão `client`, mesma sessão ──
+        // Reutiliza deliberadamente o `kegg_entry_id="1"` (natural key é por
+        // pathway, então não colide), mas com `node_type` e `gene_symbol`
+        // diferentes de A: se a staging vazasse a linha de A, o node_map_b
+        // teria 3 entradas em vez de 2, ou a linha residual seria puxada na
+        // query de resolução de PK (SELECT ... WHERE pathway_id = $1 já
+        // protege contra isso a nível de core_pathwaynode, mas o tamanho do
+        // COPY IN e o INSERT ... SELECT FROM stage não estariam isolados).
+        let pathway_id_b = upsert_pathway(&client, kegg_id_b, "via B", "test")
+            .await
+            .expect("upsert_pathway via B");
+
+        let node_b1 = ParsedNode {
+            kegg_entry_id: "1".to_string(),
+            node_type: "compound".to_string(),
+            kegg_ids: vec!["cpd:200".to_string()],
+            gene_symbol: String::new(),
+            graphics_name: "CPDB".to_string(),
+        };
+        let node_b2 = ParsedNode {
+            kegg_entry_id: "2".to_string(),
+            node_type: "gene".to_string(),
+            kegg_ids: vec!["hsa:201".to_string()],
+            gene_symbol: "GENEB".to_string(),
+            graphics_name: "GENEB".to_string(),
+        };
+        let node_map_b = copy_upsert_nodes(&client, pathway_id_b, &[node_b1, node_b2])
+            .await
+            .expect("copy_upsert_nodes via B");
+        assert_eq!(
+            node_map_b.len(),
+            2,
+            "staging de nodes contaminada entre vias: mapa de B não deve conter resíduo de A"
+        );
+
+        let edge_b = ParsedEdge {
+            source_entry_id: "1".to_string(),
+            target_entry_id: "2".to_string(),
+            relation_type: "pprel".to_string(),
+            subtypes: vec!["inhibition".to_string()],
+            sign: -1,
+            interaction: "inhibition".to_string(),
+        };
+        let n_edges_b = copy_upsert_edges(&client, pathway_id_b, &[edge_b], &node_map_b)
+            .await
+            .expect("copy_upsert_edges via B");
+        assert_eq!(
+            n_edges_b, 1,
+            "staging de edges contaminada entre vias: contagem de B não deve incluir resíduo de A"
+        );
+        update_pathway_counts(&client, pathway_id_b)
+            .await
+            .expect("update_pathway_counts via B");
+
+        // Verificação direta no banco: pathway B isolado de A.
+        let count_nodes_b: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM core_pathwaynode WHERE pathway_id = $1",
+                &[&pathway_id_b],
+            )
+            .await
+            .expect("count nodes B")
+            .get(0);
+        assert_eq!(count_nodes_b, 2);
+
+        let count_edges_b: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM core_pathwayedge WHERE pathway_id = $1",
+                &[&pathway_id_b],
+            )
+            .await
+            .expect("count edges B")
+            .get(0);
+        assert_eq!(count_edges_b, 1);
+
+        // Limpeza (edges/nodes antes do pathway — sem CASCADE no DB, ver nota acima).
+        let _ = client
+            .execute(
+                "DELETE FROM core_pathwayedge WHERE pathway_id IN ($1, $2)",
+                &[&pathway_id_a, &pathway_id_b],
+            )
+            .await;
+        let _ = client
+            .execute(
+                "DELETE FROM core_pathwaynode WHERE pathway_id IN ($1, $2)",
+                &[&pathway_id_a, &pathway_id_b],
+            )
+            .await;
+        let _ = client
+            .execute(
+                "DELETE FROM core_pathway WHERE kegg_id IN ($1, $2)",
+                &[&kegg_id_a, &kegg_id_b],
+            )
+            .await;
+    }
 
     // ─── Testes de §Sinal ─────────────────────────────────────────────────────
 

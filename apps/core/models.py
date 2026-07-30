@@ -1102,9 +1102,10 @@ class OmicMatrix(models.Model):
     (cópia textual do `matrix_pointer` consumido), `checksum_md5` (integridade do
     artefato), `loaded_at` e `loader_version` (qual versão do loader produziu).
 
-    NOTA (escopo estrito): NÃO há `OmicMatrixFeature` aqui. A promoção A→C
-    (eixo de features indexado no PG, para consultar feature sem abrir o Parquet)
-    é migration aditiva FUTURA, com gatilho na Fase 3 — não construir agora.
+    NOTA (histórico do schema): a promoção A→C — eixo de features indexado no
+    PG, para consultar feature sem abrir o Parquet — foi executada na Fase 3
+    (migration 0036) e vive em `OmicMatrixFeature` (abaixo). O corpo numérico
+    continua exclusivamente no Parquet; só o CATÁLOGO de features subiu ao PG.
     """
 
     class DataFormatLevel(models.TextChoices):
@@ -1244,6 +1245,78 @@ class OmicMatrix(models.Model):
             f"{self.dataset.accession} · {self.omics_layer}/{self.feature_axis} "
             f"[{self.loader_version}]"
         )
+
+
+class OmicMatrixFeature(models.Model):
+    """
+    Catálogo de uma LINHA da matriz Parquet — eixo de features indexado no PG.
+
+    OmnisPathway Objetivo 2, Fase 3 (promoção A→C, migration 0036). É o análogo
+    de `OmicMatrixSample` no eixo oposto: onde aquele mapeia a COLUNA
+    (`column_index` → amostra), este cataloga a LINHA (`row_index` →
+    `feature_key`). Existe para responder, sem abrir o Parquet, "dada esta
+    matriz e um conjunto de símbolos, quais existem?" — a validação de
+    existência do mapeamento readout→feature (Fase 3) e, na Fase 4, "qual o
+    `row_index` desta feature" para leitura posicional do artefato.
+
+    Escopo: catálogo, não corpo numérico. NENHUM valor da matriz sobe ao
+    Postgres — a densa continua exclusivamente no Parquet (`storage_key`).
+
+    Isolamento por usuário se dá pelo caminho `matrix__dataset` +
+    `ProjectDataset` (idêntico a `OmicMatrixSample`): a tabela é por MATRIZ,
+    não por projeto.
+
+    Gravação é responsabilidade do loader (COPY/UPSERT por (matrix,
+    feature_key) durante a carga), NÃO deste model — espelha o padrão de
+    `OmicMatrixSample`/`SampleSraRun`. É derivado do artefato: delete/regeração
+    permitidos.
+    """
+
+    matrix = models.ForeignKey(
+        OmicMatrix,
+        on_delete=models.CASCADE,
+        related_name='features',
+        help_text='Matriz a que esta linha pertence.'
+    )
+    feature_key = models.CharField(
+        'Chave da Feature',
+        max_length=128,
+        help_text='Feature como aparece na matriz, UPPERCASE: símbolo de gene '
+                  '(TP53) ou fosfo-sítio (TP53_S15). Mesmo vocabulário de '
+                  'PathwayReadoutFeature.feature_key.'
+    )
+    row_index = models.PositiveIntegerField(
+        'Índice da Linha',
+        help_text='Posição 0-based da linha no artefato Parquet.'
+    )
+
+    class Meta:
+        constraints = [
+            # Chave natural: uma feature aparece uma vez por matriz →
+            # ON CONFLICT DO UPDATE do COPY do loader e idempotência da carga.
+            # Cobre também a query QUENTE do mapeamento ("destes símbolos,
+            # quais existem nesta matriz?" = matrix + feature_key IN (...)),
+            # dispensando índice extra no FK matrix e em (matrix, feature_key).
+            models.UniqueConstraint(
+                fields=['matrix', 'feature_key'],
+                name='omicmatrixfeature_matrix_feature_uniq',
+            ),
+            # Posição da linha é única dentro de uma matriz (não há duas
+            # features na mesma linha) — espelha
+            # omicmatrixsample_matrix_column_uniq.
+            models.UniqueConstraint(
+                fields=['matrix', 'row_index'],
+                name='omicmatrixfeature_matrix_row_uniq',
+            ),
+        ]
+        # Sem índice em `feature_key` isolado: o consumidor atual sempre filtra
+        # por matriz (prefixo da NK). Consulta cross-matriz ("em que matrizes
+        # TP53 existe?") só ganha índice quando virar caminho real.
+        verbose_name = 'Omic matrix feature'
+        verbose_name_plural = 'Omic matrix features'
+
+    def __str__(self):
+        return f"{self.matrix_id} · row {self.row_index} → {self.feature_key}"
 
 
 class OmicMatrixSample(models.Model):

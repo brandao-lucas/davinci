@@ -19,21 +19,34 @@ Casos cobertos (plano passo 3.5):
       com contadores; idempotência (job ativo → PathwayTopologyJobActiveError).
   3.3 regulon: tf_allowlist derivada dos nós gene das vias; RegulonGraphNotLoadedError
       se grafo não carregado; guarda regulon_path.
-  3.4 mapeamento: Regra 1 fosfo → readout_role='phospho' + PathwayReadoutFeature(rule='phospho');
-      Regra 2 TF → readout_role='tf_target' + PathwayReadoutFeature(rule='tf_target',
-      regulon_sign=±1, regulon_source='collectri'); --dry-run NÃO persiste;
-      idempotência (2ª execução não duplica pela NK); gatilho_ac=True sempre;
-      n_features_not_found reflete alvos fora das vias (validação intra-grafo).
+  3.4 mapeamento (A→C concluída — migration 0036, OmicMatrixFeature): Regra 1
+      fosfo → readout_role='phospho' + PathwayReadoutFeature(rule='phospho'),
+      validado contra o catálogo de features da matriz de fosfo (não mais
+      contra o grafo); Regra 2 TF → readout_role='tf_target' +
+      PathwayReadoutFeature(rule='tf_target', regulon_sign=mode do JSONL
+      (+1/-1/0), regulon_source='collectri'), validado contra o catálogo de
+      features da matriz de proteoma — inclusive alvos que NÃO são nó de
+      nenhuma via (o coração do footprint de TF); --dry-run NÃO persiste;
+      idempotência (2ª execução não duplica pela NK);
+      n_features_not_found reflete símbolos fora da MATRIZ alvo (não mais
+      fora das vias); OmicMatrixFeature vazia para a matriz a validar →
+      OmicMatrixFeatureNotCataloguedError (falha alta, sem degradar para a
+      validação intra-grafo antiga).
   Tasks: run_phospho_matrix_load trata PhosphoMatrixAlreadyLoadedError como
       idempotência (COMPLETED); run_regulon_load trata RegulonGraphNotLoadedError
       sem retry.
   Isolamento: PhosphoMatrix project-scoped; grafo/readout é catálogo global.
+  MatrixFeatureCatalogService / backfill_matrix_features: popula
+      OmicMatrixFeature a partir do Parquet já carregado; idempotência
+      (UPSERT), --dry-run não persiste, MatrixFeatureCountMismatchError se a
+      contagem catalogada divergir de OmicMatrix.n_features.
 
 Padrões obrigatórios:
   - SEM rede: rust_engine SEMPRE mockado (patch.dict sys.modules).
   - SEM pytest: usa django.test.TestCase.
   - OmicSample é COMPARTILHADA entre matrizes (get_or_create por accession).
-  - JSONL de regulon fake local (não CollecTRI bruto).
+  - JSONL de regulon fake local (não CollecTRI bruto), usando o contrato REAL
+    do produtor (tf/target/mode/sources/n_references — NÃO 'sign').
   - default_storage mockado com FileSystemStorage em tmpdir.
 """
 
@@ -55,6 +68,7 @@ from apps.core.models import (
     IngestionJob,
     OmicDataset,
     OmicMatrix,
+    OmicMatrixFeature,
     OmicMatrixSample,
     OmicSample,
     Pathway,
@@ -253,10 +267,31 @@ def _write_regulon_jsonl(
     path: str,
     entries: list[dict],
 ) -> None:
-    """Escreve arquivo JSONL de regulon sintético em path."""
+    """
+    Escreve arquivo JSONL de regulon sintético em path.
+
+    Contrato REAL (rust_src/src/omics/regulon_loader.rs):
+      {"tf": str, "target": str, "mode": int (+1/-1/0),
+       "sources": str (';'-delimitada), "n_references": int}.
+    NÃO existe campo 'sign' nem 'confidence' — usar 'mode' e nunca inventar
+    campos que o loader Rust não produz (lição da sessão: mock com formato
+    presumido não pega bug de formato).
+    """
     with open(path, 'w', encoding='utf-8') as f:
         for entry in entries:
             f.write(json.dumps(entry) + '\n')
+
+
+def _make_matrix_features(matrix: OmicMatrix, feature_keys: list[str]) -> None:
+    """
+    Cria `OmicMatrixFeature` (catálogo A→C, migration 0036) para cada
+    feature_key na `matrix` dada — simula o `backfill_matrix_features` já
+    executado para esta matriz. UPPERCASE, `row_index` sequencial.
+    """
+    OmicMatrixFeature.objects.bulk_create([
+        OmicMatrixFeature(matrix=matrix, feature_key=key.upper(), row_index=idx)
+        for idx, key in enumerate(feature_keys)
+    ])
 
 
 # =============================================================================
@@ -932,6 +967,10 @@ class ReadoutMappingBaseTestCase(TestCase):
         self.node_mapk3 = _make_node(self.pathway_mapk, 'MAPK3', 'e3')
         # Nó gene na via p53 (para Regra 2)
         self.node_tp53 = _make_node(self.pathway_p53, 'TP53', 'e4')
+        # Nó gene na via de fosfo (hsa04010) cujo símbolo NÃO será catalogado
+        # na matriz de fosfo — exercita n_features_not_found > 0 na Regra 1
+        # (o caso que, sem OmicMatrixFeature, gerava readout fantasma).
+        self.node_braf = _make_node(self.pathway_mapk, 'BRAF', 'e5')
 
         # ── Nó compound (não deve virar readout) ────────────────────────────
         self.node_compound = _make_node(
@@ -943,16 +982,46 @@ class ReadoutMappingBaseTestCase(TestCase):
         self.phospho_matrix = _make_phospho_matrix()
         self.proteome_matrix = _make_proteome_matrix()
 
-        # ── Arquivo JSONL de regulon sintético ──────────────────────────────
+        # ── Catálogo de features das matrizes (A→C, migration 0036) ─────────
+        # Fosfo: PIK3CA, AKT1, MAPK3 existem; BRAF propositalmente ausente
+        # (caso "símbolo fora da matriz" da Regra 1).
+        _make_matrix_features(self.phospho_matrix, ['PIK3CA', 'AKT1', 'MAPK3'])
+        # Proteoma: AKT1, PIK3CA, BRAF (também nós do grafo) + EGFR — alvo de
+        # TF que NÃO é nó de NENHUMA via, mas existe na matriz: é o caso
+        # decisivo do footprint (Regra 2). FOOBARBAZ fica de fora
+        # propositalmente (caso "fora da matriz").
+        _make_matrix_features(
+            self.proteome_matrix, ['AKT1', 'PIK3CA', 'BRAF', 'EGFR']
+        )
+
+        # ── Arquivo JSONL de regulon sintético (contrato REAL do Rust:
+        # tf/target/mode/sources/n_references — NÃO existe campo 'sign' nem
+        # 'confidence') ──────────────────────────────────────────────────────
         self._tmpdir = tempfile.mkdtemp(prefix='davinci_readout_test_')
         self.regulon_path = os.path.join(self._tmpdir, 'regulon.jsonl')
         _write_regulon_jsonl(self.regulon_path, [
-            # TP53 (nó na via p53) é TF; AKT1 (nó nas vias) é alvo → deve bater
-            {'tf': 'TP53', 'target': 'AKT1', 'sign': -1, 'confidence': 0.9},
-            # TP53 → PIK3CA: também nas vias → deve bater
-            {'tf': 'TP53', 'target': 'PIK3CA', 'sign': 1, 'confidence': 0.8},
-            # TP53 → FOOBARBAZ: NÃO está nas vias → n_not_found
-            {'tf': 'TP53', 'target': 'FOOBARBAZ', 'sign': 1, 'confidence': 0.7},
+            # TP53 (TF, nó da via p53) → AKT1: alvo é nó do grafo E existe na
+            # matriz proteoma → deve bater. mode=-1 (inibição).
+            {'tf': 'TP53', 'target': 'AKT1', 'mode': -1,
+             'sources': 'CollecTRI', 'n_references': 12},
+            # TP53 → PIK3CA: alvo é nó do grafo E existe na matriz → mode=+1.
+            {'tf': 'TP53', 'target': 'PIK3CA', 'mode': 1,
+             'sources': 'CollecTRI', 'n_references': 8},
+            # TP53 → EGFR: CASO DECISIVO do footprint de TF. EGFR NÃO é nó de
+            # NENHUMA via, mas EXISTE na matriz proteoma → DEVE ser aceito —
+            # os alvos de um TF são por definição majoritariamente externos
+            # à via. A validação intra-grafo antiga rejeitava exatamente
+            # este caso (era o próprio bug medido na ingestão live).
+            {'tf': 'TP53', 'target': 'EGFR', 'mode': 1,
+             'sources': 'CollecTRI', 'n_references': 30},
+            # TP53 → BRAF: alvo É nó do grafo (via hsa04010) E existe na
+            # matriz → mode=0 (conflito/neutro) → regulon_sign=0.
+            {'tf': 'TP53', 'target': 'BRAF', 'mode': 0,
+             'sources': 'CollecTRI;OmniPath', 'n_references': 3},
+            # TP53 → FOOBARBAZ: NÃO existe na matriz proteoma (nem é nó de
+            # via) → não materializa, conta em n_features_not_found.
+            {'tf': 'TP53', 'target': 'FOOBARBAZ', 'mode': 1,
+             'sources': 'CollecTRI', 'n_references': 1},
         ])
 
         # ── IngestionJob REGULON_LOAD COMPLETED com regulon_path ─────────────
@@ -999,8 +1068,9 @@ class ReadoutMappingRule1Tests(ReadoutMappingBaseTestCase):
         service = self._make_service()
         service.run()
 
-        # PIK3CA e AKT1 são nós gene de hsa04151 (via fosfo)
-        for symbol in ('PIK3CA', 'AKT1'):
+        # PIK3CA/AKT1 (hsa04151) e MAPK3 (hsa04010) são nós gene das vias de
+        # fosfo E estão catalogados na matriz (OmicMatrixFeature) — devem bater.
+        for symbol in ('PIK3CA', 'AKT1', 'MAPK3'):
             self.assertTrue(
                 PathwayReadoutFeature.objects.filter(
                     matrix=self.phospho_matrix,
@@ -1077,6 +1147,36 @@ class ReadoutMappingRule1Tests(ReadoutMappingBaseTestCase):
         self.assertEqual(prf.regulon_source, '')
         self.assertIsNone(prf.regulon_sign)
 
+    def test_regra1_simbolo_fora_da_matriz_nao_materializa_e_conta_not_found(self):
+        """
+        Nó gene de via de fosfo (BRAF) cujo símbolo NÃO está catalogado na
+        matriz de fosfo (OmicMatrixFeature) → NÃO materializa
+        PathwayReadoutFeature, NÃO atualiza readout_role, e conta em
+        n_features_not_found. Este é exatamente o caso que, com a validação
+        intra-grafo antiga (contra PathwayNode.gene_symbol, sem checar a
+        matriz real), gerava readout fantasma (~36% dos readouts de fosfo
+        na ingestão live do CPTAC).
+        """
+        service = self._make_service()
+        report = service.run()
+
+        self.assertFalse(
+            PathwayReadoutFeature.objects.filter(
+                node=self.node_braf,
+                rule=PathwayReadoutFeature.Rule.PHOSPHO,
+            ).exists(),
+            'BRAF nao esta catalogado na matriz fosfo — nao deve materializar',
+        )
+        self.node_braf.refresh_from_db()
+        self.assertEqual(
+            self.node_braf.readout_role, PathwayNode.ReadoutRole.NONE,
+            'Sem match na matriz, readout_role nao deve ser atualizado',
+        )
+        self.assertGreaterEqual(
+            report['n_features_not_found'], 1,
+            'BRAF fora da matriz fosfo deve contar em n_features_not_found',
+        )
+
 
 class ReadoutMappingRule2Tests(ReadoutMappingBaseTestCase):
     """
@@ -1103,7 +1203,7 @@ class ReadoutMappingRule2Tests(ReadoutMappingBaseTestCase):
 
     def test_regra2_regulon_sign_preservado(self):
         """
-        regulon_sign=−1 preservado do JSONL (TP53→AKT1 sign=-1).
+        regulon_sign=−1 preservado do campo `mode` do JSONL (TP53→AKT1 mode=-1).
         """
         service = self._make_service()
         service.run()
@@ -1127,10 +1227,43 @@ class ReadoutMappingRule2Tests(ReadoutMappingBaseTestCase):
         self.assertIsNotNone(prf)
         self.assertEqual(prf.regulon_source, 'collectri')
 
-    def test_regra2_alvo_fora_das_vias_nao_materializa(self):
+    def test_regra2_alvo_fora_do_grafo_mas_na_matriz_e_aceito(self):
         """
-        Alvo do regulon (FOOBARBAZ) não está nas vias → NÃO gera
-        PathwayReadoutFeature (validação intra-grafo).
+        CASO DECISIVO do footprint de TF: EGFR não é nó de NENHUMA via do
+        grafo KEGG, mas EXISTE na matriz de proteoma (OmicMatrixFeature) →
+        DEVE materializar PathwayReadoutFeature(rule='tf_target').
+
+        Os alvos de um TF são, por definição, majoritariamente genes FORA
+        da via de sinalização onde o TF está anotado — validar contra o
+        grafo (comportamento antigo) rejeitava exatamente este caso, e foi
+        isso que descartou ~95% dos alvos reais na ingestão live do CPTAC
+        (548 readouts de TF em vez de 3.728). A validação correta é contra
+        a matriz ALVO, não contra o grafo.
+        """
+        service = self._make_service()
+        service.run()
+
+        self.assertFalse(
+            PathwayNode.objects.filter(gene_symbol='EGFR').exists(),
+            'Pre-condicao do teste: EGFR nao deve ser no de nenhuma via',
+        )
+        self.assertTrue(
+            PathwayReadoutFeature.objects.filter(
+                node=self.node_tp53,
+                matrix=self.proteome_matrix,
+                feature_key='EGFR',
+                rule=PathwayReadoutFeature.Rule.TF_TARGET,
+            ).exists(),
+            'Alvo fora do grafo mas presente na matriz DEVE ser aceito '
+            '(coracao do footprint de TF) — o bug antigo rejeitava isso.',
+        )
+
+    def test_regra2_alvo_fora_da_matriz_nao_materializa(self):
+        """
+        Alvo do regulon (FOOBARBAZ) não existe na matriz de proteoma
+        (OmicMatrixFeature) → NÃO gera PathwayReadoutFeature. A validação é
+        contra a matriz ALVO, não contra o grafo — mas ainda rejeita alvos
+        que genuinamente não existem em lugar nenhum.
         """
         service = self._make_service()
         service.run()
@@ -1139,21 +1272,24 @@ class ReadoutMappingRule2Tests(ReadoutMappingBaseTestCase):
             PathwayReadoutFeature.objects.filter(
                 feature_key='FOOBARBAZ',
             ).exists(),
-            'Alvo fora das vias não deve gerar PathwayReadoutFeature',
+            'Alvo fora da matriz proteoma nao deve gerar PathwayReadoutFeature',
         )
 
-    def test_regra2_n_features_not_found_reflete_alvos_fora_das_vias(self):
+    def test_regra2_n_features_not_found_reflete_alvos_fora_da_matriz(self):
         """
-        n_features_not_found = nº de alvos do regulon fora das vias (1 linha
-        com FOOBARBAZ no JSONL fixture).
+        n_features_not_found = nº de alvos/símbolos que NÃO existem na
+        matriz alvo — não mais "fora das vias". Na fixture: BRAF (Regra 1,
+        fora da matriz fosfo) + FOOBARBAZ (Regra 2, fora da matriz
+        proteoma) = 2. EGFR e demais alvos existem na matriz e NÃO contam,
+        mesmo não sendo nós do grafo.
         """
         service = self._make_service()
         report = service.run()
 
-        # FOOBARBAZ não está nas vias → deve contar como not_found
-        self.assertGreaterEqual(
-            report['n_features_not_found'], 1,
-            'n_features_not_found deve refletir alvos fora das vias',
+        self.assertEqual(
+            report['n_features_not_found'], 2,
+            'n_features_not_found deve refletir apenas simbolos fora da '
+            'MATRIZ (1 fosfo: BRAF + 1 tf: FOOBARBAZ), nao fora das vias',
         )
 
     def test_regra2_marca_readout_role_tf_target_no_node_tf(self):
@@ -1168,7 +1304,8 @@ class ReadoutMappingRule2Tests(ReadoutMappingBaseTestCase):
 
     def test_regra2_alvo_tf_positivo_tem_regulon_sign_positivo(self):
         """
-        TP53→PIK3CA sign=+1 → PathwayReadoutFeature(regulon_sign=1).
+        TP53→PIK3CA mode=+1 (campo `mode` do JSONL, NÃO `sign`) →
+        PathwayReadoutFeature(regulon_sign=1).
         """
         service = self._make_service()
         service.run()
@@ -1181,10 +1318,32 @@ class ReadoutMappingRule2Tests(ReadoutMappingBaseTestCase):
         self.assertIsNotNone(prf)
         self.assertEqual(prf.regulon_sign, 1)
 
-    def test_regra2_confidence_do_jsonl(self):
+    def test_regra2_mode_zero_produz_regulon_sign_zero(self):
         """
-        confidence da Regra 2 vem do campo 'confidence' do JSONL.
+        TP53→BRAF mode=0 (conflito/neutro no CollecTRI) →
+        PathwayReadoutFeature(regulon_sign=0). Trava o terceiro valor
+        possível de `mode` além de +1/-1.
         """
+        service = self._make_service()
+        service.run()
+
+        prf = PathwayReadoutFeature.objects.filter(
+            node=self.node_tp53,
+            feature_key='BRAF',
+            rule=PathwayReadoutFeature.Rule.TF_TARGET,
+        ).first()
+        self.assertIsNotNone(prf)
+        self.assertEqual(prf.regulon_sign, 0)
+
+    def test_regra2_confidence_e_fixa_ignora_jsonl(self):
+        """
+        O JSONL real (rust_src/src/omics/regulon_loader.rs) NÃO tem campo de
+        confiança contínua — apenas `n_references` (cru, não normalizado).
+        confidence de PathwayReadoutFeature(rule='tf_target') é o valor FIXO
+        CONFIDENCE_TF_TARGET, não derivado de nenhum campo do JSONL.
+        """
+        from apps.core.services.readout_mapping_service import CONFIDENCE_TF_TARGET
+
         service = self._make_service()
         service.run()
 
@@ -1194,26 +1353,16 @@ class ReadoutMappingRule2Tests(ReadoutMappingBaseTestCase):
             rule=PathwayReadoutFeature.Rule.TF_TARGET,
         ).first()
         self.assertIsNotNone(prf)
-        self.assertAlmostEqual(prf.confidence, 0.9, places=5)
+        self.assertAlmostEqual(prf.confidence, CONFIDENCE_TF_TARGET, places=5)
 
 
 class ReadoutMappingContractTests(ReadoutMappingBaseTestCase):
     """
-    Contrato declarado do ReadoutMappingService: gatilho_ac, dry_run, idempotência.
+    Contrato declarado do ReadoutMappingService: dry_run, idempotência,
+    validation_strategy. (`gatilho_ac` foi removido do relatório: a promoção
+    A→C está concluída — migration 0036 — não há mais gatilho adiado a
+    sinalizar.)
     """
-
-    def test_gatilho_ac_e_sempre_true(self):
-        """
-        gatilho_ac=True sempre (A→C adiada — validação completa do Parquet
-        requer OmicMatrixFeature, que não existe ainda).
-        """
-        service = self._make_service()
-        report = service.run()
-
-        self.assertTrue(
-            report.get('gatilho_ac'),
-            'gatilho_ac deve ser True sempre (A→C adiada na Fase 3)',
-        )
 
     def test_dry_run_nao_persiste_readout_features(self):
         """
@@ -1274,7 +1423,12 @@ class ReadoutMappingContractTests(ReadoutMappingBaseTestCase):
         self.assertEqual(report['mapping_version'], 'fase3-readout-v1')
 
     def test_report_contem_todas_as_chaves_do_contrato(self):
-        """run() retorna dict com todas as chaves esperadas."""
+        """
+        run() retorna dict com EXATAMENTE as chaves esperadas — travamento
+        estrito (assertEqual de sets, não apenas assertIn por chave) para que
+        a remoção de `gatilho_ac` (A→C concluída) ou a introdução de campo
+        novo sem atualizar este teste sejam ambas detectadas.
+        """
         service = self._make_service()
         report = service.run()
 
@@ -1282,11 +1436,10 @@ class ReadoutMappingContractTests(ReadoutMappingBaseTestCase):
             'n_phospho_mapped', 'n_tf_mapped', 'n_nodes_readout',
             'n_unmapped_nodes', 'n_features_not_found',
             'mapping_version', 'dry_run', 'duration_s',
-            'validation_strategy', 'gatilho_ac',
+            'validation_strategy',
             'phospho_matrix_id', 'proteome_matrix_id', 'regulon_path_found',
         }
-        for key in expected_keys:
-            self.assertIn(key, report, f'Chave ausente no relatório: {key!r}')
+        self.assertEqual(set(report.keys()), expected_keys)
 
     def test_n_phospho_mapped_positivo(self):
         """n_phospho_mapped > 0 quando há nós gene nas vias fosfo."""
@@ -1317,6 +1470,91 @@ class ReadoutMappingContractTests(ReadoutMappingBaseTestCase):
         service = self._make_service()
         report = service.run()
         self.assertEqual(report['proteome_matrix_id'], self.proteome_matrix.id)
+
+
+class ReadoutMappingFeatureNotCataloguedTests(TestCase):
+    """
+    Falha alta sem degradação: proteção contra a reintrodução silenciosa do
+    bug original (validar contra o grafo KEGG em vez da matriz). Se
+    `OmicMatrixFeature` está vazia para a matriz que precisa ser validada
+    (backfill_matrix_features não rodou), o service DEVE levantar
+    `OmicMatrixFeatureNotCataloguedError` — nunca cair de volta silenciosamente
+    na validação intra-grafo antiga.
+    """
+
+    def setUp(self):
+        self.pathway = _make_pathway('hsa04151')
+        _make_node(self.pathway, 'AKT1', 'e1')
+        # Matrizes criadas mas SEM nenhuma OmicMatrixFeature catalogada —
+        # simula o estado "backfill ainda não rodou".
+        self.phospho_matrix = _make_phospho_matrix()
+        self.proteome_matrix = _make_proteome_matrix()
+
+    def test_matriz_fosfo_sem_catalogo_levanta_erro_sem_degradar(self):
+        """
+        Regra 1: matriz de fosfo sem OmicMatrixFeature → levanta
+        OmicMatrixFeatureNotCataloguedError. NÃO deve materializar nenhum
+        PathwayReadoutFeature via fallback intra-grafo.
+        """
+        from apps.core.services.readout_mapping_service import (
+            OmicMatrixFeatureNotCataloguedError,
+            ReadoutMappingService,
+        )
+
+        service = ReadoutMappingService(
+            pathway_ids_phospho=['hsa04151'],
+            pathway_ids_tf=['hsa04151'],
+            dry_run=True,
+        )
+        with self.assertRaises(OmicMatrixFeatureNotCataloguedError) as ctx:
+            service.run()
+
+        self.assertEqual(ctx.exception.matrix.id, self.phospho_matrix.id)
+        self.assertEqual(PathwayReadoutFeature.objects.count(), 0)
+
+    def test_matriz_proteoma_sem_catalogo_levanta_erro_sem_degradar(self):
+        """
+        Regra 2: matriz de proteoma sem OmicMatrixFeature → levanta
+        OmicMatrixFeatureNotCataloguedError quando há candidatos reais (TF
+        com alvos no JSONL de regulon) a validar.
+        """
+        from apps.core.services.readout_mapping_service import (
+            OmicMatrixFeatureNotCataloguedError,
+            ReadoutMappingService,
+        )
+
+        # Catálogo do fosfo presente (para isolar o erro na Regra 2).
+        _make_matrix_features(self.phospho_matrix, ['AKT1'])
+
+        tmpdir = tempfile.mkdtemp(prefix='davinci_notcatalogued_test_')
+        try:
+            regulon_path = os.path.join(tmpdir, 'regulon.jsonl')
+            _write_regulon_jsonl(regulon_path, [
+                {'tf': 'AKT1', 'target': 'EGFR', 'mode': 1,
+                 'sources': 'CollecTRI', 'n_references': 5},
+            ])
+            user = _make_user('notcatalogued_user')
+            project = _make_project(user, 'NotCatalogued Project')
+            IngestionJob.objects.create(
+                project=project,
+                job_type=IngestionJob.JobType.REGULON_LOAD,
+                status=IngestionJob.JobStatus.COMPLETED,
+                parameters={'regulon_path': regulon_path, 'source_version': 'test'},
+            )
+
+            service = ReadoutMappingService(
+                pathway_ids_phospho=['hsa04151'],
+                pathway_ids_tf=['hsa04151'],
+                dry_run=True,
+            )
+            with self.assertRaises(OmicMatrixFeatureNotCataloguedError) as ctx:
+                service.run()
+
+            self.assertEqual(ctx.exception.matrix.id, self.proteome_matrix.id)
+            self.assertEqual(PathwayReadoutFeature.objects.count(), 0)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 class ReadoutMappingAusenciaPreconditionTests(TestCase):
@@ -1363,8 +1601,12 @@ class ReadoutMappingAusenciaPreconditionTests(TestCase):
 
         pathway = _make_pathway('hsa04151')
         _make_node(pathway, 'TP53')
-        _make_phospho_matrix()
+        phospho_matrix = _make_phospho_matrix()
         _make_proteome_matrix()
+        # Catálogo de features da matriz fosfo (backfill já feito) — sem
+        # isso a Regra 1 levantaria OmicMatrixFeatureNotCataloguedError
+        # antes mesmo de chegarmos na Regra 2 (que é o que este teste cobre).
+        _make_matrix_features(phospho_matrix, ['TP53'])
 
         service = ReadoutMappingService(
             pathway_ids_phospho=['hsa04151'],
@@ -1862,3 +2104,422 @@ class PathwayCatalogGlobalTests(TestCase):
                 relation_type=PathwayEdge.RelationType.PPREL,
                 subtypes=['activation'],
             )
+
+
+# =============================================================================
+# 8. OmicMatrixFeature — modelo (migration 0036, promoção A→C)
+# =============================================================================
+
+class OmicMatrixFeatureModelTests(TestCase):
+    """
+    Testa as duas natural keys de OmicMatrixFeature:
+      - (matrix, feature_key): uma feature aparece uma vez por matriz.
+      - (matrix, row_index): uma linha do Parquet é única por matriz.
+    """
+
+    def setUp(self):
+        self.matrix = _make_proteome_matrix('CPTAC-OMF-MODEL')
+
+    def test_duplicate_feature_key_na_mesma_matriz_rejeitado(self):
+        """NK (matrix, feature_key) rejeita duplicata."""
+        from django.db import IntegrityError
+
+        OmicMatrixFeature.objects.create(
+            matrix=self.matrix, feature_key='TP53', row_index=0,
+        )
+        with self.assertRaises(IntegrityError):
+            OmicMatrixFeature.objects.create(
+                matrix=self.matrix, feature_key='TP53', row_index=1,
+            )
+
+    def test_duplicate_row_index_na_mesma_matriz_rejeitado(self):
+        """NK (matrix, row_index) rejeita duplicata."""
+        from django.db import IntegrityError
+
+        OmicMatrixFeature.objects.create(
+            matrix=self.matrix, feature_key='TP53', row_index=0,
+        )
+        with self.assertRaises(IntegrityError):
+            OmicMatrixFeature.objects.create(
+                matrix=self.matrix, feature_key='AKT1', row_index=0,
+            )
+
+    def test_mesmo_feature_key_em_matrizes_diferentes_e_permitido(self):
+        """
+        A NK é por matriz — o mesmo feature_key pode existir em duas
+        matrizes distintas sem conflito.
+        """
+        matrix2 = _make_proteome_matrix('CPTAC-OMF-MODEL-2')
+        OmicMatrixFeature.objects.create(
+            matrix=self.matrix, feature_key='TP53', row_index=0,
+        )
+        OmicMatrixFeature.objects.create(
+            matrix=matrix2, feature_key='TP53', row_index=0,
+        )
+        self.assertEqual(
+            OmicMatrixFeature.objects.filter(feature_key='TP53').count(), 2,
+        )
+
+
+# =============================================================================
+# 9. MatrixFeatureCatalogService / backfill_matrix_features (A→C, migration 0036)
+# =============================================================================
+
+class MatrixFeatureCatalogStorageTestCase(TestCase):
+    """Substitui default_storage por FileSystemStorage local (padrão do módulo)."""
+
+    def setUp(self):
+        super().setUp()
+        self._tmpdir = tempfile.mkdtemp(prefix='davinci_matrixfeat_test_')
+        self._storage = FileSystemStorage(location=self._tmpdir)
+        self._storage_patcher = patch(
+            'apps.core.services.matrix_feature_catalog_service.default_storage',
+            new=self._storage,
+        )
+        self._storage_patcher.start()
+
+    def _put_parquet(self, storage_key: str) -> None:
+        path = os.path.join(self._tmpdir, storage_key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as f:
+            f.write(b'PAR1' + b'\x00' * 16 + b'PAR1')
+
+    def tearDown(self):
+        self._storage_patcher.stop()
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        super().tearDown()
+
+
+def _fake_catalog_matrix_features_engine(feature_keys: list[str]) -> MagicMock:
+    """
+    Fake rust_engine cujo catalog_matrix_features PERSISTE OmicMatrixFeature
+    via Django ORM (idempotente — UPSERT simulado por get_or_create/bulk_create
+    ignorando o que já existe), simulando o efeito real do COPY/UPSERT feito
+    pelo Rust. Retorna manifest com n_inserted/n_updated.
+
+    Sem isso, um mock "burro" (MagicMock puro) não exerceria a idempotência
+    real da NK — cairia na mesma armadilha de "mock com formato presumido não
+    pega bug de formato/comportamento" citada no plano desta sessão.
+    """
+    def _fn(parquet_path, matrix_id, db_url):
+        existing = set(
+            OmicMatrixFeature.objects.filter(matrix_id=matrix_id)
+            .values_list('feature_key', flat=True)
+        )
+        to_create = [
+            OmicMatrixFeature(matrix_id=matrix_id, feature_key=key.upper(), row_index=idx)
+            for idx, key in enumerate(feature_keys)
+            if key.upper() not in existing
+        ]
+        OmicMatrixFeature.objects.bulk_create(to_create)
+        n_inserted = len(to_create)
+        n_updated = len(feature_keys) - n_inserted
+
+        manifest = MagicMock()
+        manifest.n_inserted = n_inserted
+        manifest.n_updated = n_updated
+        return manifest
+
+    fake_engine = MagicMock()
+    fake_engine.catalog_matrix_features.side_effect = _fn
+    return fake_engine
+
+
+class MatrixFeatureCatalogServiceTests(MatrixFeatureCatalogStorageTestCase):
+    """
+    Testa MatrixFeatureCatalogService.run() com mock do Rust (persistindo via
+    ORM para exercitar a idempotência real da NK).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.user = _make_user('matrixfeat_user')
+        self.project = _make_project(self.user, 'MatrixFeat Project')
+        self.matrix = _make_proteome_matrix('CPTAC-MATRIXFEAT')
+        self.matrix.n_features = 3
+        self.matrix.save(update_fields=['n_features'])
+        ProjectDataset.objects.create(
+            project=self.project, dataset=self.matrix.dataset,
+        )
+        self._put_parquet(self.matrix.storage_key)
+
+    def test_run_insere_features_e_bate_com_n_features(self):
+        """run() insere as features e match=True quando a contagem bate."""
+        from apps.core.services.matrix_feature_catalog_service import (
+            MatrixFeatureCatalogService,
+        )
+
+        fake_engine = _fake_catalog_matrix_features_engine(['TP53', 'AKT1', 'PIK3CA'])
+        service = MatrixFeatureCatalogService(self.project)
+        with patch.dict('sys.modules', {'rust_engine': fake_engine}):
+            result = service._execute(self.matrix, fake_engine)
+            n_after = OmicMatrixFeature.objects.filter(matrix=self.matrix).count()
+
+        self.assertEqual(n_after, 3)
+        self.assertEqual(result.n_inserted, 3)
+        self.assertEqual(result.n_updated, 0)
+
+    def test_run_completo_match_true_via_run(self):
+        """service.run(matrix) de ponta a ponta: match=True, sem exceção."""
+        from apps.core.services.matrix_feature_catalog_service import (
+            MatrixFeatureCatalogService,
+        )
+
+        fake_engine = _fake_catalog_matrix_features_engine(['TP53', 'AKT1', 'PIK3CA'])
+        service = MatrixFeatureCatalogService(self.project)
+        with patch.dict('sys.modules', {'rust_engine': fake_engine}):
+            result = service.run(self.matrix, dry_run=False)
+
+        self.assertTrue(result['match'])
+        self.assertEqual(result['n_catalogued_after'], 3)
+        self.assertEqual(result['n_features_expected'], 3)
+
+    def test_run_idempotente_segunda_execucao_nao_duplica(self):
+        """
+        2ª execução do backfill (mesmo Parquet/feature_keys) não duplica
+        OmicMatrixFeature — a NK (matrix, feature_key) garante upsert.
+        """
+        from apps.core.services.matrix_feature_catalog_service import (
+            MatrixFeatureCatalogService,
+        )
+
+        fake_engine = _fake_catalog_matrix_features_engine(['TP53', 'AKT1', 'PIK3CA'])
+        service = MatrixFeatureCatalogService(self.project)
+
+        with patch.dict('sys.modules', {'rust_engine': fake_engine}):
+            result1 = service.run(self.matrix, dry_run=False)
+        count_after_first = OmicMatrixFeature.objects.filter(matrix=self.matrix).count()
+
+        with patch.dict('sys.modules', {'rust_engine': fake_engine}):
+            result2 = service.run(self.matrix, dry_run=False)
+        count_after_second = OmicMatrixFeature.objects.filter(matrix=self.matrix).count()
+
+        self.assertEqual(count_after_first, count_after_second)
+        self.assertEqual(count_after_second, 3)
+        # Na 2ª execução, tudo já existia — n_inserted deve ser 0.
+        self.assertEqual(result2['n_inserted'], 0)
+        self.assertEqual(result2['n_updated'], 3)
+
+    def test_dry_run_nao_baixa_parquet_nem_chama_rust(self):
+        """
+        --dry-run NÃO chama rust_engine.catalog_matrix_features nem persiste
+        OmicMatrixFeature — apenas reporta o estado atual do catálogo.
+        """
+        from apps.core.services.matrix_feature_catalog_service import (
+            MatrixFeatureCatalogService,
+        )
+
+        fake_engine = _fake_catalog_matrix_features_engine(['TP53', 'AKT1', 'PIK3CA'])
+        service = MatrixFeatureCatalogService(self.project)
+
+        result = service.run(self.matrix, dry_run=True)
+
+        self.assertTrue(result['dry_run'])
+        self.assertEqual(result['n_catalogued_after'], 0)
+        self.assertEqual(OmicMatrixFeature.objects.filter(matrix=self.matrix).count(), 0)
+        fake_engine.catalog_matrix_features.assert_not_called()
+
+    def test_mismatch_levanta_matrix_feature_count_mismatch_error(self):
+        """
+        Contagem catalogada divergindo de OmicMatrix.n_features (Parquet e
+        metadado discordam) → MatrixFeatureCountMismatchError.
+        """
+        from apps.core.services.matrix_feature_catalog_service import (
+            MatrixFeatureCatalogService,
+            MatrixFeatureCountMismatchError,
+        )
+
+        # Rust "encontra" só 2 features, mas OmicMatrix.n_features=3.
+        fake_engine = _fake_catalog_matrix_features_engine(['TP53', 'AKT1'])
+        service = MatrixFeatureCatalogService(self.project)
+
+        with self.assertRaises(MatrixFeatureCountMismatchError):
+            with patch.dict('sys.modules', {'rust_engine': fake_engine}):
+                service.run(self.matrix, dry_run=False)
+
+    def test_resolve_matrices_isolamento_por_projeto(self):
+        """
+        resolve_matrices só retorna matrizes vinculadas ao projeto via
+        ProjectDataset — outro projeto não vê a matriz.
+        """
+        from apps.core.services.matrix_feature_catalog_service import (
+            MatrixFeatureCatalogMatrixNotFoundError,
+            MatrixFeatureCatalogService,
+        )
+
+        other_user = _make_user('matrixfeat_other_user')
+        other_project = _make_project(other_user, 'MatrixFeat Other Project')
+
+        with self.assertRaises(MatrixFeatureCatalogMatrixNotFoundError):
+            MatrixFeatureCatalogService.resolve_matrices(other_project)
+
+        matrices = MatrixFeatureCatalogService.resolve_matrices(self.project)
+        self.assertEqual([m.id for m in matrices], [self.matrix.id])
+
+
+class BackfillMatrixFeaturesCommandTests(MatrixFeatureCatalogStorageTestCase):
+    """Testa o management command backfill_matrix_features de ponta a ponta."""
+
+    def setUp(self):
+        super().setUp()
+        self.user = _make_user('backfill_cmd_user')
+        self.project = _make_project(self.user, 'Backfill Cmd Project')
+        self.matrix = _make_proteome_matrix('CPTAC-BACKFILL-CMD')
+        self.matrix.n_features = 2
+        self.matrix.save(update_fields=['n_features'])
+        ProjectDataset.objects.create(
+            project=self.project, dataset=self.matrix.dataset,
+        )
+        self._put_parquet(self.matrix.storage_key)
+
+    def test_dry_run_nao_persiste(self):
+        """--dry-run do command não persiste OmicMatrixFeature."""
+        from django.core.management import call_command
+
+        fake_engine = _fake_catalog_matrix_features_engine(['TP53', 'AKT1'])
+        out = StringIO()
+        with patch.dict('sys.modules', {'rust_engine': fake_engine}):
+            call_command(
+                'backfill_matrix_features',
+                project=str(self.project.id),
+                dry_run=True,
+                stdout=out,
+            )
+
+        self.assertEqual(
+            OmicMatrixFeature.objects.filter(matrix=self.matrix).count(), 0,
+        )
+        self.assertIn('DRY RUN', out.getvalue())
+
+    def test_backfill_real_popula_e_reporta_sucesso(self):
+        """Backfill real popula OmicMatrixFeature e reporta sucesso."""
+        from django.core.management import call_command
+
+        fake_engine = _fake_catalog_matrix_features_engine(['TP53', 'AKT1'])
+        out = StringIO()
+        with patch.dict('sys.modules', {'rust_engine': fake_engine}):
+            call_command(
+                'backfill_matrix_features',
+                project=str(self.project.id),
+                matrix_id=self.matrix.id,
+                stdout=out,
+            )
+
+        self.assertEqual(
+            OmicMatrixFeature.objects.filter(matrix=self.matrix).count(), 2,
+        )
+        self.assertIn('Backfill concluído', out.getvalue())
+
+    def test_backfill_idempotente_segunda_chamada_nao_duplica(self):
+        """2ª chamada do command não duplica OmicMatrixFeature."""
+        from django.core.management import call_command
+
+        fake_engine = _fake_catalog_matrix_features_engine(['TP53', 'AKT1'])
+        with patch.dict('sys.modules', {'rust_engine': fake_engine}):
+            call_command(
+                'backfill_matrix_features',
+                project=str(self.project.id),
+                matrix_id=self.matrix.id,
+                stdout=StringIO(),
+            )
+            call_command(
+                'backfill_matrix_features',
+                project=str(self.project.id),
+                matrix_id=self.matrix.id,
+                stdout=StringIO(),
+            )
+
+        self.assertEqual(
+            OmicMatrixFeature.objects.filter(matrix=self.matrix).count(), 2,
+        )
+
+
+# =============================================================================
+# 10. Regressão de proporção — matriz aceita vs. grafo aceita (footprint de TF)
+# =============================================================================
+
+class ReadoutMappingProportionRegressionTests(TestCase):
+    """
+    Monta um cenário reduzido com a mesma ESTRUTURA do CPTAC real: um TF cujos
+    alvos no regulon são majoritariamente genes de FORA do grafo KEGG, mas
+    TODOS catalogados na matriz de proteoma. Trava que a contagem aceita
+    segue o critério-MATRIZ (aceita praticamente todos), não o critério-grafo
+    antigo (que aceitava só a fração que também é nó de via — na ingestão
+    live do CPTAC isso foi 548 vs. 3.728 readouts de TF, ~15% do ganho real).
+    """
+
+    def setUp(self):
+        self.pathway = _make_pathway('hsa00001', 'Synthetic TF Pathway')
+        self.node_myc = _make_node(self.pathway, 'MYC', 'e_myc')
+
+        # 4 alvos DENTRO do grafo (também são PathwayNode desta via).
+        self.in_graph_targets = [f'INGRAPH{i}' for i in range(4)]
+        for i, sym in enumerate(self.in_graph_targets):
+            _make_node(self.pathway, sym, f'e_ingraph_{i}')
+
+        # 36 alvos FORA do grafo — nunca viram PathwayNode. Estrutura do
+        # footprint real: a maioria dos alvos de um TF fica fora da via.
+        self.out_graph_targets = [f'OUTGRAPH{i}' for i in range(36)]
+
+        self.proteome_matrix = _make_proteome_matrix('CPTAC-PROPORTION')
+        all_targets = self.in_graph_targets + self.out_graph_targets
+        _make_matrix_features(self.proteome_matrix, all_targets)
+
+        self._tmpdir = tempfile.mkdtemp(prefix='davinci_proportion_test_')
+        self.regulon_path = os.path.join(self._tmpdir, 'regulon.jsonl')
+        _write_regulon_jsonl(self.regulon_path, [
+            {'tf': 'MYC', 'target': t, 'mode': 1,
+             'sources': 'CollecTRI', 'n_references': 5}
+            for t in all_targets
+        ])
+
+        user = _make_user('proportion_user')
+        project = _make_project(user, 'Proportion Project')
+        IngestionJob.objects.create(
+            project=project,
+            job_type=IngestionJob.JobType.REGULON_LOAD,
+            status=IngestionJob.JobStatus.COMPLETED,
+            parameters={
+                'regulon_path': self.regulon_path,
+                'source_version': 'test',
+            },
+        )
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        super().tearDown()
+
+    def test_alvos_fora_do_grafo_sao_aceitos_na_ordem_da_matriz(self):
+        """
+        40 alvos no regulon, todos catalogados na matriz proteoma; apenas 4
+        são nós do grafo. O critério-grafo antigo aceitaria só os 4 (10%);
+        o critério-matriz correto aceita os 40 (100%).
+        """
+        from apps.core.services.readout_mapping_service import ReadoutMappingService
+
+        # pathway_ids_phospho aponta para vias sem matriz de fosfo carregada
+        # nesta TestCase isolada — Regra 1 é pulada (n_phospho_mapped=0),
+        # deixando o foco exclusivamente na Regra 2 (TF).
+        service = ReadoutMappingService(
+            pathway_ids_phospho=['hsa04151', 'hsa04010'],
+            pathway_ids_tf=['hsa00001'],
+            dry_run=True,
+        )
+        report = service.run()
+
+        n_accepted = report['n_tf_mapped']
+        n_graph_criterion = len(self.in_graph_targets)         # 4
+        n_matrix_criterion = len(self.in_graph_targets) + len(self.out_graph_targets)  # 40
+
+        self.assertEqual(
+            n_accepted, n_matrix_criterion,
+            'Todos os 40 alvos catalogados na matriz devem ser aceitos',
+        )
+        self.assertGreater(
+            n_accepted, n_graph_criterion * 5,
+            'A contagem aceita deve estar na ordem de grandeza do '
+            'critério-matriz, nao do critério-grafo antigo (que aceitava '
+            'apenas os nos do grafo)',
+        )

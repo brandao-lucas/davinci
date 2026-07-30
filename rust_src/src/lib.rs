@@ -2492,6 +2492,77 @@ fn load_cptac_phospho_matrix(
     }
 }
 
+// ─── Catálogo de features de matriz (Obj 2 — Fase 3, promoção A→C) ─────────
+
+/// Manifesto retornado por `catalog_matrix_features`.
+///
+/// | Campo | Tipo | Descrição |
+/// |---|---|---|
+/// | `n_features` | `int` | Features distintas (UPPERCASE, dedup) catalogadas em `core_omicmatrixfeature`. |
+/// | `n_inserted` | `int` | Linhas gravadas como INSERT novo (normal: = n_features). |
+/// | `n_updated` | `int` | Linhas que colidiram em `(matrix_id, feature_key)` no COPY final (defesa; normalmente 0). |
+#[pyclass]
+pub struct FeatureCatalogManifest {
+    #[pyo3(get)]
+    pub n_features: u64,
+    #[pyo3(get)]
+    pub n_inserted: u64,
+    #[pyo3(get)]
+    pub n_updated: u64,
+}
+
+#[pymethods]
+impl FeatureCatalogManifest {
+    fn __repr__(&self) -> String {
+        format!(
+            "FeatureCatalogManifest(n_features={}, n_inserted={}, n_updated={})",
+            self.n_features, self.n_inserted, self.n_updated
+        )
+    }
+}
+
+/// Lê o eixo de linhas (coluna `feature`, 0-based) de um Parquet de matriz
+/// já carregado (proteoma/fosfoproteoma CPTAC hoje) e popula
+/// `core_omicmatrixfeature`: uma linha por `(matrix_id, feature_key) → row_index`.
+///
+/// Normaliza `feature_key` para UPPERCASE. Idempotente: rodar duas vezes com
+/// o mesmo Parquet não duplica — o catálogo antigo da matriz é limpo (DELETE)
+/// antes de repopular, evitando colisão em `(matrix_id, row_index)` quando a
+/// posição de uma feature muda entre versões do loader (ver decisão completa
+/// no cabeçalho de `matrix_feature_catalog.rs`).
+///
+/// # Pré-requisitos
+///
+/// - `parquet_path`: caminho local do Parquet (Django baixou do object storage).
+/// - `matrix_id`: PK bigint de `OmicMatrix` já registrado.
+///
+/// # Argumentos
+///
+/// | Parâmetro | Tipo | Descrição |
+/// |---|---|---|
+/// | `parquet_path` | `str` | Caminho local do Parquet da matriz (absoluto). |
+/// | `matrix_id` | `int` | PK de `OmicMatrix` (FK bigint em `OmicMatrixFeature`). |
+/// | `db_url` | `str` | PostgreSQL connection string. |
+///
+/// # Retorno
+///
+/// `FeatureCatalogManifest` — ver campos acima. Lança `PyRuntimeError` em caso de erro fatal.
+#[pyfunction]
+fn catalog_matrix_features(
+    parquet_path: String,
+    matrix_id: i64,
+    db_url: String,
+) -> PyResult<FeatureCatalogManifest> {
+    match crate::omics::matrix_feature_catalog::catalog_matrix_features(&parquet_path, matrix_id, &db_url) {
+        Ok(m) => Ok(FeatureCatalogManifest {
+            n_features: m.n_features,
+            n_inserted: m.n_inserted,
+            n_updated: m.n_updated,
+        }),
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
 // ─── KEGG topology loader (Obj 2 — Fase 3, passo 3.2) ───────────────────────
 
 /// Manifesto retornado por `load_kegg_topology`.
@@ -2778,5 +2849,8 @@ fn rust_engine(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // CollecTRI regulon loader (Obj 2 — Fase 3, passo 3.3)
     m.add_class::<RegulonLoadManifest>()?;
     m.add_function(wrap_pyfunction!(load_collectri_regulons, m)?)?;
+    // Catálogo de features de matriz — promoção A→C (Obj 2 — Fase 3)
+    m.add_class::<FeatureCatalogManifest>()?;
+    m.add_function(wrap_pyfunction!(catalog_matrix_features, m)?)?;
     Ok(())
 }
