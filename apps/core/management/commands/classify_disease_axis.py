@@ -44,6 +44,7 @@ import datetime
 import logging
 import os
 
+from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
 logger = logging.getLogger(__name__)
@@ -250,12 +251,10 @@ class Command(BaseCommand):
         skip_gene_hit: bool,
     ) -> None:
         """Grava relatório de cobertura em diagnostics/classify_disease_axis_YYYYMMDD_HHMMSS.log."""
-        # Calcular caminho de diagnostics/
-        # apps/core/management/commands/ → subir 5 níveis → davinci/
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        for _ in range(5):
-            base_dir = os.path.dirname(base_dir)
-        diag_dir = os.path.join(base_dir, 'diagnostics')
+        # BUG anterior: contagem manual de os.path.dirname(__file__) (5 níveis)
+        # resolvia um nível ACIMA da raiz do repo (biohub.solutions/diagnostics/,
+        # fora do repositório). settings.REPO_ROOT é a âncora comprovada.
+        diag_dir = os.path.join(str(settings.REPO_ROOT), 'diagnostics')
         os.makedirs(diag_dir, exist_ok=True)
 
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')

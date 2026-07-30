@@ -13,7 +13,21 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
+# ATENÇÃO: BASE_DIR aponta para config/ (não para a raiz do repo) — é assim
+# de propósito, pois firebase-service-account.json e db.sqlite3 vivem em
+# config/. NÃO usar BASE_DIR para achar diagnostics/, guidelines/ etc.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Raiz do repositório (davinci/). Âncora explícita e comprovada para qualquer
+# caminho fora de config/ — ex.: diagnostics/cache (dados licenciados/
+# não-redistribuíveis, gitignored). Serviços/commands em apps/ devem usar
+# REPO_ROOT em vez de contar os.path.dirname(__file__) manualmente — contagem
+# de níveis quebra silenciosamente quando o arquivo muda de lugar.
+REPO_ROOT = BASE_DIR.parent
+assert (REPO_ROOT / 'manage.py').is_file(), (
+    f'REPO_ROOT ({REPO_ROOT}) não aponta para a raiz do repositório '
+    '(manage.py não encontrado) — revise BASE_DIR em config/settings/base.py'
+)
 
 
 # Quick-start development settings - unsuitable for production

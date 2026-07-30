@@ -29,3 +29,11 @@ celerybeat-schedule*
 
 #ia
 .claude/
+# Diagnostics — NUNCA commitar (laudo 007, 2026-07-30, achados C1/C2)
+# Contem: dumps de banco com PII (firebase_uid, e-mail, hash de senha),
+# exports globais cross-usuario, e cache de dados externos LICENCIADOS
+# (KGML do KEGG, regulons CollecTRI/OmniPath) cuja licenca academica proibe
+# redistribuicao. Antes deste bloco a protecao dependia de um .gitignore
+# untracked dentro de diagnostics/cache/ — inexistente em clone limpo/CI.
+diagnostics/
+!diagnostics/*.md

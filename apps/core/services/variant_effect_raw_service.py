@@ -132,8 +132,12 @@ class VariantEffectRawJobActiveError(Exception):
 
 def _cache_path() -> str:
     """Retorna o caminho do arquivo de cache do mapa uniprot→gene."""
+    # NÃO usar settings.BASE_DIR aqui — BASE_DIR aponta para config/ (usado
+    # para firebase-service-account.json/db.sqlite3), não para a raiz do
+    # repo. settings.REPO_ROOT é a âncora correta para diagnostics/cache
+    # (gitignored via diagnostics/cache/.gitignore).
     cache_dir = os.path.join(
-        settings.BASE_DIR, 'diagnostics', 'cache'
+        str(settings.REPO_ROOT), 'diagnostics', 'cache'
     )
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, UNIPROT_CACHE_FILENAME)

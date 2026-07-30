@@ -73,6 +73,7 @@ from __future__ import annotations
 import logging
 import tempfile
 
+from django.conf import settings
 from django.utils import timezone
 
 from apps.core.models import DaVinciProject, IngestionJob, PathwayNode
@@ -362,12 +363,14 @@ class RegulonLoadService:
         import os
 
         # Diretório de saída persistente para o intermediário de regulon
-        # (sob diagnostics/cache — gitignored, específico da sessão de ingestão)
+        # (sob diagnostics/cache — gitignored via diagnostics/cache/.gitignore.
+        # O dado bruto (CollecTRI/OmniPath, licença acadêmica) NÃO pode ficar
+        # em caminho commitável — usar settings.REPO_ROOT, não contar
+        # os.path.dirname(__file__) manualmente: BASE_DIR aponta para config/,
+        # não para a raiz do repo, e contagem de níveis quebra silenciosamente
+        # se o arquivo mudar de lugar.)
         cache_dir = os.path.join(
-            os.path.dirname(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            ),
-            'diagnostics', 'cache', 'omnipath',
+            str(settings.REPO_ROOT), 'diagnostics', 'cache', 'omnipath',
         )
         os.makedirs(cache_dir, exist_ok=True)
 
