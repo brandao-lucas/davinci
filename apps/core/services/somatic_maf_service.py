@@ -697,8 +697,20 @@ class SomaticMafService:
                 n_files,
             )
 
+            # Contrato PyO3: load_somatic_maf espera Vec<SomaticMafFileEntry>
+            # (pyclass tipado), não list[dict]. resolve_file_map() retorna
+            # list[dict] (mais conveniente para log/teste) — converte aqui,
+            # imediatamente antes da fronteira Rust.
+            file_map_entries = [
+                rust_engine.SomaticMafFileEntry(
+                    file_id=entry['file_id'],
+                    sample_accession=entry['sample_accession'],
+                )
+                for entry in file_map
+            ]
+
             manifest = rust_engine.load_somatic_maf(
-                file_map=file_map,
+                file_map=file_map_entries,
                 dest_dir=dest_dir,
                 db_url=db_url,
                 gene_allowlist=gene_allowlist,
@@ -850,8 +862,10 @@ class SomaticMafService:
         'genomic' = mutação/sequência, já nota no schema; 'counts' = burden
         inteiro de mutações não-sinônimas por gene×amostra).
 
-        OmicSample: get_or_create por accession=f"{case_id}_tumor".
-        Reusa amostras existentes da CNV/proteoma (mesma amostra biológica).
+        OmicSample: get_or_create por accession = sample_accession completa
+        devolvida pelo Rust (ver comentário abaixo sobre o contrato de
+        `MafSampleColumn.case_id`). Reusa amostras existentes da CNV/proteoma
+        (mesma amostra biológica) quando a accession bate.
         """
         with transaction.atomic():
             # ── OmicMatrix ────────────────────────────────────────────────────
@@ -881,10 +895,23 @@ class SomaticMafService:
                 )
                 matrix.refresh_from_db()
 
-            # ── OmicSample: um por (case_id, 'tumor') ─────────────────────────
+            # ── OmicSample: um por (sample_accession, 'tumor') ────────────────
             # Loader somático retorna sample_role='tumor' para todas as amostras.
-            # accession = f"{case_id}_tumor" — mesmo padrão da Fase 0 e CNV.
-            # Se a amostra já existe (CNV/proteoma), get_or_create a resolve.
+            #
+            # CONTRATO — atenção ao nome enganoso do campo `case_id` aqui:
+            # `MafSampleColumn.case_id` (rust_src/src/omics/maf_loader.rs) NÃO é
+            # um case_id nu. O loader de MAF não deriva case_id a partir do nome
+            # da coluna do Parquet — ele apenas ecoa de volta, por coluna, a
+            # `sample_accession` COMPLETA que o Django enviou em
+            # `MafFileEntry.sample_accession` (montada em resolve_file_map como
+            # f"{submitter_id}_tumor", ex.: "C3L-00004_tumor"). Isso é DIFERENTE
+            # do `matrix_loader.rs` de CNV/proteoma, cujo `SampleColumn.case_id`
+            # É de fato o case_id nu (extraído do nome da coluna `T_<case_id>` /
+            # `N_<case_id>` do Parquet burden).
+            # Logo: `col.case_id` AQUI já é a accession completa — usar
+            # diretamente como accession. Re-sufixar com f"_{role}" (como no
+            # loader de CNV/proteoma) duplica o sufixo ("..._tumor_tumor") e
+            # quebra o casamento com as OmicSample corretas.
             col_map: dict[tuple[str, str], int] = {}
             for col in manifest.sample_columns:
                 key = (col.case_id, col.sample_role)
@@ -892,28 +919,37 @@ class SomaticMafService:
                     col_map[key] = col.column_index
 
             sample_by_key: dict[tuple[str, str], OmicSample] = {}
-            for (case_id, role), _col_idx in col_map.items():
-                accession = f'{case_id}_{role}'
+            for (sample_accession, role), _col_idx in col_map.items():
+                # sample_accession já é a accession completa (ver contrato acima).
+                # nu_case_id é derivado removendo o sufixo de papel — é o valor
+                # gravado em characteristics['case_id'], consumido por
+                # SamplePairingService (precedência 1) para pareamento tumor↔normal.
+                role_suffix = f'_{role}'
+                nu_case_id = (
+                    sample_accession.removesuffix(role_suffix)
+                    if sample_accession.endswith(role_suffix)
+                    else sample_accession
+                )
                 sample, _ = OmicSample.objects.get_or_create(
-                    accession=accession,
+                    accession=sample_accession,
                     defaults={
                         'dataset': dataset,
-                        'title': f'{case_id} — {role} (CPTAC CCRCC Somatic MAF)',
+                        'title': f'{nu_case_id} — {role} (CPTAC CCRCC Somatic MAF)',
                         'organism': 'Homo sapiens',
                         'characteristics': {
-                            'case_id': case_id,
+                            'case_id': nu_case_id,
                             'sample_role': role,
                             'study': 'CPTAC-CCRCC',
                             'omic_type': 'genomic',
                         },
                     },
                 )
-                sample_by_key[(case_id, role)] = sample
+                sample_by_key[(sample_accession, role)] = sample
 
             # ── OmicMatrixSample: bulk_create com ignore_conflicts ─────────────
             oms_to_create = []
-            for (case_id, role), col_idx in col_map.items():
-                sample = sample_by_key[(case_id, role)]
+            for (sample_accession, role), col_idx in col_map.items():
+                sample = sample_by_key[(sample_accession, role)]
                 oms_to_create.append(
                     OmicMatrixSample(
                         matrix=matrix,

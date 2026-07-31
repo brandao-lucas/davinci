@@ -1092,6 +1092,73 @@ class PfsReadoutCounterContractTests(PfsScoringBaseTestCase):
 
 
 # =============================================================================
+# 8b. Universo de vias — default deixou de ser 3 fixas (quarto/último lugar)
+# =============================================================================
+
+class PfsPathwayUniverseDefaultTests(PfsScoringBaseTestCase):
+    """
+    Sem `pathway_kegg_ids`, `run()`/`dispatch()` usam TODAS as `Pathway` em
+    PG no momento da execução — não o preset legado de 3 vias fixas
+    (LEGACY_V1_PATHWAY_KEGG_IDS/DEFAULT_PATHWAY_KEGG_IDS). Mesmo padrão de
+    prova já usado em RegulonLoadService/ReadoutMappingService
+    (test_omnispathway_fase3.py): cria uma via FORA do preset legado e
+    confirma que ela É passada ao Rust — o preset legado antigo jamais a
+    incluiria. Espelha o bug real que este ajuste fecha: sem isso, o motor
+    PFS pontuaria só 3 das 372 vias, silenciosamente.
+    """
+
+    def test_default_usa_todas_as_pathway_em_pg_nao_o_preset_legado(self):
+        _make_pathway('hsa04150', 'mTOR signaling pathway')  # fora do preset legado
+
+        fake_engine = MagicMock()
+        fake_engine.run_pfs_scoring.return_value = _make_pfs_manifest()
+        service = PathwayScoringService(self.project)
+        with patch.dict('sys.modules', {'rust_engine': fake_engine}):
+            service.run(method_version='fase4-pfs-v1-universe-default')
+
+        call_kwargs = fake_engine.run_pfs_scoring.call_args.kwargs
+        self.assertEqual(
+            sorted(call_kwargs['pathway_kegg_ids']),
+            sorted(DEFAULT_PATHWAY_KEGG_IDS + ['hsa04150']),
+        )
+
+    def test_dispatch_default_usa_todas_as_pathway_em_pg(self):
+        _make_pathway('hsa04150', 'mTOR signaling pathway')  # fora do preset legado
+
+        with patch(
+            'apps.core.tasks.ingestion_tasks.run_pathway_scoring.delay',
+            return_value=None,
+        ):
+            job = PathwayScoringService.dispatch(
+                self.project, method_version='fase4-pfs-v1-universe-dispatch',
+            )
+
+        self.assertEqual(
+            sorted(job.parameters['pathway_kegg_ids']),
+            sorted(DEFAULT_PATHWAY_KEGG_IDS + ['hsa04150']),
+        )
+
+    def test_lista_explicita_vazia_e_respeitada_nao_cai_no_default(self):
+        """
+        `pathway_kegg_ids=[]` explícito NÃO cai para o universo default
+        (todas as `Pathway`) nem para o preset legado — é respeitado tal
+        como passado. Prova indireta: com vias=[], a pré-checagem de
+        readouts mapeados falha citando exatamente `[]` na mensagem — se
+        `[]` tivesse sido silenciosamente substituído pelo default, a
+        pré-checagem passaria (as 3 vias de setUp têm readout mapeado) e o
+        motor seria chamado.
+        """
+        fake_engine = MagicMock()
+        service = PathwayScoringService(self.project)
+        with patch.dict('sys.modules', {'rust_engine': fake_engine}):
+            with self.assertRaises(PfsReadoutsNotMappedError) as ctx:
+                service.run(pathway_kegg_ids=[], method_version='fase4-pfs-v1-empty')
+
+        self.assertIn('nas vias []', str(ctx.exception))
+        fake_engine.run_pfs_scoring.assert_not_called()
+
+
+# =============================================================================
 # 9. Modelo PathwayActivityScore
 # =============================================================================
 

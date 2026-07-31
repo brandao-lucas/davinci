@@ -116,8 +116,6 @@ pub(crate) struct GeneRoleRow {
     role: &'static str,
     cgc_flag: bool,
     vogelstein_flag: bool,
-    /// Valor cru de Gene Type para auditoria em `evidence`
-    evidence_raw: String,
     source_version: String,
 }
 
@@ -235,22 +233,12 @@ pub(crate) fn parse_oncokb_tsv(path: &Path, source_version: &str) -> Result<Vec<
             .map(|s| s.trim().eq_ignore_ascii_case("yes"))
             .unwrap_or(false);
 
-        // evidence: concatenar Gene Type + CGC + Vogelstein para auditoria
-        let cgc_str = if cgc_flag { "CGC:Yes" } else { "CGC:No" };
-        let vog_str = if vogelstein_flag { "Vogelstein:Yes" } else { "Vogelstein:No" };
-        let evidence_raw = if gene_type_raw.is_empty() {
-            format!("GeneType:none;{};{}", cgc_str, vog_str)
-        } else {
-            format!("GeneType:{};{};{}", gene_type_raw, cgc_str, vog_str)
-        };
-
         rows.push(GeneRoleRow {
             gene_symbol,
             entrez_id,
             role,
             cgc_flag,
             vogelstein_flag,
-            evidence_raw,
             source_version: source_version.to_string(),
         });
     }
@@ -283,7 +271,6 @@ pub(crate) async fn copy_gene_roles(
                 role             VARCHAR(30),
                 cgc_flag         BOOLEAN,
                 vogelstein_flag  BOOLEAN,
-                evidence         TEXT,
                 source           VARCHAR(20),
                 source_version   VARCHAR(100),
                 loaded_at        TIMESTAMPTZ
@@ -299,7 +286,7 @@ pub(crate) async fn copy_gene_roles(
         let sink = client
             .copy_in(
                 "COPY _staging_generole (gene_symbol, entrez_id, role, cgc_flag, \
-                 vogelstein_flag, evidence, source, source_version, loaded_at) \
+                 vogelstein_flag, source, source_version, loaded_at) \
                  FROM STDIN WITH (FORMAT csv, NULL 'NULL')",
             )
             .await?;
@@ -313,16 +300,15 @@ pub(crate) async fn copy_gene_roles(
         .execute(
             "INSERT INTO core_generole \
                 (gene_symbol, entrez_id, role, cgc_flag, vogelstein_flag, \
-                 evidence, source, source_version, loaded_at)
+                 source, source_version, loaded_at)
              SELECT gene_symbol, entrez_id, role, cgc_flag, vogelstein_flag, \
-                    evidence, source, source_version, loaded_at
+                    source, source_version, loaded_at
              FROM _staging_generole
              ON CONFLICT (gene_symbol, source) DO UPDATE SET
                  entrez_id        = COALESCE(EXCLUDED.entrez_id, core_generole.entrez_id),
                  role             = EXCLUDED.role,
                  cgc_flag         = EXCLUDED.cgc_flag,
                  vogelstein_flag  = EXCLUDED.vogelstein_flag,
-                 evidence         = EXCLUDED.evidence,
                  source_version   = EXCLUDED.source_version,
                  loaded_at        = EXCLUDED.loaded_at",
             &[],
@@ -343,13 +329,12 @@ fn build_gene_role_csv(rows: &[GeneRoleRow]) -> String {
     let mut csv = String::new();
     for r in rows {
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{}\n",
             escape_csv_field(&r.gene_symbol),
             r.entrez_id.map_or("NULL".to_string(), |v| v.to_string()),
             escape_csv_field(r.role),
             if r.cgc_flag { "t" } else { "f" },
             if r.vogelstein_flag { "t" } else { "f" },
-            escape_csv_field(&r.evidence_raw),
             escape_csv_field("oncokb"),
             escape_csv_field(&r.source_version),
             &now,
@@ -731,27 +716,6 @@ EMPTYGENE\t\t\tNo\tNo\t\n\
         let rows = parse_oncokb_tsv(&path, "2026-07-11").unwrap();
         // Se chegou aqui sem panic, extra col foi ignorada corretamente
         assert!(!rows.is_empty());
-    }
-
-    #[test]
-    fn test_parse_oncokb_tsv_evidence_raw_format() {
-        let dir = TempDir::new().unwrap();
-        let path = write_fixture(dir.path(), "oncokb.tsv", ONCOKB_FIXTURE);
-        let rows = parse_oncokb_tsv(&path, "2026-07-11").unwrap();
-
-        let vhl = rows.iter().find(|r| r.gene_symbol == "VHL").unwrap();
-        assert!(
-            vhl.evidence_raw.contains("TSG"),
-            "evidence_raw deve conter o valor cru 'TSG'"
-        );
-        assert!(
-            vhl.evidence_raw.contains("CGC:Yes"),
-            "evidence_raw deve conter 'CGC:Yes'"
-        );
-        assert!(
-            vhl.evidence_raw.contains("Vogelstein:Yes"),
-            "evidence_raw deve conter 'Vogelstein:Yes'"
-        );
     }
 
     /// Teste com fixture usando coluna CGC por substring (nome diferente de "COSMIC CGC (v99)")

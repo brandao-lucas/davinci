@@ -4,9 +4,23 @@ RegulonLoadService — orquestração Django da carga de regulons CollecTRI/Omni
 OmnisPathway Objetivo 2, Fase 3, Passo 3.3.
 
 Responsabilidade:
-  1. Derivar tf_allowlist dos nós gene das 3 vias já carregadas em PG:
+  1. Derivar tf_allowlist dos nós gene das vias já carregadas em PG (default:
+     TODAS as `Pathway` — ver "Universo de vias" abaixo):
      PathwayNode.objects.filter(pathway__kegg_id__in=[...], node_type='gene')
      .values_list('gene_symbol', flat=True).distinct() (exclui vazios).
+
+Universo de vias (generalizado — deixou de ser 3 fixas):
+  v1 (Fase 3 inicial) fixava DEFAULT_PATHWAY_IDS em 3 vias KEGG (hoje alias
+  de LEGACY_V1_PATHWAY_IDS). Com a bancada expandida para as vias humanas
+  completas do KEGG (372 vias, grafo com 49.322 nós / 5.520 símbolos-gene
+  distintos), fixar em 3 deixaria o tf_allowlist artificialmente pequeno — a
+  allowlist é 100% derivada do grafo carregado (`_derive_tf_allowlist`), não
+  de uma lista hardcoded independente dele. `dispatch()`/`run()` agora
+  resolvem `pathway_ids=None` para TODAS as `Pathway.kegg_id` em PG no
+  momento da chamada (`_resolve_default_pathway_ids`), não para a constante.
+  `pathway_ids` explícito (via `--pathway` no command, ou chamada
+  programática) continua restringindo a execução — útil para debug ou para
+  reproduzir o preset legado (LEGACY_V1_PATHWAY_IDS).
   2. Gate de idempotência: não duplicar job ativo de REGULON_LOAD.
   3. Criar IngestionJob(job_type=REGULON_LOAD).
   4. Chamar rust_engine.load_collectri_regulons(tf_allowlist, dest_dir)
@@ -94,16 +108,43 @@ import tempfile
 from django.conf import settings
 from django.utils import timezone
 
-from apps.core.models import DaVinciProject, IngestionJob, PathwayNode
+from apps.core.models import DaVinciProject, IngestionJob, Pathway, PathwayNode
 
 logger = logging.getLogger(__name__)
 
-# Vias padrão que definem o escopo do tf_allowlist (deve ser consistente
-# com as vias carregadas no passo 3.2).
-DEFAULT_PATHWAY_IDS = ['hsa04151', 'hsa04010', 'hsa04115']
+# Preset legado (v1, Fase 3 inicial) — as 3 vias KEGG originais (PI3K-Akt,
+# MAPK, p53). NÃO é mais o default de dispatch()/run() (ver "Universo de
+# vias" na docstring do módulo) — mantido nomeado só para reprodutibilidade
+# de execuções antigas / testes que queiram fixar o universo explicitamente.
+LEGACY_V1_PATHWAY_IDS = ['hsa04151', 'hsa04010', 'hsa04115']
+
+# Alias retrocompatível (nome antigo) — mesmo conteúdo do preset acima.
+# Não usar como default: ver dispatch()/run() (usam
+# _resolve_default_pathway_ids() quando pathway_ids=None).
+DEFAULT_PATHWAY_IDS = LEGACY_V1_PATHWAY_IDS
 
 # Versão do loader: atualizar quando o contrato Rust mudar de forma incompatível.
 LOADER_VERSION = 'collectri-v1'
+
+
+def _resolve_default_pathway_ids() -> list[str]:
+    """
+    Resolve o universo padrão de vias: TODAS as `Pathway.kegg_id` carregadas
+    em PG neste momento — não a constante `DEFAULT_PATHWAY_IDS` (preset
+    legado de 3 vias).
+
+    Chamada sob demanda (dentro de dispatch()/run(), quando `pathway_ids`
+    não foi informado) para refletir o catálogo `Pathway` no momento da
+    execução, não em tempo de import do módulo.
+
+    Retorna lista vazia se `Pathway` estiver vazio (nenhuma via carregada
+    ainda) — o chamador (`_derive_tf_allowlist`) trata isso como "nenhum
+    PathwayNode encontrado" e levanta `RegulonGraphNotLoadedError`, o mesmo
+    comportamento de antes para o caso "passo 3.2 não rodou".
+    """
+    return list(
+        Pathway.objects.order_by('kegg_id').values_list('kegg_id', flat=True)
+    )
 
 
 class RegulonJobActiveError(Exception):
@@ -133,9 +174,12 @@ class RegulonGraphNotLoadedError(Exception):
 
 class RegulonLoadService:
     """
-    Serviço de carga de regulons CollecTRI (OmniPath) para os TFs das 3 vias.
+    Serviço de carga de regulons CollecTRI (OmniPath) para os TFs das vias
+    carregadas (default: TODAS as `Pathway` em PG — ver "Universo de vias"
+    na docstring do módulo).
 
-    Uso síncrono (management command / bancada de prova):
+    Uso síncrono (management command / bancada de prova) — universo default
+    (todas as vias carregadas):
         service = RegulonLoadService(project)
         result = service.run()
 
@@ -180,7 +224,9 @@ class RegulonLoadService:
         Args:
             project: DaVinciProject de tracking (isolamento de IngestionJob).
             pathway_ids: IDs KEGG cujos TFs compõem o allowlist. None →
-                         DEFAULT_PATHWAY_IDS.
+                         TODAS as `Pathway` carregadas em PG neste momento
+                         (`_resolve_default_pathway_ids`) — lista explícita
+                         (incl. `[]`) é respeitada tal como passada.
 
         Returns:
             IngestionJob recém-criado (status=PENDING).
@@ -191,7 +237,7 @@ class RegulonLoadService:
         """
         from apps.core.tasks.ingestion_tasks import run_regulon_load
 
-        ids = pathway_ids or DEFAULT_PATHWAY_IDS
+        ids = pathway_ids if pathway_ids is not None else _resolve_default_pathway_ids()
         service = cls(project)
         tf_allowlist = service._derive_tf_allowlist(ids)
         service._check_idempotency()
@@ -248,7 +294,9 @@ class RegulonLoadService:
             job: IngestionJob existente (criado pelo dispatch); se None, cria
                  internamente.
             pathway_ids: IDs KEGG cujos TFs compõem o allowlist. None →
-                         job.parameters ou DEFAULT_PATHWAY_IDS.
+                         job.parameters['pathway_ids'] (se `job` foi
+                         informado) ou TODAS as `Pathway` carregadas em PG
+                         neste momento (`_resolve_default_pathway_ids`).
 
         Returns:
             dict com n_tfs, n_targets, n_edges, regulon_path, tf_allowlist_size.
@@ -257,10 +305,10 @@ class RegulonLoadService:
 
         # Resolve pathway_ids
         if pathway_ids is None:
-            if job is not None:
-                pathway_ids = job.parameters.get('pathway_ids', DEFAULT_PATHWAY_IDS)
+            if job is not None and job.parameters.get('pathway_ids') is not None:
+                pathway_ids = job.parameters['pathway_ids']
             else:
-                pathway_ids = DEFAULT_PATHWAY_IDS
+                pathway_ids = _resolve_default_pathway_ids()
 
         tf_allowlist = self._derive_tf_allowlist(pathway_ids)
 

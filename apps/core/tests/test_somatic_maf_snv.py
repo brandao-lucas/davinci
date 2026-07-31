@@ -164,9 +164,21 @@ def _write_occurrences_tsv(
             })
 
 
-def _make_fake_sample_column(case_id: str, sample_role: str = 'tumor', column_index: int = 0):
+def _make_fake_sample_column(sample_accession: str, sample_role: str = 'tumor', column_index: int = 0):
+    """
+    Fabrica um MafSampleColumn fake.
+
+    CONTRATO REAL (rust_src/src/omics/maf_loader.rs): o campo `case_id` de
+    `MafSampleColumn`, apesar do nome, carrega a `sample_accession` COMPLETA
+    que o Django enviou em `MafFileEntry.sample_accession` (ex.:
+    "C3L-00004_tumor") — o Rust apenas ecoa o valor recebido, NÃO deriva um
+    case_id nu. `sample_accession` aqui deve, portanto, já vir com o sufixo
+    de papel (ex.: "C3L-00004_tumor"), replicando o que o Rust de fato
+    devolve. Passar um case_id nu aqui mascara o bug de sufixo duplicado
+    (_tumor_tumor) que existiu em somatic_maf_service.py.
+    """
     col = MagicMock()
-    col.case_id = case_id
+    col.case_id = sample_accession
     col.sample_role = sample_role
     col.column_index = column_index
     return col
@@ -179,22 +191,29 @@ def _make_fake_manifest(
     n_files: int = 3,
     n_occurrences: int = 5,
 ) -> MagicMock:
-    """Manifesto fake de SomaticMafManifest do Rust."""
-    case_ids = sample_case_ids or ['C3L-00004', 'C3L-00005']
+    """
+    Manifesto fake de SomaticMafManifest do Rust.
+
+    `sample_case_ids` — apesar do nome do parâmetro (mantido por
+    compatibilidade com os call sites), espera-se a sample_accession
+    COMPLETA de cada amostra (ex.: "C3L-00004_tumor"), pois é isso que
+    `MafSampleColumn.case_id` carrega de fato (ver `_make_fake_sample_column`).
+    """
+    accessions = sample_case_ids or ['C3L-00004_tumor', 'C3L-00005_tumor']
     m = MagicMock()
     m.parquet_path = parquet_path
     m.occurrences_path = occurrences_path
     m.checksum_md5 = 'abcdef1234567890abcdef1234567890'
     m.n_features = 200
-    m.n_samples = len(case_ids)
+    m.n_samples = len(accessions)
     m.n_files_processed = n_files
     m.n_occurrences = n_occurrences
     m.n_variants_skipped_synonymous = 2
     m.n_variants_skipped_offlist = 8
     m.errors = []
     m.sample_columns = [
-        _make_fake_sample_column(cid, 'tumor', idx)
-        for idx, cid in enumerate(case_ids)
+        _make_fake_sample_column(acc, 'tumor', idx)
+        for idx, acc in enumerate(accessions)
     ]
     return m
 
@@ -804,7 +823,7 @@ class SomaticMafRunTests(_SomaticStorageTestCase):
         fake_manifest = _make_fake_manifest(
             parquet_path=parquet_path,
             occurrences_path=occurrences_path,
-            sample_case_ids=['C3L-00001'],
+            sample_case_ids=['C3L-00001_tumor'],
             n_files=3,
             n_occurrences=len(rows),
         )
@@ -867,6 +886,30 @@ class SomaticMafRunTests(_SomaticStorageTestCase):
         self.assertTrue(
             OmicSample.objects.filter(accession='C3L-00001_tumor').exists()
         )
+
+    def test_run_does_not_duplicate_role_suffix_in_accession(self):
+        """
+        Regressão: MafSampleColumn.case_id JÁ vem com a accession completa
+        (contrato do Rust — ver comentário em _persist_orm). run() não pode
+        re-sufixar com "_tumor", produzindo "C3L-00001_tumor_tumor".
+        """
+        self._run_mocked()
+
+        self.assertFalse(
+            OmicSample.objects.filter(accession__endswith='_tumor_tumor').exists(),
+            'accession com sufixo de papel duplicado — regressão do bug de '
+            'mapeamento barcode GDC ↔ OmicSample',
+        )
+
+    def test_run_characteristics_case_id_is_bare(self):
+        """
+        characteristics['case_id'] deve ser o case_id NU (sem sufixo de papel),
+        pois é a fonte primária consumida por SamplePairingService.
+        """
+        self._run_mocked()
+
+        sample = OmicSample.objects.get(accession='C3L-00001_tumor')
+        self.assertEqual(sample.characteristics['case_id'], 'C3L-00001')
 
     def test_run_creates_omic_matrix_sample(self):
         """run() cria OmicMatrixSample vinculando amostra à matriz."""
@@ -1153,7 +1196,7 @@ class LoadSomaticMafCommandTests(_SomaticStorageTestCase):
         fake_manifest = _make_fake_manifest(
             parquet_path=parquet_path,
             occurrences_path=occurrences_path,
-            sample_case_ids=['C3L-00001'],
+            sample_case_ids=['C3L-00001_tumor'],
             n_occurrences=1,
         )
         fake_engine = MagicMock()

@@ -913,6 +913,33 @@ class RegulonLoadServiceTests(TestCase):
         # tf_allowlist_size deve refletir os 3 genes distintos (sem contar pathway)
         self.assertGreaterEqual(result['tf_allowlist_size'], 3)
 
+    def test_run_sem_pathway_ids_deriva_de_todas_as_pathway_em_pg(self):
+        """
+        pathway_ids=None (nenhum argumento, sem job) deriva o tf_allowlist de
+        TODAS as `Pathway` em PG — não do preset legado de 3 vias fixas
+        (LEGACY_V1_PATHWAY_IDS/DEFAULT_PATHWAY_IDS). Prova: cria uma via FORA
+        do preset legado (hsa04150) com um TF exclusivo dela e confirma que
+        ele aparece no tf_allowlist passado ao Rust — o preset legado antigo
+        jamais o incluiria.
+        """
+        from apps.core.services.regulon_load_service import RegulonLoadService
+
+        self._setup_graph(pathway_ids=['hsa04150'], genes=['FOXO3'])
+
+        fake_manifest = _make_regulon_manifest('/tmp/regulon_default_universe.jsonl')
+        fake_engine = MagicMock()
+        fake_engine.load_collectri_regulons.return_value = fake_manifest
+
+        service = RegulonLoadService(self.project)
+        with patch.dict('sys.modules', {'rust_engine': fake_engine}):
+            service.run()  # pathway_ids=None, job=None -> default: todas as Pathway
+
+        call_kwargs = fake_engine.load_collectri_regulons.call_args[1]
+        self.assertIn(
+            'FOXO3', call_kwargs['tf_allowlist'],
+            'Default deve incluir vias fora do preset legado de 3 vias fixas',
+        )
+
 
 class RegulonIdempotencyTests(TestCase):
     """Testa idempotência do RegulonLoadService."""
@@ -1422,12 +1449,44 @@ class ReadoutMappingContractTests(ReadoutMappingBaseTestCase):
         report = service.run()
         self.assertEqual(report['mapping_version'], 'fase3-readout-v1')
 
+    def test_default_sem_pathway_ids_usa_todas_as_pathway_em_pg(self):
+        """
+        Sem pathway_ids_phospho/pathway_ids_tf no construtor, o service usa
+        TODAS as `Pathway` em PG — não o preset legado de 3 vias fixas
+        (LEGACY_V1_PHOSPHO_PATHWAY_IDS/LEGACY_V1_TF_PATHWAY_IDS). Prova: cria
+        uma 4ª via FORA do preset legado com um nó gene cujo símbolo existe
+        na matriz de fosfo, e confirma que ela entra no universo desta
+        execução (n_pathways_total) e produz readout de fosfo — o preset
+        legado antigo jamais a incluiria.
+        """
+        from apps.core.services.readout_mapping_service import ReadoutMappingService
+
+        extra_pathway = _make_pathway('hsa04150', 'mTOR signaling pathway')
+        # AKT1 já está catalogado na matriz de fosfo (setUp) — reaproveita
+        # para provar que a via nova participa da Regra 1 sem configuração
+        # adicional.
+        _make_node(extra_pathway, 'AKT1', 'extra-e1')
+
+        service = ReadoutMappingService(dry_run=True)  # default: todas as vias
+        report = service.run()
+
+        self.assertEqual(
+            report['n_pathways_total'], 4,
+            'Universo default deve incluir as 3 vias do preset legado + a '
+            '4a via nova (fora do preset)',
+        )
+
     def test_report_contem_todas_as_chaves_do_contrato(self):
         """
         run() retorna dict com EXATAMENTE as chaves esperadas — travamento
         estrito (assertEqual de sets, não apenas assertIn por chave) para que
         a remoção de `gatilho_ac` (A→C concluída) ou a introdução de campo
         novo sem atualizar este teste sejam ambas detectadas.
+
+        Inclui as chaves de distribuição por via (`n_pathways_*`),
+        introduzidas na generalização do mapeamento para todas as vias
+        carregadas (OmnisPathway Obj 2 — bancada expandida de 3 para 372
+        vias KEGG humanas) — item 5 do relatório operacional.
         """
         service = self._make_service()
         report = service.run()
@@ -1435,6 +1494,8 @@ class ReadoutMappingContractTests(ReadoutMappingBaseTestCase):
         expected_keys = {
             'n_phospho_mapped', 'n_tf_mapped', 'n_nodes_readout',
             'n_unmapped_nodes', 'n_features_not_found',
+            'n_pathways_total', 'n_pathways_with_phospho',
+            'n_pathways_with_tf', 'n_pathways_without_readout',
             'mapping_version', 'dry_run', 'duration_s',
             'validation_strategy',
             'phospho_matrix_id', 'proteome_matrix_id', 'regulon_path_found',

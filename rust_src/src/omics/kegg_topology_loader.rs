@@ -35,8 +35,18 @@
 ///   `kegg_id` vire componente de path (`Path::join` com absoluto descarta a
 ///   base) ou injete segmentos na URL (hardening A3, laudo 007).
 /// - Teto de bytes: 50 MB por KGML (arquivos KEGG são pequenos; cap generoso).
-/// - Rate limit: ≤ 3 req/s (3 vias = 3 chamadas; sem sleep necessário, mas documentado).
-/// - Cache local em `dest_dir/kegg/` (gitignored).
+/// - Rate limit: KEGG documenta ≤ 3 req/s e proíbe bulk download sem
+///   espaçamento. Com 372 vias (`hsa`, carga completa — Fase 3+), disparar
+///   sem intervalo bloquearia o acesso. `load_kegg_topology_async` faz
+///   throttle real entre downloads (não entre cache hits): mede o tempo
+///   decorrido desde o início do fetch anterior via relógio monotônico
+///   (`std::time::Instant`) e dorme só o restante até completar
+///   `throttle_ms` (default 400 ms = 2,5 req/s, margem de segurança sob o
+///   limite de 3 req/s). Ver `throttle_sleep_duration`.
+/// - Cache local em `dest_dir/kegg/` (gitignored) — um KGML já cacheado
+///   nunca gera requisição HTTP nem consome o throttle (ver `download_kgml`
+///   vs. branch de cache em `load_kegg_topology_async`), então reexecuções
+///   da mesma lista de vias são baratas.
 /// - Fixtures de teste **SINTÉTICAS** — não commitar KGML bruto KEGG.
 /// - `redirect::Policy::none()` no client HTTP (hardening A4, laudo 007):
 ///   `rest.kegg.jp` não depende de redirect (checado empiricamente); proibir
@@ -55,17 +65,76 @@
 /// `PanicException` em runtime (não é pego por `cargo check`/testes com mock).
 /// Toda leitura de PK/FK neste módulo **deve** usar `i64`, e qualquer tabela
 /// temp de staging que receba essas colunas deve ser `BIGINT`, não `INT`.
+///
+/// # Dedupe de chave de conflito ANTES do COPY (bug de produção — via `hsa00030`)
+///
+/// KGML metabólico (ex.: `hsa00030`, Pentose phosphate) pode conter múltiplas
+/// `<relation>` ECrel com o MESMO par `(entry1, entry2)`, cada uma carregando
+/// um `<subtype name="compound">` diferente — o metabólito que liga duas
+/// enzimas. `"compound"` não é subtype de sinal conhecido (§Sinal), então
+/// todas essas relações derivam para `sign=0, interaction="unknown"` — a
+/// MESMA natural key de conflito `(pathway_id, source_node_id,
+/// target_node_id, interaction)`. Duas (ou mais) linhas do MESMO lote de
+/// `INSERT ... ON CONFLICT DO UPDATE` com a mesma chave de conflito fazem o
+/// Postgres recusar o comando **inteiro** com `ON CONFLICT DO UPDATE command
+/// cannot affect row a second time` (SQLSTATE 21000) — não é a linha
+/// duplicada que falha, é o INSERT inteiro (visto em produção: 15 vias OK,
+/// `hsa00030` quebrou o job das 372).
+///
+/// `merge_duplicate_edges` deduplica por essa chave **antes** de montar o
+/// COPY, unindo (com dedup interno de valores) os `subtypes` das relações
+/// colapsadas — preserva proveniência em vez de descartar. `sign`/
+/// `interaction` nunca conflitam entre linhas colapsadas (deriváveis 1:1 de
+/// `interaction`, que já é parte da chave). `dedup_nodes_by_entry_id` faz o
+/// mesmo preventivamente para nós (NK `(pathway, kegg_entry_id)`), embora o
+/// formato KGML declare `entry id` único por arquivo — não deveria colidir,
+/// mas um KGML malformado causaria o mesmo erro 21000 sem essa defesa.
+///
+/// Nota: `ParsedEdge.subtypes` hoje só captura o atributo `name` do
+/// `<subtype>` (não `value`). Para relações `compound`, `name` é sempre o
+/// literal `"compound"` — o identificador do metabólito específico vive em
+/// `value`, não capturado. O union de `subtypes` aqui preserva toda a
+/// proveniência que o parser já extrai; diferenciar metabólitos individuais
+/// exigiria capturar `value` também, o que colide com o uso de `subtypes`
+/// para derivar sinal (`derive_sign_and_interaction` casa por igualdade
+/// exata contra literais como `"activation"`) — fora do escopo deste fix.
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
 use bytes::Bytes;
+use indexmap::IndexMap;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use tokio_postgres::Client;
 
 // ─── Teto de bytes por KGML ──────────────────────────────────────────────────
 const KEGG_MAX_BYTES: usize = 50 * 1024 * 1024; // 50 MB
+
+// ─── Throttle de requisições KGML ────────────────────────────────────────────
+
+/// Intervalo mínimo padrão entre downloads KGML, em milissegundos.
+///
+/// 400 ms ⇒ 2,5 req/s, margem de segurança confortável sob o limite documentado
+/// do KEGG (≤ 3 req/s, sob risco de bloqueio de acesso). Com 372 vias `hsa`,
+/// 372 × 0,4 s ≈ 2,5 min de espera total — aceitável para uma carga completa.
+/// Parametrizável via `throttle_ms` em `load_kegg_topology`/`load_kegg_topology_async`
+/// para não engessar (ex.: reduzir em teste local com endpoint mockado).
+pub const KEGG_DEFAULT_THROTTLE_MS: u64 = 400;
+
+/// Calcula quanto dormir para respeitar `min_interval` entre requisições,
+/// dado o tempo já decorrido desde a requisição anterior.
+///
+/// Função pura (sem I/O, sem relógio de parede) para ser testável sem depender
+/// de tempo real: `elapsed_since_last` já vem calculado pelo chamador via
+/// `Instant::elapsed()`. Se `elapsed_since_last >= min_interval`, não dorme
+/// (`Duration::ZERO`) — nunca dorme um valor fixo cego.
+fn throttle_sleep_duration(
+    elapsed_since_last: std::time::Duration,
+    min_interval: std::time::Duration,
+) -> std::time::Duration {
+    min_interval.saturating_sub(elapsed_since_last)
+}
 
 // ─── Manifesto público ────────────────────────────────────────────────────────
 
@@ -507,6 +576,35 @@ async fn download_kgml(
 
 // ─── COPY UPSERT via tokio-postgres ──────────────────────────────────────────
 
+/// Formata um erro `tokio_postgres::Error` incluindo SQLSTATE + mensagem do
+/// servidor quando disponível (bug de produção corrigido — Fase 3).
+///
+/// A `Display` de `tokio_postgres::Error` para erros de banco (`Kind::Db`)
+/// retorna só a string fixa `"db error"` — sem código, sem mensagem, sem
+/// detalhe — porque o texto real fica no `DbError` de dentro da cadeia de
+/// `source()`, não no próprio `Error`. Isso custou uma investigação inteira:
+/// a mensagem propagada para o Python era literalmente `"INSERT edges from
+/// stage: db error"`, sem indicar qual constraint/comando falhou.
+/// `Error::as_db_error()` expõe o `DbError` de verdade (SQLSTATE, mensagem e
+/// detail do Postgres); usamos isso quando o erro é de banco e caímos para
+/// `Display` só para erros que não são (`Io`, `Tls`, `Closed`, etc.).
+fn describe_pg_error(e: &tokio_postgres::Error) -> String {
+    match e.as_db_error() {
+        Some(db_err) => {
+            let mut msg = format!(
+                "db error (SQLSTATE {}): {}",
+                db_err.code().code(),
+                db_err.message()
+            );
+            if let Some(detail) = db_err.detail() {
+                msg.push_str(&format!(" DETAIL: {}", detail));
+            }
+            msg
+        }
+        None => e.to_string(),
+    }
+}
+
 /// Insere ou atualiza um `Pathway` em `core_pathway` (ON CONFLICT kegg_id).
 ///
 /// Retorna o `id` da linha (novo ou existente).
@@ -537,9 +635,38 @@ async fn upsert_pathway(
             &[&kegg_id, &name, &source_version],
         )
         .await
-        .map_err(|e| format!("upsert_pathway '{}': {}", kegg_id, e))?;
+        .map_err(|e| format!("upsert_pathway '{}': {}", kegg_id, describe_pg_error(&e)))?;
 
     Ok(row.get::<_, i64>(0))
+}
+
+/// Deduplica nós por `kegg_entry_id` ANTES do COPY — defensivo (item 2 do
+/// hardening pós-`hsa00030`).
+///
+/// A natural key de conflito de `core_pathwaynode` é `(pathway_id,
+/// kegg_entry_id)`. O formato KGML declara `entry id` como identificador
+/// único do elemento dentro do arquivo — relations/reactions o referenciam
+/// como se fosse uma PK — então não deveria repetir. Mas nada externo
+/// garante que um KGML esteja bem formado, e a mesma classe de erro 21000
+/// vista nas arestas aconteceria aqui se `entry id` colidisse. Mantém a
+/// ÚLTIMA ocorrência (mesma convergência que `ON CONFLICT DO UPDATE`
+/// produziria se cada linha fosse aplicada em sequência).
+///
+/// `IndexMap`: O(1) amortizado por chave — O(n) no total, não O(n²) —
+/// necessário na escala de 372 vias (`hsa01100` sozinha soma milhares de
+/// entries). Preserva ordem de inserção para saída determinística em teste.
+fn dedup_nodes_by_entry_id(nodes: &[ParsedNode]) -> (IndexMap<String, ParsedNode>, usize) {
+    let mut deduped: IndexMap<String, ParsedNode> = IndexMap::with_capacity(nodes.len());
+    let mut n_collapsed = 0usize;
+    for node in nodes {
+        if deduped
+            .insert(node.kegg_entry_id.clone(), node.clone())
+            .is_some()
+        {
+            n_collapsed += 1;
+        }
+    }
+    (deduped, n_collapsed)
 }
 
 /// COPY UPSERT dos nós em `core_pathwaynode`.
@@ -553,6 +680,15 @@ async fn copy_upsert_nodes(
 ) -> Result<HashMap<String, i64>, String> {
     if nodes.is_empty() {
         return Ok(HashMap::new());
+    }
+
+    // Dedupe defensivo por `kegg_entry_id` — ver `dedup_nodes_by_entry_id`.
+    let (deduped_nodes, n_dedup_collapsed) = dedup_nodes_by_entry_id(nodes);
+    if n_dedup_collapsed > 0 {
+        eprintln!(
+            "[kegg_topology_loader] {} nós colapsados por kegg_entry_id repetido (KGML malformado?); mantida a última ocorrência",
+            n_dedup_collapsed
+        );
     }
 
     // Criar tabela temp para staging.
@@ -571,7 +707,7 @@ async fn copy_upsert_nodes(
     client
         .execute("DROP TABLE IF EXISTS _kegg_node_stage", &[])
         .await
-        .map_err(|e| format!("DROP staging nodes: {}", e))?;
+        .map_err(|e| format!("DROP staging nodes: {}", describe_pg_error(&e)))?;
 
     client
         .execute(
@@ -585,16 +721,16 @@ async fn copy_upsert_nodes(
             &[],
         )
         .await
-        .map_err(|e| format!("CREATE TEMP TABLE nodes: {}", e))?;
+        .map_err(|e| format!("CREATE TEMP TABLE nodes: {}", describe_pg_error(&e)))?;
 
     // COPY para a tabela staging
     let sink = client
         .copy_in("COPY _kegg_node_stage (kegg_entry_id, node_type, kegg_ids, gene_symbol, graphics_name) FROM STDIN WITH (FORMAT text, DELIMITER '\t')")
         .await
-        .map_err(|e| format!("COPY IN node stage: {}", e))?;
+        .map_err(|e| format!("COPY IN node stage: {}", describe_pg_error(&e)))?;
 
     let mut data = String::new();
-    for node in nodes {
+    for node in deduped_nodes.values() {
         // kegg_ids: formato de array PostgreSQL {hsa:5290,hsa:1647}
         let kegg_ids_pg = format!(
             "{{{}}}",
@@ -625,10 +761,10 @@ async fn copy_upsert_nodes(
     let mut sink = std::pin::pin!(sink);
     sink.send(Bytes::from(data))
         .await
-        .map_err(|e| format!("COPY send node stage: {}", e))?;
+        .map_err(|e| format!("COPY send node stage: {}", describe_pg_error(&e)))?;
     sink.finish()
         .await
-        .map_err(|e| format!("COPY finish node stage: {}", e))?;
+        .map_err(|e| format!("COPY finish node stage: {}", describe_pg_error(&e)))?;
 
     // Upsert da staging → core_pathwaynode
     client
@@ -656,7 +792,7 @@ async fn copy_upsert_nodes(
             &[&pathway_id],
         )
         .await
-        .map_err(|e| format!("INSERT nodes from stage: {}", e))?;
+        .map_err(|e| format!("INSERT nodes from stage: {}", describe_pg_error(&e)))?;
 
     // Resolver kegg_entry_id → PK (id)
     let rows = client
@@ -665,7 +801,7 @@ async fn copy_upsert_nodes(
             &[&pathway_id],
         )
         .await
-        .map_err(|e| format!("SELECT node PKs: {}", e))?;
+        .map_err(|e| format!("SELECT node PKs: {}", describe_pg_error(&e)))?;
 
     let mut map: HashMap<String, i64> = HashMap::with_capacity(rows.len());
     for row in rows {
@@ -677,10 +813,108 @@ async fn copy_upsert_nodes(
     Ok(map)
 }
 
+/// Aresta "mesclada", pronta para COPY: `subtypes` unidos (dedup de valores,
+/// ordem de primeira ocorrência preservada) de todas as relações KGML que
+/// colapsaram na mesma chave de conflito `(source_node_id, target_node_id,
+/// interaction)`. `sign`/`relation_type`/`interaction` vêm da primeira
+/// relação vista para a chave — ver justificativa em `merge_duplicate_edges`.
+#[derive(Debug, Clone, PartialEq)]
+struct MergedEdge {
+    sign: i16,
+    relation_type: String,
+    subtypes: Vec<String>,
+    interaction: String,
+}
+
+/// Resolve `entry_id → PK` e deduplica arestas pela chave de conflito
+/// `(source_node_id, target_node_id, interaction)` ANTES do COPY — o fix do
+/// bug de produção da via `hsa00030` (ver doc do módulo, seção "Dedupe de
+/// chave de conflito ANTES do COPY").
+///
+/// Arestas com `entry_id` não resolvido em `node_id_map` são logadas e
+/// descartadas (comportamento pré-existente, preservado).
+///
+/// Decisão de dedupe: os `subtypes` de TODAS as relações colapsadas na mesma
+/// chave são unidos num único array (com dedup interno de valores) — em vez
+/// de manter só a primeira e descartar as demais, preserva toda a
+/// proveniência que `ParsedEdge.subtypes` carrega. `sign`/`interaction` não
+/// têm conflito de valor a resolver: são deriváveis 1:1 de `interaction` por
+/// construção (`derive_sign_and_interaction`), e `interaction` já faz parte
+/// da chave de dedupe — logo toda linha colapsada na mesma chave já tem o
+/// mesmo `sign`. `relation_type` mantém o da primeira ocorrência (divergir
+/// para o mesmo par não foi observado no KGML real e não afeta sinal).
+///
+/// `IndexMap<(i64, i64, String), MergedEdge>`: inserção/lookup O(1)
+/// amortizado por chave — O(n) no total sobre `edges`, não O(n²) —
+/// necessário para `hsa01100` (mapa metabólico global, milhares de
+/// relações) na carga completa de 372 vias. `IndexMap` só para preservar
+/// ordem de inserção e tornar a saída determinística em teste.
+fn merge_duplicate_edges(
+    node_id_map: &HashMap<String, i64>,
+    edges: &[ParsedEdge],
+) -> (IndexMap<(i64, i64, String), MergedEdge>, usize, usize) {
+    let mut merged: IndexMap<(i64, i64, String), MergedEdge> = IndexMap::new();
+    let mut n_unresolved = 0usize;
+    let mut n_collapsed = 0usize;
+
+    for edge in edges {
+        let source_pk = match node_id_map.get(&edge.source_entry_id) {
+            Some(pk) => *pk,
+            None => {
+                eprintln!(
+                    "[kegg_topology_loader] aresta com entry1={} não resolvida; descartando",
+                    edge.source_entry_id
+                );
+                n_unresolved += 1;
+                continue;
+            }
+        };
+        let target_pk = match node_id_map.get(&edge.target_entry_id) {
+            Some(pk) => *pk,
+            None => {
+                eprintln!(
+                    "[kegg_topology_loader] aresta com entry2={} não resolvida; descartando",
+                    edge.target_entry_id
+                );
+                n_unresolved += 1;
+                continue;
+            }
+        };
+
+        let key = (source_pk, target_pk, edge.interaction.clone());
+        match merged.get_mut(&key) {
+            Some(existing) => {
+                for s in &edge.subtypes {
+                    if !existing.subtypes.contains(s) {
+                        existing.subtypes.push(s.clone());
+                    }
+                }
+                n_collapsed += 1;
+            }
+            None => {
+                merged.insert(
+                    key,
+                    MergedEdge {
+                        sign: edge.sign,
+                        relation_type: edge.relation_type.clone(),
+                        subtypes: edge.subtypes.clone(),
+                        interaction: edge.interaction.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    (merged, n_unresolved, n_collapsed)
+}
+
 /// COPY UPSERT das arestas em `core_pathwayedge`.
 ///
 /// Usa `node_id_map` para resolver `kegg_entry_id → node_pk`.
-/// Arestas com entry_id não resolvido são logadas e descartadas.
+/// Arestas com entry_id não resolvido são logadas e descartadas. Arestas que
+/// colapsam na mesma chave de conflito são deduplicadas via
+/// `merge_duplicate_edges` — ver doc lá para a causa-raiz e a decisão de
+/// unir `subtypes` em vez de descartar.
 async fn copy_upsert_edges(
     client: &Client,
     pathway_id: i64,
@@ -689,6 +923,21 @@ async fn copy_upsert_edges(
 ) -> Result<usize, String> {
     if edges.is_empty() {
         return Ok(0);
+    }
+
+    let (merged, n_unresolved, n_collapsed) = merge_duplicate_edges(node_id_map, edges);
+
+    if n_unresolved > 0 {
+        eprintln!(
+            "[kegg_topology_loader] {} arestas descartadas por entry_id não resolvido",
+            n_unresolved
+        );
+    }
+    if n_collapsed > 0 {
+        eprintln!(
+            "[kegg_topology_loader] {} relações colapsadas por dedupe de chave de conflito (source_node_id, target_node_id, interaction); subtypes unidos",
+            n_collapsed
+        );
     }
 
     // Criar tabela temp.
@@ -700,7 +949,7 @@ async fn copy_upsert_edges(
     client
         .execute("DROP TABLE IF EXISTS _kegg_edge_stage", &[])
         .await
-        .map_err(|e| format!("DROP staging edges: {}", e))?;
+        .map_err(|e| format!("DROP staging edges: {}", describe_pg_error(&e)))?;
 
     client
         .execute(
@@ -715,44 +964,20 @@ async fn copy_upsert_edges(
             &[],
         )
         .await
-        .map_err(|e| format!("CREATE TEMP TABLE edges: {}", e))?;
+        .map_err(|e| format!("CREATE TEMP TABLE edges: {}", describe_pg_error(&e)))?;
 
     let sink = client
         .copy_in("COPY _kegg_edge_stage (source_node_id, target_node_id, sign, relation_type, subtypes, interaction) FROM STDIN WITH (FORMAT text, DELIMITER '\t')")
         .await
-        .map_err(|e| format!("COPY IN edge stage: {}", e))?;
+        .map_err(|e| format!("COPY IN edge stage: {}", describe_pg_error(&e)))?;
 
     let mut data = String::new();
-    let mut n_unresolved = 0usize;
 
-    for edge in edges {
-        let source_pk = match node_id_map.get(&edge.source_entry_id) {
-            Some(pk) => pk,
-            None => {
-                eprintln!(
-                    "[kegg_topology_loader] aresta com entry1={} não resolvida; descartando",
-                    edge.source_entry_id
-                );
-                n_unresolved += 1;
-                continue;
-            }
-        };
-        let target_pk = match node_id_map.get(&edge.target_entry_id) {
-            Some(pk) => pk,
-            None => {
-                eprintln!(
-                    "[kegg_topology_loader] aresta com entry2={} não resolvida; descartando",
-                    edge.target_entry_id
-                );
-                n_unresolved += 1;
-                continue;
-            }
-        };
-
+    for ((source_pk, target_pk, _interaction), m) in merged.iter() {
         // subtypes: array PG {activation,phosphorylation}
         let subtypes_pg = format!(
             "{{{}}}",
-            edge.subtypes
+            m.subtypes
                 .iter()
                 .map(|s| s.replace('\\', "\\\\").replace('"', "\\\""))
                 .collect::<Vec<_>>()
@@ -770,28 +995,21 @@ async fn copy_upsert_edges(
             "{}\t{}\t{}\t{}\t{}\t{}\n",
             source_pk,
             target_pk,
-            edge.sign,
-            escape(&edge.relation_type),
+            m.sign,
+            escape(&m.relation_type),
             escape(&subtypes_pg),
-            escape(&edge.interaction),
+            escape(&m.interaction),
         ));
-    }
-
-    if n_unresolved > 0 {
-        eprintln!(
-            "[kegg_topology_loader] {} arestas descartadas por entry_id não resolvido",
-            n_unresolved
-        );
     }
 
     use futures::SinkExt;
     let mut sink = std::pin::pin!(sink);
     sink.send(Bytes::from(data))
         .await
-        .map_err(|e| format!("COPY send edge stage: {}", e))?;
+        .map_err(|e| format!("COPY send edge stage: {}", describe_pg_error(&e)))?;
     sink.finish()
         .await
-        .map_err(|e| format!("COPY finish edge stage: {}", e))?;
+        .map_err(|e| format!("COPY finish edge stage: {}", describe_pg_error(&e)))?;
 
     // Upsert da staging → core_pathwayedge
     let n_inserted = client
@@ -816,7 +1034,7 @@ async fn copy_upsert_edges(
             &[&pathway_id],
         )
         .await
-        .map_err(|e| format!("INSERT edges from stage: {}", e))?;
+        .map_err(|e| format!("INSERT edges from stage: {}", describe_pg_error(&e)))?;
 
     Ok(n_inserted as usize)
 }
@@ -838,17 +1056,21 @@ async fn update_pathway_counts(
             &[&pathway_id],
         )
         .await
-        .map_err(|e| format!("UPDATE pathway counts: {}", e))?;
+        .map_err(|e| format!("UPDATE pathway counts: {}", describe_pg_error(&e)))?;
     Ok(())
 }
 
 // ─── Função principal assíncrona ─────────────────────────────────────────────
 
 /// Carrega as topologias KEGG das vias listadas em `pathway_kegg_ids`.
+///
+/// `throttle_ms`: intervalo mínimo entre downloads KGML reais (não conta cache
+/// hits). Ver `KEGG_DEFAULT_THROTTLE_MS`.
 pub async fn load_kegg_topology_async(
     pathway_kegg_ids: &[String],
     dest_dir: &Path,
     db_url: &str,
+    throttle_ms: u64,
 ) -> Result<KeggTopologyManifest, String> {
     // Versão da fonte: data do download
     let source_version = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -883,6 +1105,8 @@ pub async fn load_kegg_topology_async(
     });
 
     let kegg_cache_dir = dest_dir.join("kegg");
+    let min_interval = std::time::Duration::from_millis(throttle_ms);
+    let mut last_request_started_at: Option<std::time::Instant> = None;
 
     let mut total_nodes = 0usize;
     let mut total_edges = 0usize;
@@ -898,12 +1122,24 @@ pub async fn load_kegg_topology_async(
         validate_kegg_id(kegg_id)?;
         let cache_path = kegg_cache_dir.join(format!("{}.kgml", kegg_id));
 
-        // Download (ou usar cache local se existir)
+        // Download (ou usar cache local se existir). Cache hits não fazem
+        // requisição HTTP, então não consomem/afetam o throttle abaixo.
         let xml_bytes = if cache_path.exists() {
             eprintln!("[kegg_topology_loader] usando cache: {:?}", cache_path);
             std::fs::read(&cache_path)
                 .map_err(|e| format!("Falha ao ler cache {:?}: {}", cache_path, e))?
         } else {
+            // Throttle: espaça o início desta requisição em relação ao início
+            // da anterior por pelo menos `min_interval`, dormindo só o resto
+            // do intervalo (não um valor fixo cego) — usa relógio monotônico.
+            if let Some(prev_start) = last_request_started_at {
+                let sleep_for = throttle_sleep_duration(prev_start.elapsed(), min_interval);
+                if !sleep_for.is_zero() {
+                    tokio::time::sleep(sleep_for).await;
+                }
+            }
+            last_request_started_at = Some(std::time::Instant::now());
+
             eprintln!("[kegg_topology_loader] baixando: {}", url);
             download_kgml(&http_client, &url, &cache_path).await?
         };
@@ -962,10 +1198,14 @@ pub async fn load_kegg_topology_async(
 }
 
 /// Entry point síncrono para PyO3.
+///
+/// `throttle_ms`: intervalo mínimo entre downloads KGML reais. `0` desabilita
+/// o throttle (uso interno/teste apenas — nunca contra `rest.kegg.jp` real).
 pub fn load_kegg_topology(
     pathway_kegg_ids: &[String],
     dest_dir: &str,
     db_url: &str,
+    throttle_ms: u64,
 ) -> Result<KeggTopologyManifest, String> {
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| format!("Falha ao criar runtime Tokio: {}", e))?;
@@ -973,6 +1213,7 @@ pub fn load_kegg_topology(
         pathway_kegg_ids,
         Path::new(dest_dir),
         db_url,
+        throttle_ms,
     ))
 }
 
@@ -1326,6 +1567,213 @@ mod tests {
             .await;
     }
 
+    // ─── Teste de integração: dedupe de chave de conflito ponta-a-ponta ──────
+    //
+    // Reproduz o bug de produção original (via `hsa00030`) direto contra
+    // Postgres real: duas arestas resolvidas para a MESMA chave de conflito
+    // `(pathway_id, source_node_id, target_node_id, interaction)` no MESMO
+    // lote. Antes do fix, `copy_upsert_edges` mandava as 2 linhas coincidentes
+    // para o `INSERT ... ON CONFLICT DO UPDATE` e o Postgres recusava o
+    // comando inteiro com SQLSTATE 21000. Este teste prova que `Ok` é
+    // retornado (sem erro), que só 1 linha chega na tabela, e que os
+    // `subtypes` das duas relações colapsadas foram unidos (proveniência
+    // preservada) em vez de descartados.
+    //
+    // Exemplo de execução local:
+    // ```
+    // DATABASE_URL="postgres://user:pass@localhost:5432/davinci" \
+    //     cargo test --lib omics::kegg_topology_loader -- --ignored
+    // ```
+    #[tokio::test]
+    #[ignore = "requer DATABASE_URL apontando para Postgres com schema Django migrado"]
+    async fn integration_duplicate_conflict_key_edges_do_not_crash_copy_against_real_db() {
+        let db_url = std::env::var("DATABASE_URL")
+            .expect("defina DATABASE_URL para rodar este teste de integração");
+
+        let (client, connection) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+            .await
+            .expect("falha ao conectar em DATABASE_URL");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        // kegg_id é VARCHAR(20) no schema (migration 0035) — manter curto.
+        let kegg_id = "test_dup_pair";
+
+        // Limpeza prévia best-effort (idempotência).
+        let _ = client
+            .execute(
+                "DELETE FROM core_pathwayedge WHERE pathway_id IN
+                    (SELECT id FROM core_pathway WHERE kegg_id = $1)",
+                &[&kegg_id],
+            )
+            .await;
+        let _ = client
+            .execute(
+                "DELETE FROM core_pathwaynode WHERE pathway_id IN
+                    (SELECT id FROM core_pathway WHERE kegg_id = $1)",
+                &[&kegg_id],
+            )
+            .await;
+        let _ = client
+            .execute("DELETE FROM core_pathway WHERE kegg_id = $1", &[&kegg_id])
+            .await;
+
+        let pathway_id = upsert_pathway(&client, kegg_id, "via dedupe test", "test")
+            .await
+            .expect("upsert_pathway");
+
+        let node_a = ParsedNode {
+            kegg_entry_id: "54".to_string(),
+            node_type: "gene".to_string(),
+            kegg_ids: vec!["hsa:5213".to_string()],
+            gene_symbol: "PFKL".to_string(),
+            graphics_name: "PFKL".to_string(),
+        };
+        let node_b = ParsedNode {
+            kegg_entry_id: "82".to_string(),
+            node_type: "gene".to_string(),
+            kegg_ids: vec!["hsa:2821".to_string()],
+            gene_symbol: "GPI".to_string(),
+            graphics_name: "GPI".to_string(),
+        };
+        let node_id_map = copy_upsert_nodes(&client, pathway_id, &[node_a, node_b])
+            .await
+            .expect("copy_upsert_nodes");
+        assert_eq!(node_id_map.len(), 2);
+
+        // Duas relações KGML para o MESMO par (54, 82), MESMA interação
+        // derivada ("unknown", já que "compound" não tem sinal conhecido) —
+        // exatamente o padrão de hsa00030 que quebrava o COPY.
+        let edges = vec![
+            ParsedEdge {
+                source_entry_id: "54".to_string(),
+                target_entry_id: "82".to_string(),
+                relation_type: "ecrel".to_string(),
+                subtypes: vec!["compound".to_string()],
+                sign: 0,
+                interaction: "unknown".to_string(),
+            },
+            ParsedEdge {
+                source_entry_id: "54".to_string(),
+                target_entry_id: "82".to_string(),
+                relation_type: "ecrel".to_string(),
+                subtypes: vec!["compound".to_string()],
+                sign: 0,
+                interaction: "unknown".to_string(),
+            },
+        ];
+
+        let n_edges = copy_upsert_edges(&client, pathway_id, &edges, &node_id_map)
+            .await
+            .expect(
+                "copy_upsert_edges não deve falhar com SQLSTATE 21000 quando \
+                 duas arestas resolvem para a mesma chave de conflito",
+            );
+        assert_eq!(
+            n_edges, 1,
+            "as 2 relações colapsadas devem virar 1 única linha no banco"
+        );
+
+        let row = client
+            .query_one(
+                "SELECT COUNT(*), array_agg(DISTINCT s) FROM core_pathwayedge, \
+                 unnest(subtypes) AS s WHERE pathway_id = $1 GROUP BY pathway_id",
+                &[&pathway_id],
+            )
+            .await
+            .expect("query subtypes persistidos");
+        let count: i64 = row.get(0);
+        assert_eq!(count, 1, "só 1 linha de aresta deve existir no banco");
+
+        update_pathway_counts(&client, pathway_id)
+            .await
+            .expect("update_pathway_counts");
+
+        // Limpeza.
+        let _ = client
+            .execute(
+                "DELETE FROM core_pathwayedge WHERE pathway_id = $1",
+                &[&pathway_id],
+            )
+            .await;
+        let _ = client
+            .execute(
+                "DELETE FROM core_pathwaynode WHERE pathway_id = $1",
+                &[&pathway_id],
+            )
+            .await;
+        let _ = client
+            .execute("DELETE FROM core_pathway WHERE kegg_id = $1", &[&kegg_id])
+            .await;
+    }
+
+    // ─── Testes de throttle (rate limit KEGG ≤ 3 req/s) ──────────────────────
+    // Função pura: sem rede, sem `sleep` real — só aritmética de `Duration`.
+
+    #[test]
+    fn test_throttle_sleep_full_interval_when_no_time_elapsed() {
+        // Requisição "instantânea" após a anterior: deve dormir o intervalo inteiro.
+        let elapsed = std::time::Duration::from_millis(0);
+        let min_interval = std::time::Duration::from_millis(400);
+        assert_eq!(
+            throttle_sleep_duration(elapsed, min_interval),
+            std::time::Duration::from_millis(400)
+        );
+    }
+
+    #[test]
+    fn test_throttle_sleep_partial_when_fetch_already_consumed_some_time() {
+        // Fetch anterior levou 300ms de um intervalo de 400ms → dorme só os 100ms restantes.
+        let elapsed = std::time::Duration::from_millis(300);
+        let min_interval = std::time::Duration::from_millis(400);
+        assert_eq!(
+            throttle_sleep_duration(elapsed, min_interval),
+            std::time::Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn test_throttle_sleep_zero_when_fetch_already_slower_than_interval() {
+        // Fetch anterior já levou mais que o intervalo mínimo → não dorme
+        // (nunca um valor fixo cego; `saturating_sub` evita overflow negativo).
+        let elapsed = std::time::Duration::from_millis(900);
+        let min_interval = std::time::Duration::from_millis(400);
+        assert_eq!(
+            throttle_sleep_duration(elapsed, min_interval),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn test_throttle_sleep_exact_boundary_is_zero() {
+        // elapsed == min_interval é o limite: não deve dormir (já respeitou o intervalo).
+        let elapsed = std::time::Duration::from_millis(400);
+        let min_interval = std::time::Duration::from_millis(400);
+        assert_eq!(
+            throttle_sleep_duration(elapsed, min_interval),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn test_throttle_sleep_disabled_when_min_interval_zero() {
+        // throttle_ms=0 (uso interno/teste) nunca dorme independente do elapsed.
+        let elapsed = std::time::Duration::from_millis(0);
+        let min_interval = std::time::Duration::ZERO;
+        assert_eq!(
+            throttle_sleep_duration(elapsed, min_interval),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn test_kegg_default_throttle_is_under_3_req_per_sec() {
+        // Documentação KEGG: bloqueio acima de 3 req/s. Default deve ficar
+        // com margem de segurança confortável abaixo disso (>333ms/req).
+        assert!(KEGG_DEFAULT_THROTTLE_MS > 333);
+    }
+
     // ─── Testes de §Sinal ─────────────────────────────────────────────────────
 
     #[test]
@@ -1569,6 +2017,266 @@ mod tests {
             .unwrap();
         assert_eq!(edge.source_entry_id, "6");
         assert_eq!(edge.target_entry_id, "1");
+    }
+
+    // ─── Testes de regressão: dedupe de chave de conflito (bug hsa00030) ─────
+    //
+    // Reproduzem a causa-raiz do bug de produção: KGML metabólico com
+    // múltiplas `<relation>` no MESMO par `(entry1, entry2)`, cuja natural key
+    // de conflito `(pathway_id, source_node_id, target_node_id, interaction)`
+    // colide DENTRO do mesmo lote de COPY. Antes do fix, isso fazia o
+    // Postgres recusar `INSERT ... ON CONFLICT DO UPDATE` inteiro com
+    // SQLSTATE 21000. Estes testes provam, sem precisar de Postgres real, que
+    // `merge_duplicate_edges`/`dedup_nodes_by_entry_id` colapsam a chave ANTES
+    // do COPY — logo o precondicionante do crash (duas linhas com a mesma
+    // chave no mesmo lote) nunca chega à camada de banco.
+
+    /// Fixture sintética espelhando a estrutura real de `hsa00030`: duas
+    /// `<relation>` ECrel para o MESMO par (entry1="54", entry2="82"), cada
+    /// uma com um `<subtype name="compound" value="...">` distinto — o
+    /// metabólito que liga as duas enzimas. NÃO é KGML bruto KEGG (licença).
+    const KGML_FIXTURE_DUPLICATE_PAIR: &str = r##"<?xml version="1.0"?>
+<pathway name="path:hsa00030" org="hsa" number="00030"
+         title="Pentose phosphate pathway (regression fixture)">
+    <entry id="54" name="hsa:5213" type="gene">
+        <graphics name="PFKL, ATP-PFK, PFK-B, PFK-L" fgcolor="#000000" bgcolor="#BFFFBF"
+             type="rectangle" x="100" y="100" width="46" height="17"/>
+    </entry>
+    <entry id="82" name="hsa:2821" type="gene">
+        <graphics name="GPI, AMF, NLK, PGI" fgcolor="#000000" bgcolor="#BFFFBF"
+             type="rectangle" x="200" y="100" width="46" height="17"/>
+    </entry>
+    <relation entry1="54" entry2="82" type="ECrel">
+        <subtype name="compound" value="90"/>
+    </relation>
+    <relation entry1="54" entry2="82" type="ECrel">
+        <subtype name="compound" value="91"/>
+    </relation>
+</pathway>"##;
+
+    #[test]
+    fn test_parse_kgml_duplicate_pair_produces_two_separate_edges_at_parse_time() {
+        // O parser NÃO deduplica — cada <relation> vira um ParsedEdge próprio.
+        // O dedupe acontece depois, em merge_duplicate_edges (camada de COPY).
+        let parsed = parse_kgml(KGML_FIXTURE_DUPLICATE_PAIR.as_bytes()).unwrap();
+        assert_eq!(parsed.nodes.len(), 2);
+        assert_eq!(parsed.edges.len(), 2);
+        assert!(parsed
+            .edges
+            .iter()
+            .all(|e| e.source_entry_id == "54" && e.target_entry_id == "82"));
+        // "compound" não é subtype de sinal conhecido → ambas colapsam para
+        // a mesma interação derivada (a MESMA natural key de conflito).
+        assert!(parsed.edges.iter().all(|e| e.interaction == "unknown"));
+        assert!(parsed.edges.iter().all(|e| e.sign == 0));
+    }
+
+    #[test]
+    fn test_merge_duplicate_edges_collapses_same_conflict_key_into_one_row() {
+        // Reproduz hsa00030 pós-parse: as duas relações resolvidas para PKs
+        // devem colapsar em UMA única linha de COPY (a chave de conflito é
+        // idêntica), provando que o precondicionante do erro 21000 desaparece.
+        let parsed = parse_kgml(KGML_FIXTURE_DUPLICATE_PAIR.as_bytes()).unwrap();
+        let mut node_id_map = HashMap::new();
+        node_id_map.insert("54".to_string(), 1000i64);
+        node_id_map.insert("82".to_string(), 2000i64);
+
+        let (merged, n_unresolved, n_collapsed) =
+            merge_duplicate_edges(&node_id_map, &parsed.edges);
+
+        assert_eq!(n_unresolved, 0);
+        assert_eq!(n_collapsed, 1, "as 2 relações devem colapsar em 1 dedupe");
+        assert_eq!(
+            merged.len(),
+            1,
+            "COPY deve receber só 1 linha para o par (54,82) — nunca 2 com a mesma chave"
+        );
+
+        let entry = merged.get(&(1000, 2000, "unknown".to_string())).unwrap();
+        assert_eq!(entry.sign, 0);
+        assert_eq!(entry.interaction, "unknown");
+        // O parser hoje só captura o atributo `name` do <subtype> (não
+        // `value`); como ambas relações têm name="compound", o union
+        // (com dedup) resulta em um único valor "compound" — comportamento
+        // correto para o campo que de fato é capturado (ver nota de módulo
+        // sobre a limitação de não capturar `value`).
+        assert_eq!(entry.subtypes, vec!["compound".to_string()]);
+    }
+
+    #[test]
+    fn test_merge_duplicate_edges_unions_distinct_subtype_values_without_losing_provenance() {
+        // Prova genérica (independente da particularidade "compound") de que
+        // o union preserva TODOS os valores distintos de subtypes vistos nas
+        // relações colapsadas, em vez de manter só a primeira e descartar.
+        let mut node_id_map = HashMap::new();
+        node_id_map.insert("1".to_string(), 10i64);
+        node_id_map.insert("2".to_string(), 20i64);
+
+        let edges = vec![
+            ParsedEdge {
+                source_entry_id: "1".to_string(),
+                target_entry_id: "2".to_string(),
+                relation_type: "ecrel".to_string(),
+                subtypes: vec!["compound".to_string()],
+                sign: 0,
+                interaction: "unknown".to_string(),
+            },
+            ParsedEdge {
+                source_entry_id: "1".to_string(),
+                target_entry_id: "2".to_string(),
+                relation_type: "ecrel".to_string(),
+                subtypes: vec!["hidden compound".to_string()],
+                sign: 0,
+                interaction: "unknown".to_string(),
+            },
+        ];
+
+        let (merged, n_unresolved, n_collapsed) = merge_duplicate_edges(&node_id_map, &edges);
+
+        assert_eq!(n_unresolved, 0);
+        assert_eq!(n_collapsed, 1);
+        assert_eq!(merged.len(), 1);
+        let entry = merged.get(&(10, 20, "unknown".to_string())).unwrap();
+        assert_eq!(
+            entry.subtypes,
+            vec!["compound".to_string(), "hidden compound".to_string()],
+            "ambos os valores distintos de subtype devem ser preservados, na ordem de primeira ocorrência"
+        );
+    }
+
+    #[test]
+    fn test_merge_duplicate_edges_does_not_dedup_same_subtype_value_twice_within_union() {
+        // Se as duas relações colapsadas trazem o MESMO valor de subtype, o
+        // union não deve duplicá-lo (dedup dos valores, não só concatenar).
+        let mut node_id_map = HashMap::new();
+        node_id_map.insert("1".to_string(), 10i64);
+        node_id_map.insert("2".to_string(), 20i64);
+
+        let edges = vec![
+            ParsedEdge {
+                source_entry_id: "1".to_string(),
+                target_entry_id: "2".to_string(),
+                relation_type: "ecrel".to_string(),
+                subtypes: vec!["compound".to_string()],
+                sign: 0,
+                interaction: "unknown".to_string(),
+            },
+            ParsedEdge {
+                source_entry_id: "1".to_string(),
+                target_entry_id: "2".to_string(),
+                relation_type: "ecrel".to_string(),
+                subtypes: vec!["compound".to_string()],
+                sign: 0,
+                interaction: "unknown".to_string(),
+            },
+        ];
+
+        let (merged, _n_unresolved, n_collapsed) = merge_duplicate_edges(&node_id_map, &edges);
+        assert_eq!(n_collapsed, 1);
+        let entry = merged.get(&(10, 20, "unknown".to_string())).unwrap();
+        assert_eq!(entry.subtypes, vec!["compound".to_string()]);
+    }
+
+    #[test]
+    fn test_merge_duplicate_edges_keeps_distinct_interactions_separate() {
+        // Mesmo par (entry1, entry2), mas interações DIFERENTES não devem
+        // colapsar — a chave de conflito inclui `interaction`.
+        let mut node_id_map = HashMap::new();
+        node_id_map.insert("1".to_string(), 10i64);
+        node_id_map.insert("2".to_string(), 20i64);
+
+        let edges = vec![
+            ParsedEdge {
+                source_entry_id: "1".to_string(),
+                target_entry_id: "2".to_string(),
+                relation_type: "pprel".to_string(),
+                subtypes: vec!["activation".to_string()],
+                sign: 1,
+                interaction: "activation".to_string(),
+            },
+            ParsedEdge {
+                source_entry_id: "1".to_string(),
+                target_entry_id: "2".to_string(),
+                relation_type: "pprel".to_string(),
+                subtypes: vec!["inhibition".to_string()],
+                sign: -1,
+                interaction: "inhibition".to_string(),
+            },
+        ];
+
+        let (merged, _n_unresolved, n_collapsed) = merge_duplicate_edges(&node_id_map, &edges);
+        assert_eq!(n_collapsed, 0, "interações distintas não devem colapsar");
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_duplicate_edges_reports_unresolved_entry_ids() {
+        let node_id_map = HashMap::new(); // vazio: nada resolve
+        let edges = vec![ParsedEdge {
+            source_entry_id: "1".to_string(),
+            target_entry_id: "2".to_string(),
+            relation_type: "pprel".to_string(),
+            subtypes: vec!["activation".to_string()],
+            sign: 1,
+            interaction: "activation".to_string(),
+        }];
+
+        let (merged, n_unresolved, n_collapsed) = merge_duplicate_edges(&node_id_map, &edges);
+        assert_eq!(n_unresolved, 1);
+        assert_eq!(n_collapsed, 0);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_dedup_nodes_by_entry_id_collapses_repeated_entry_id_keeping_last() {
+        // Defensivo (item 2 do pedido): KGML não deveria repetir <entry id>,
+        // mas se repetir, o mesmo erro 21000 apareceria na NK
+        // (pathway, kegg_entry_id) sem essa defesa.
+        let nodes = vec![
+            ParsedNode {
+                kegg_entry_id: "1".to_string(),
+                node_type: "gene".to_string(),
+                kegg_ids: vec!["hsa:1".to_string()],
+                gene_symbol: "FIRST".to_string(),
+                graphics_name: "FIRST".to_string(),
+            },
+            ParsedNode {
+                kegg_entry_id: "1".to_string(),
+                node_type: "gene".to_string(),
+                kegg_ids: vec!["hsa:1".to_string()],
+                gene_symbol: "SECOND".to_string(),
+                graphics_name: "SECOND".to_string(),
+            },
+        ];
+
+        let (deduped, n_collapsed) = dedup_nodes_by_entry_id(&nodes);
+        assert_eq!(n_collapsed, 1);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped.get("1").unwrap().gene_symbol, "SECOND");
+    }
+
+    #[test]
+    fn test_dedup_nodes_by_entry_id_is_noop_when_entry_ids_are_unique() {
+        let nodes = vec![
+            ParsedNode {
+                kegg_entry_id: "1".to_string(),
+                node_type: "gene".to_string(),
+                kegg_ids: vec!["hsa:1".to_string()],
+                gene_symbol: "A".to_string(),
+                graphics_name: "A".to_string(),
+            },
+            ParsedNode {
+                kegg_entry_id: "2".to_string(),
+                node_type: "gene".to_string(),
+                kegg_ids: vec!["hsa:2".to_string()],
+                gene_symbol: "B".to_string(),
+                graphics_name: "B".to_string(),
+            },
+        ];
+
+        let (deduped, n_collapsed) = dedup_nodes_by_entry_id(&nodes);
+        assert_eq!(n_collapsed, 0);
+        assert_eq!(deduped.len(), 2);
     }
 
     // ─── Testes de validação de URL ──────────────────────────────────────────

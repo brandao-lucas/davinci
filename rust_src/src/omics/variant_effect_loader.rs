@@ -64,7 +64,7 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use chrono::Utc;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use futures::SinkExt;
 use std::pin::pin;
 use tokio_postgres::Client;
@@ -458,6 +458,75 @@ pub fn parse_am_header(header_line: &str) -> Result<AlphaMissenseColIdx, String>
     })
 }
 
+/// Máquina de busca do cabeçalho de colunas do TSV AlphaMissense, linha a linha
+/// (streaming-friendly — não exige carregar o arquivo inteiro em memória).
+///
+/// ## Motivação
+///
+/// O arquivo real do AlphaMissense (`AlphaMissense_hg38.tsv.gz`) tem um preâmbulo de
+/// licença de tamanho variável ANTES da linha de colunas, e todas as linhas do
+/// preâmbulo também começam com `#`:
+///
+/// ```text
+/// # Copyright 2023 DeepMind Technologies Limited
+/// #
+/// # Licensed under CC BY-NC-SA 4.0 license
+/// #CHROM  POS  REF  ALT  genome  uniprot_id  transcript_id  protein_variant  am_pathogenicity  am_class
+/// chr1    69094  G  T  hg38  Q8NH21  ENST00000335137.4  V2L  0.2937  likely_benign
+/// ```
+///
+/// Tratar "a primeira linha prefixada com `#`" como cabeçalho (heurística por
+/// POSIÇÃO) quebra nesse arquivo: pega a linha de copyright, falha o split de
+/// colunas esperadas e aborta o parse inteiro. A localização correta é por
+/// CONTEÚDO: testar cada linha candidata com [`parse_am_header`] e aceitar a
+/// primeira que resolve todas as colunas esperadas (`CHROM`/`POS`/`REF`/`ALT`/...).
+/// Linhas `#`-prefixadas que falham nesse teste são tratadas como preâmbulo e
+/// puladas; uma linha SEM prefixo `#` que também falhe indica que já chegamos em
+/// dado real sem jamais termos achado um cabeçalho válido — erro fatal.
+struct AmHeaderSearch {
+    preamble_seen: Vec<String>,
+}
+
+impl AmHeaderSearch {
+    const MAX_PREAMBLE_LINES_LOGGED: usize = 20;
+
+    fn new() -> Self {
+        Self { preamble_seen: Vec::new() }
+    }
+
+    /// Processa uma linha candidata a cabeçalho.
+    ///
+    /// - `Some(Ok(idx))`: cabeçalho encontrado — pare de chamar `try_line`.
+    /// - `Some(Err(msg))`: dado real alcançado sem cabeçalho válido — erro fatal,
+    ///   pare o parse do arquivo.
+    /// - `None`: ainda procurando (linha vazia ou preâmbulo `#`) — chame de novo
+    ///   com a próxima linha.
+    fn try_line(&mut self, line: &str) -> Option<Result<AlphaMissenseColIdx, String>> {
+        if line.trim().is_empty() {
+            return None;
+        }
+
+        match parse_am_header(line) {
+            Ok(idx) => Some(Ok(idx)),
+            Err(_) => {
+                if line.starts_with('#') {
+                    if self.preamble_seen.len() < Self::MAX_PREAMBLE_LINES_LOGGED {
+                        self.preamble_seen.push(line.to_string());
+                    }
+                    None
+                } else {
+                    Some(Err(format!(
+                        "Cabeçalho AM não encontrado (formato inesperado: dado \
+                         alcançado sem uma linha de colunas CHROM/POS/REF/ALT/... \
+                         válida). Linhas vistas até aqui: {:?}",
+                        self.preamble_seen
+                    )))
+                }
+            }
+        }
+    }
+}
+
 // ─── Extração de source_version do header VCF ClinVar ────────────────────────
 
 /// Extrai a versão da fonte do cabeçalho VCF ClinVar.
@@ -766,7 +835,15 @@ pub async fn parse_and_copy_clinvar(
 
     let file = std::fs::File::open(gz_path)
         .map_err(|e| format!("Falha ao abrir {:?}: {}", gz_path, e))?;
-    let gz_reader = GzDecoder::new(file);
+    // `MultiGzDecoder`, não `GzDecoder`: o ClinVar VCF é servido em BGZF (gzip
+    // multi-membro, o formato usado por htslib/tabix). `GzDecoder` decodifica
+    // só o primeiro membro e termina sem erro — silenciosamente processando
+    // apenas o cabeçalho `##` (que cabe no 1º bloco BGZF) e reportando sucesso
+    // com zero variantes. Verificado empiricamente via `file -b` no payload real
+    // (`Blocked GNU Zip Format (BGZF; gzip compatible)`). `MultiGzDecoder` lê
+    // gzip de membro único normalmente também, então é seguro mesmo se a fonte
+    // mudar de formato no futuro.
+    let gz_reader = MultiGzDecoder::new(file);
     let buf_reader = BufReader::new(gz_reader);
 
     let mut header_lines: Vec<String> = Vec::new();
@@ -876,6 +953,23 @@ pub async fn parse_and_copy_clinvar(
         n_variants_processed, n_kept, n_skipped_offlist, n_skipped_no_gene, n_upserted
     );
 
+    // Guarda de silêncio: um arquivo aberto com sucesso que produz ZERO
+    // variantes processadas é anômalo por definição — a fonte real do ClinVar
+    // tem dezenas de milhões de linhas. Causas plausíveis: decoder gzip que só
+    // lê o 1º membro de um payload BGZF multi-membro (bug de origem desta
+    // guarda — ver `MultiGzDecoder` acima), download truncado, ou mudança de
+    // formato na fonte. Nunca deixar isso passar como sucesso limpo.
+    if n_variants_processed == 0 {
+        errors.push(format!(
+            "ANOMALIA: 0 linhas de variante processadas no arquivo ClinVar {:?} \
+             após um download aparentemente bem-sucedido. Isso é anômalo — a \
+             fonte real tem dezenas de milhões de registros. Causas prováveis: \
+             arquivo truncado/corrompido, ou decoder gzip que não leu o \
+             payload completo (ex.: BGZF multi-membro).",
+            gz_path
+        ));
+    }
+
     Ok(ClinVarLoadManifest {
         n_variants_processed,
         n_kept,
@@ -983,7 +1077,10 @@ pub async fn parse_and_copy_alphamissense(
 
     let file = std::fs::File::open(gz_path)
         .map_err(|e| format!("Falha ao abrir {:?}: {}", gz_path, e))?;
-    let gz_reader = GzDecoder::new(file);
+    // `MultiGzDecoder`: o TSV do AlphaMissense também é servido em BGZF
+    // (confirmado empiricamente via `file -b` — mesma classe de bug do ClinVar).
+    // Ver comentário em `parse_and_copy_clinvar`.
+    let gz_reader = MultiGzDecoder::new(file);
     let buf_reader = BufReader::new(gz_reader);
 
     let mut n_variants_processed = 0usize;
@@ -993,6 +1090,11 @@ pub async fn parse_and_copy_alphamissense(
     let mut errors: Vec<String> = Vec::new();
     let mut batch: Vec<VariantEffectRawRow> = Vec::with_capacity(BATCH_SIZE);
     let mut col_idx: Option<AlphaMissenseColIdx> = None;
+    // Ver documentação de `AmHeaderSearch`: o cabeçalho é localizado por
+    // CONTEÚDO (nunca por posição), pois o arquivo real do AlphaMissense tem um
+    // preâmbulo de licença de tamanho variável, todo prefixado com '#', antes
+    // da linha de colunas de fato.
+    let mut header_search = AmHeaderSearch::new();
 
     for (line_num, line_result) in buf_reader.lines().enumerate() {
         let line = match line_result {
@@ -1005,33 +1107,26 @@ pub async fn parse_and_copy_alphamissense(
 
         let line = line.trim_end_matches('\r');
 
-        // Comentários (linhas com ##)
-        if line.starts_with("##") {
-            continue;
-        }
-
-        // Cabeçalho (primeira linha não-## que começa com # ou é a primeira linha de dados)
+        // Cabeçalho ainda não localizado: seguir procurando por conteúdo.
         if col_idx.is_none() {
-            // Tentar detectar o cabeçalho
-            if line.starts_with('#') || line.to_uppercase().contains("CHROM") {
-                match parse_am_header(line) {
-                    Ok(idx) => {
-                        col_idx = Some(idx);
-                        continue;
-                    }
-                    Err(e) => {
-                        errors.push(format!("Erro ao parsear cabeçalho AM: {}", e));
-                        return Ok(AlphaMissenseLoadManifest {
-                            n_variants_processed: 0,
-                            n_kept: 0,
-                            n_skipped_no_map: 0,
-                            n_upserted: 0,
-                            source_version: source_version.to_string(),
-                            errors,
-                            handoff_required: false,
-                        });
-                    }
+            match header_search.try_line(line) {
+                Some(Ok(idx)) => {
+                    col_idx = Some(idx);
+                    continue;
                 }
+                Some(Err(msg)) => {
+                    errors.push(format!("Erro ao localizar cabeçalho AM (linha {}): {}", line_num + 1, msg));
+                    return Ok(AlphaMissenseLoadManifest {
+                        n_variants_processed: 0,
+                        n_kept: 0,
+                        n_skipped_no_map: 0,
+                        n_upserted: 0,
+                        source_version: source_version.to_string(),
+                        errors,
+                        handoff_required: false,
+                    });
+                }
+                None => continue,
             }
         }
 
@@ -1111,6 +1206,20 @@ pub async fn parse_and_copy_alphamissense(
         "[variant_effect_loader] AlphaMissense: processadas={} kept={} skipped={} upserted={}",
         n_variants_processed, n_kept, n_skipped_no_map, n_upserted
     );
+
+    // Guarda de silêncio (mesma classe de bug do ClinVar — ver comentário em
+    // `parse_and_copy_clinvar`): 0 linhas processadas depois de um cabeçalho
+    // detectado com sucesso é anômalo — a fonte real do AlphaMissense tem
+    // dezenas de milhões de linhas.
+    if n_variants_processed == 0 {
+        errors.push(format!(
+            "ANOMALIA: 0 linhas processadas no arquivo AlphaMissense {:?} após \
+             um download aparentemente bem-sucedido (cabeçalho foi encontrado). \
+             Causas prováveis: arquivo truncado/corrompido, ou decoder gzip que \
+             não leu o payload completo (ex.: BGZF multi-membro).",
+            gz_path
+        ));
+    }
 
     Ok(AlphaMissenseLoadManifest {
         n_variants_processed,
@@ -1460,6 +1569,137 @@ mod tests {
         assert_eq!(idx.am_class, 9);
     }
 
+    /// Preâmbulo REAL de licença do `AlphaMissense_hg38.tsv.gz` (3 linhas,
+    /// prefixadas com `#`) seguido da linha de cabeçalho real e 2 linhas de dado
+    /// real (dado público de exemplo, não é redistribuição de recorte do dataset).
+    /// Regressão do bug: o cabeçalho é a linha `#CHROM...`, NÃO a 1ª linha com `#`.
+    const AM_REAL_PREAMBLE_AND_HEADER: &[&str] = &[
+        "# Copyright 2023 DeepMind Technologies Limited",
+        "#",
+        "# Licensed under CC BY-NC-SA 4.0 license",
+        "#CHROM\tPOS\tREF\tALT\tgenome\tuniprot_id\ttranscript_id\tprotein_variant\tam_pathogenicity\tam_class",
+    ];
+    const AM_REAL_DATA_LINE: &str =
+        "chr1\t69094\tG\tT\thg38\tQ8NH21\tENST00000335137.4\tV2L\t0.2937\tlikely_benign";
+
+    #[test]
+    fn test_am_header_search_localiza_apos_preambulo_de_licenca_real() {
+        // Antes do fix, a 1ª linha ("# Copyright ...") era tratada como cabeçalho
+        // e o parse abortava com "Coluna 'CHROM' não encontrada". Agora a busca
+        // por CONTEÚDO deve pular as 3 linhas de preâmbulo e achar `#CHROM...`.
+        let mut search = AmHeaderSearch::new();
+        let mut found: Option<AlphaMissenseColIdx> = None;
+
+        for line in AM_REAL_PREAMBLE_AND_HEADER {
+            match search.try_line(line) {
+                Some(Ok(idx)) => {
+                    found = Some(idx);
+                    break;
+                }
+                Some(Err(e)) => panic!("busca de cabeçalho falhou antes do esperado: {}", e),
+                None => continue,
+            }
+        }
+
+        let idx = found.expect("cabeçalho deveria ter sido localizado após o preâmbulo de licença");
+        assert_eq!(idx.chrom, 0);
+        assert_eq!(idx.pos, 1);
+        assert_eq!(idx.ref_allele, 2);
+        assert_eq!(idx.alt_allele, 3);
+        assert_eq!(idx.uniprot_id, 5);
+        assert_eq!(idx.am_pathogenicity, 8);
+        assert_eq!(idx.am_class, 9);
+
+        // E a linha de dado real, com o cabeçalho correto, parseia normalmente
+        // (CHROM 'chr1' → '1', normalização de prefixo 'chr' continua valendo).
+        let record = parse_alphamissense_line(AM_REAL_DATA_LINE, &idx)
+            .unwrap()
+            .expect("linha de dado válida deve produzir um record");
+        assert_eq!(record.variant_key, "1:69094:G:T");
+        assert_eq!(record.uniprot_id, "Q8NH21");
+        assert!((record.am_pathogenicity - 0.2937).abs() < 1e-4);
+        assert_eq!(record.am_class, "likely_benign");
+    }
+
+    #[test]
+    fn test_am_header_search_erra_alto_se_dado_alcancado_sem_cabecalho() {
+        // Linha sem '#' e sem colunas esperadas antes de qualquer cabeçalho válido
+        // ser encontrado → erro fatal (não silencia, não trava em loop).
+        let mut search = AmHeaderSearch::new();
+        assert!(search.try_line("# Copyright 2023 DeepMind Technologies Limited").is_none());
+        assert!(search.try_line("#").is_none());
+
+        let result = search.try_line(AM_REAL_DATA_LINE);
+        let err = match result {
+            Some(Err(e)) => e,
+            other => panic!("esperava erro fatal, obteve {:?}", other),
+        };
+        assert!(err.contains("Cabeçalho AM não encontrado"), "err={}", err);
+        // Mensagem cita as linhas de preâmbulo vistas, para diagnóstico.
+        assert!(err.contains("Copyright"), "err deveria citar linhas vistas: {}", err);
+    }
+
+    #[test]
+    fn test_parse_am_gz_fixture_com_preambulo_real_via_parse_and_copy() {
+        // Regressão end-to-end (sem DB): o fixture usa o preâmbulo REAL de 3
+        // linhas de licença. `n_kept=0` (mapa uniprot vazio) garante que o batch
+        // nunca preenche e `copy_variant_effect_raw` nunca é chamado — não requer
+        // Postgres. O que este teste prova é que `n_variants_processed` reflete
+        // as 2 linhas de dado REAIS (cabeçalho foi localizado corretamente),
+        // reproduzindo a contagem "0 processadas" do bug original se regredir.
+        let dir = TempDir::new().unwrap();
+        let mut content = String::new();
+        for line in AM_REAL_PREAMBLE_AND_HEADER {
+            content.push_str(line);
+            content.push('\n');
+        }
+        content.push_str(AM_REAL_DATA_LINE);
+        content.push('\n');
+        content.push_str("chr7\t117548628\tG\tA\thg38\tQ9Y6I3\tENST00000003084.11\tG542X\t0.0812\tlikely_benign\n");
+
+        let gz_path = write_am_gz_fixture(dir.path(), "am_real_preamble.tsv.gz", &content);
+
+        // Reaproveita a mesma leitura manual (sem DB) usada nos outros testes
+        // deste arquivo — mas com a busca de cabeçalho de produção
+        // (`AmHeaderSearch`), não a heurística antiga por posição.
+        let file = std::fs::File::open(&gz_path).unwrap();
+        let gz = MultiGzDecoder::new(file);
+        let reader = BufReader::new(gz);
+        let mut col_idx: Option<AlphaMissenseColIdx> = None;
+        let mut header_search = AmHeaderSearch::new();
+        let mut processed = 0usize;
+
+        for line_result in reader.lines() {
+            let line = line_result.unwrap();
+            let line = line.trim_end_matches('\r').to_string();
+
+            if col_idx.is_none() {
+                match header_search.try_line(&line) {
+                    Some(Ok(idx)) => {
+                        col_idx = Some(idx);
+                        continue;
+                    }
+                    Some(Err(e)) => panic!("cabeçalho AM não localizado: {}", e),
+                    None => continue,
+                }
+            }
+
+            if line.is_empty() {
+                continue;
+            }
+
+            let idx = col_idx.as_ref().unwrap();
+            processed += 1;
+            assert!(parse_alphamissense_line(&line, idx).unwrap().is_some());
+        }
+
+        assert_eq!(
+            processed, 2,
+            "as 2 linhas de dado reais devem ser processadas (cabeçalho \
+             localizado corretamente após o preâmbulo de 3 linhas de licença)"
+        );
+    }
+
     #[test]
     fn test_parse_alphamissense_pathogenic() {
         let idx = parse_am_header(AM_HEADER).unwrap();
@@ -1639,7 +1879,7 @@ mod tests {
 
         // Abrir gzip e parsear linhas manualmente (sem DB)
         let file = std::fs::File::open(&gz_path).unwrap();
-        let gz = GzDecoder::new(file);
+        let gz = MultiGzDecoder::new(file);
         let reader = BufReader::new(gz);
         let mut data_lines = 0usize;
         let mut kept = 0usize;
@@ -1723,7 +1963,7 @@ chr1\t1000\tA\tT\thg38\tUNKNOWN_UNI\tENST00000000001.1\tA100T\t0.5\tambiguous\n\
 
         // Parse sem DB — verifica contagens manualmente
         let file = std::fs::File::open(&gz_path).unwrap();
-        let gz = GzDecoder::new(file);
+        let gz = MultiGzDecoder::new(file);
         let reader = BufReader::new(gz);
         let mut col_idx: Option<AlphaMissenseColIdx> = None;
         let mut kept = 0usize;
@@ -1778,7 +2018,7 @@ chr1\t1000\tA\tT\thg38\tUNKNOWN_UNI\tENST00000000001.1\tA100T\t0.5\tambiguous\n\
         let allowlist: HashSet<String> = HashSet::new();
 
         let file = std::fs::File::open(&gz_path).unwrap();
-        let gz = GzDecoder::new(file);
+        let gz = MultiGzDecoder::new(file);
         let reader = BufReader::new(gz);
         let mut col_idx: Option<AlphaMissenseColIdx> = None;
         let mut kept = 0usize;
@@ -1821,5 +2061,166 @@ chr1\t1000\tA\tT\thg38\tUNKNOWN_UNI\tENST00000000001.1\tA100T\t0.5\tambiguous\n\
     #[test]
     fn test_escape_csv_field_campo_vazio() {
         assert_eq!(escape_csv_field(""), "\"\"");
+    }
+
+    // ── Regressão: BGZF (gzip multi-membro) — GzDecoder lê só o 1º membro ──────
+    //
+    // Bug real: ClinVar/AlphaMissense são servidos em BGZF (gzip compatível,
+    // mas concatenação de MÚLTIPLOS membros gzip — htslib/samtools/tabix).
+    // `flate2::read::GzDecoder` decodifica só o primeiro membro e termina
+    // LIMPO (sem erro) ao fim dele. Como o cabeçalho VCF/TSV cabe inteiro no
+    // 1º bloco BGZF, o parser via `GzDecoder` via só linhas `##`/cabeçalho e
+    // nunca alcança dado real → `n_variants_processed = 0`, reportado como
+    // sucesso. `MultiGzDecoder` corrige isso lendo todos os membros.
+
+    /// Escreve um arquivo gzip multi-membro concatenando `parts` — cada parte
+    /// vira um membro gzip independente, igual à estrutura de um BGZF real
+    /// (blocos ~64KB comprimidos individualmente e concatenados).
+    fn write_multimember_gz_fixture(dir: &Path, filename: &str, parts: &[&str]) -> PathBuf {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write as IoWrite;
+
+        let path = dir.join(filename);
+        let mut out = std::fs::File::create(&path).unwrap();
+        for part in parts {
+            // Cada `finish()` fecha o membro gzip corrente; o próximo `GzEncoder`
+            // sobre o mesmo `Vec<u8>` cria um NOVO membro gzip independente —
+            // concatenados, formam um arquivo multi-membro (BGZF-like).
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                let mut enc = GzEncoder::new(&mut buf, Compression::default());
+                enc.write_all(part.as_bytes()).unwrap();
+                enc.finish().unwrap();
+            }
+            out.write_all(&buf).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn test_bgzf_multimembro_multigzdecoder_le_todos_gzdecoder_nao() {
+        // Membro 1: só o cabeçalho VCF (como o 1º bloco BGZF real do ClinVar,
+        // que contém só `##...` e cabe sozinho no bloco ~64KB).
+        let member1 = "\
+##fileDate=20260701\n\
+##reference=GRCh38\n\
+##source=ClinVar\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n";
+
+        // Membro 2: as linhas de dados reais (equivalente aos blocos BGZF
+        // seguintes, que o `GzDecoder` de membro único NUNCA alcança).
+        let member2 = "\
+7\t117548628\t12375\tG\tA\t.\t.\tGENEINFO=CFTR:1080;CLNSIG=Pathogenic\n\
+17\t7676154\t99999\tC\tT\t.\t.\tGENEINFO=TP53:7157;CLNSIG=Likely_pathogenic\n\
+1\t1000\t11111\tA\tT\t.\t.\tGENEINFO=EGFR:1956;CLNSIG=Benign\n";
+
+        let dir = TempDir::new().unwrap();
+        let gz_path =
+            write_multimember_gz_fixture(dir.path(), "clinvar_bgzf_like.vcf.gz", &[member1, member2]);
+
+        // ── Com MultiGzDecoder (produção, pós-correção): lê os 2 membros ──────
+        let file = std::fs::File::open(&gz_path).unwrap();
+        let reader = BufReader::new(MultiGzDecoder::new(file));
+        let mut data_lines_multi = 0usize;
+        for line_result in reader.lines() {
+            let line = line_result.unwrap();
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            data_lines_multi += 1;
+        }
+        assert_eq!(
+            data_lines_multi, 3,
+            "MultiGzDecoder deve ler as 3 linhas de dados do 2º membro em diante"
+        );
+
+        // ── Com GzDecoder de membro único (bug pré-correção): só o 1º membro ──
+        let file = std::fs::File::open(&gz_path).unwrap();
+        let reader = BufReader::new(flate2::read::GzDecoder::new(file));
+        let mut data_lines_single = 0usize;
+        for line_result in reader.lines() {
+            // GzDecoder não erra ao fim do 1º membro — o iterador simplesmente
+            // termina "limpo", daí o bug ser silencioso (sem Err em lugar nenhum).
+            let line = line_result.unwrap();
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            data_lines_single += 1;
+        }
+        assert_eq!(
+            data_lines_single, 0,
+            "GzDecoder (membro único) não deve alcançar nenhuma linha de dado \
+             do 2º membro — reproduz exatamente o bug de produção (0 variantes \
+             processadas, sem erro)"
+        );
+    }
+
+    #[test]
+    fn test_bgzf_multimembro_parse_manual_com_multigzdecoder_conta_todas_as_linhas() {
+        // Mesmo harness de `test_parse_vcf_gz_fixture_conta_linhas`, mas com o
+        // VCF fatiado em 2 membros gzip (cabeçalho / dados) — exercita o mesmo
+        // padrão de decodificação usado por `parse_and_copy_clinvar` em produção.
+        let header_member = "\
+##fileDate=20260701\n\
+##reference=GRCh38\n\
+##source=ClinVar\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n";
+        let data_member = "\
+7\t117548628\t12375\tG\tA\t.\t.\tGENEINFO=CFTR:1080;CLNSIG=Pathogenic\n\
+17\t7676154\t99999\tC\tT\t.\t.\tGENEINFO=TP53:7157;CLNSIG=Likely_pathogenic\n\
+1\t1000\t11111\tA\tT\t.\t.\tGENEINFO=EGFR:1956;CLNSIG=Benign\n";
+
+        let dir = TempDir::new().unwrap();
+        let gz_path = write_multimember_gz_fixture(
+            dir.path(),
+            "clinvar_bgzf_like2.vcf.gz",
+            &[header_member, data_member],
+        );
+
+        let allowlist: HashSet<String> = ["TP53".to_string(), "CFTR".to_string()]
+            .iter()
+            .cloned()
+            .collect();
+
+        let file = std::fs::File::open(&gz_path).unwrap();
+        let gz = MultiGzDecoder::new(file);
+        let reader = BufReader::new(gz);
+        let mut data_lines = 0usize;
+        let mut kept = 0usize;
+        let mut offlist = 0usize;
+        let mut header_lines: Vec<String> = Vec::new();
+
+        for line_result in reader.lines() {
+            let line = line_result.unwrap();
+            let line = line.trim_end_matches('\r').to_string();
+
+            if line.starts_with("##") {
+                header_lines.push(line);
+                continue;
+            }
+            if line.starts_with('#') {
+                continue;
+            }
+            if line.is_empty() {
+                continue;
+            }
+
+            data_lines += 1;
+            if let Ok(Some(record)) = parse_clinvar_vcf_line(&line) {
+                if allowlist.contains(&record.gene_symbol) {
+                    kept += 1;
+                } else {
+                    offlist += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            data_lines, 3,
+            "as 3 linhas de dados (no 2º membro gzip) devem ser lidas via MultiGzDecoder"
+        );
+        assert_eq!(kept, 2, "TP53 e CFTR devem ser mantidos");
+        assert_eq!(offlist, 1, "EGFR fora da allowlist");
     }
 }

@@ -62,7 +62,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use md5::{Digest, Md5};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -193,6 +193,88 @@ fn parse_maf_header(header_line: &str) -> Result<MafColIdx, String> {
     })
 }
 
+/// Máquina de busca do cabeçalho de colunas do MAF, linha a linha
+/// (streaming-friendly — não exige carregar o arquivo inteiro em memória).
+///
+/// ## Motivação
+///
+/// O MAF real do GDC tem um preâmbulo de comentários de tamanho variável ANTES
+/// da linha de colunas — mas, ao contrário do AlphaMissense
+/// (ver [`super::variant_effect_loader::AmHeaderSearch`] — mesma classe de bug,
+/// duplicada aqui por operar sobre `MafColIdx` em vez de `AlphaMissenseColIdx`),
+/// as linhas de preâmbulo usam prefixo `#` SIMPLES, e o cabeçalho de colunas
+/// em si NÃO tem prefixo `#`:
+///
+/// ```text
+/// #version gdc-1.0.0
+/// #annotation.spec gdc-2.0.0-aliquot-merged-masked
+/// #contigs chr1,chr2,chr3,...
+/// #sort.order BarcodesAndCoordinate
+/// #filedate 20220513
+/// #normal.aliquot 9d8605f9-6281-4ce5-a4fa-4399e1902769
+/// #tumor.aliquot 5e08ba1d-7269-475b-bda6-e685083916a8
+/// Hugo_Symbol	Entrez_Gene_Id	Center	NCBI_Build	Chromosome	...
+/// ```
+///
+/// Tratar "a primeira linha não-`##`" como cabeçalho (heurística por POSIÇÃO,
+/// usada antes desta correção) quebra nesse arquivo: pega `#version gdc-1.0.0`
+/// como candidata, `parse_maf_header` falha porque a coluna `Hugo_Symbol` não
+/// existe ali, e o erro é retornado como fatal sem nunca chegar na linha real
+/// de colunas. A localização correta é por CONTEÚDO: testar cada linha
+/// candidata com [`parse_maf_header`] e aceitar a primeira que resolve todas
+/// as colunas obrigatórias. Linhas `#`-prefixadas que falham nesse teste são
+/// tratadas como preâmbulo e puladas; uma linha SEM prefixo `#` que também
+/// falhe indica que já chegamos em dado real sem jamais termos achado um
+/// cabeçalho válido — erro fatal, reportando o preâmbulo visto para diagnóstico.
+struct MafHeaderSearch {
+    preamble_seen: Vec<String>,
+}
+
+impl MafHeaderSearch {
+    const MAX_PREAMBLE_LINES_LOGGED: usize = 20;
+
+    fn new() -> Self {
+        Self { preamble_seen: Vec::new() }
+    }
+
+    /// Processa uma linha candidata a cabeçalho.
+    ///
+    /// - `Some(Ok(idx))`: cabeçalho encontrado — pare de chamar `try_line`.
+    /// - `Some(Err(msg))`: dado real alcançado sem cabeçalho válido — erro fatal,
+    ///   pare o parse do arquivo.
+    /// - `None`: ainda procurando (linha vazia ou preâmbulo `#`) — chame de novo
+    ///   com a próxima linha.
+    fn try_line(&mut self, line: &str) -> Option<Result<MafColIdx, String>> {
+        if line.trim().is_empty() {
+            return None;
+        }
+
+        // Aceita cabeçalho com ou sem prefixo `#` (alguns MAFs do GDC prefixam
+        // a linha de colunas com `#`, outros não — ver comentário original em
+        // `parse_maf_header`).
+        let header_candidate = line.trim_start_matches('#');
+        match parse_maf_header(header_candidate) {
+            Ok(idx) => Some(Ok(idx)),
+            Err(_) => {
+                if line.starts_with('#') {
+                    if self.preamble_seen.len() < Self::MAX_PREAMBLE_LINES_LOGGED {
+                        self.preamble_seen.push(line.to_string());
+                    }
+                    None
+                } else {
+                    Some(Err(format!(
+                        "Cabeçalho MAF não encontrado (formato inesperado: dado \
+                         alcançado sem uma linha de colunas Hugo_Symbol/Chromosome/\
+                         Start_Position/... válida). Linhas de preâmbulo vistas até \
+                         aqui: {:?}",
+                        self.preamble_seen
+                    )))
+                }
+            }
+        }
+    }
+}
+
 // ─── Verificação de variant_classification ────────────────────────────────────
 
 /// Retorna `true` se a classificação é não-sinônima (deve entrar no burden/ocorrências).
@@ -251,13 +333,26 @@ fn parse_maf_gz(
 ) -> Result<(Vec<Occurrence>, usize, usize), String> {
     let file = std::fs::File::open(path)
         .map_err(|e| format!("Falha ao abrir MAF {:?}: {}", path, e))?;
-    let gz = GzDecoder::new(file);
+    // `MultiGzDecoder`, não `GzDecoder`: verificação empírica (`file -b` num
+    // `file_id` real `access=open` do GDC) mostrou que o MAF do GDC é gzip
+    // padrão de membro único — não BGZF. `MultiGzDecoder` lê gzip de membro
+    // único normalmente, então a troca é segura mesmo aqui e blinda contra
+    // mudança futura de formato na fonte (mesma classe de bug do ClinVar/AM
+    // em `variant_effect_loader.rs`).
+    let gz = MultiGzDecoder::new(file);
     let reader = BufReader::new(gz);
 
     let mut col_idx: Option<MafColIdx> = None;
+    let mut header_search = MafHeaderSearch::new();
     let mut occurrences: Vec<Occurrence> = Vec::new();
     let mut n_skipped_synonymous = 0usize;
     let mut n_skipped_offlist = 0usize;
+    // Guarda de silêncio (mesma classe de bug do ClinVar/AlphaMissense em
+    // `variant_effect_loader.rs`): conta toda linha de dados vista sob o
+    // cabeçalho, mesmo as descartadas por colunas insuficientes. Se o arquivo
+    // baixou com sucesso mas 0 linhas de dados forem vistas, isso é anômalo —
+    // ver checagem ao final da função.
+    let mut n_data_lines_seen = 0usize;
 
     for (line_num, line_result) in reader.lines().enumerate() {
         let line = line_result
@@ -265,7 +360,8 @@ fn parse_maf_gz(
 
         let line = line.trim_end_matches('\r');
 
-        // Pular linhas de comentário ##
+        // Pular linhas de comentário `##` (metadado de formato) — sempre
+        // ignoradas, mesmo depois do cabeçalho já ter sido localizado.
         if line.starts_with("##") {
             continue;
         }
@@ -274,26 +370,30 @@ fn parse_maf_gz(
             continue;
         }
 
-        // Cabeçalho (primeira linha não-##, começa com Hugo_Symbol ou #Hugo_Symbol)
+        // Cabeçalho: localizado por CONTEÚDO via `MafHeaderSearch`, não por
+        // POSIÇÃO ("primeira linha não-##"). O MAF real do GDC tem um
+        // preâmbulo de linhas `#`-simples (`#version`, `#annotation.spec`,
+        // `#contigs`, `#sort.order`, `#filedate`, `#normal.aliquot`,
+        // `#tumor.aliquot`) antes da linha de colunas — ver documentação de
+        // `MafHeaderSearch`.
         if col_idx.is_none() {
-            // O MAF GDC pode ter o cabeçalho como `Hugo_Symbol\t...` (sem #)
-            // ou `#Hugo_Symbol\t...` em alguns arquivos. Strip do # se presente.
-            let header_line = line.trim_start_matches('#');
-            match parse_maf_header(header_line) {
-                Ok(idx) => {
+            match header_search.try_line(line) {
+                Some(Ok(idx)) => {
                     col_idx = Some(idx);
                     continue;
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     return Err(format!(
-                        "Falha ao parsear cabeçalho MAF em {:?}: {}",
+                        "Falha ao localizar cabeçalho MAF em {:?}: {}",
                         path, e
                     ));
                 }
+                None => continue, // preâmbulo — ainda procurando o cabeçalho
             }
         }
 
         let idx = col_idx.as_ref().unwrap();
+        n_data_lines_seen += 1;
         let fields: Vec<&str> = line.split('\t').collect();
 
         // Verificar que temos colunas suficientes
@@ -383,6 +483,31 @@ fn parse_maf_gz(
             gene_symbol: hugo_symbol.to_string(),
             variant_classification: variant_classification.to_string(),
         });
+    }
+
+    // Guarda de silêncio: um MAF cujo cabeçalho foi encontrado mas que produziu
+    // ZERO linhas de dados é anômalo — arquivo truncado, download corrompido,
+    // ou decoder gzip que não leu o payload completo (a mesma classe de bug do
+    // ClinVar em `variant_effect_loader.rs`, ainda que o GDC MAF hoje seja gzip
+    // de membro único — verificado empiricamente). Reportar como erro em vez de
+    // devolver silenciosamente 0 ocorrências com `Ok`.
+    if col_idx.is_some() && n_data_lines_seen == 0 {
+        return Err(format!(
+            "MAF {:?}: cabeçalho encontrado mas 0 linhas de dados lidas — \
+             arquivo pode estar truncado, corrompido, ou o decoder gzip não \
+             leu o payload completo.",
+            path
+        ));
+    }
+
+    // Cabeçalho nunca encontrado (arquivo vazio ou só comentários/linhas em branco)
+    // — mesma anomalia, reportar em vez de devolver Ok silencioso.
+    if col_idx.is_none() {
+        return Err(format!(
+            "MAF {:?}: nenhuma linha de cabeçalho encontrada — arquivo vazio, \
+             corrompido, ou o decoder gzip não leu o payload completo.",
+            path
+        ));
     }
 
     Ok((occurrences, n_skipped_synonymous, n_skipped_offlist))
@@ -1283,5 +1408,164 @@ TP53\t7157\tWUSM\tGRCh38\tchr17\t7676154\t7676154\t+\tMissense_Mutation\tSNP\tC\
         assert!(lines[1].contains("17:7676154:C:T"));
         assert!(lines[1].contains("TP53"));
         assert!(lines[1].contains("Missense_Mutation"));
+    }
+
+    // ── Regressão: guarda de silêncio — arquivo válido + 0 registros ⇒ Err ─────
+    //
+    // Mesma classe de bug do ClinVar (BGZF multi-membro lido só até o 1º
+    // membro): um MAF cujo cabeçalho foi encontrado mas que não produz
+    // NENHUMA linha de dado é anômalo (arquivo truncado, download corrompido,
+    // ou decoder gzip que não leu o payload completo). Antes desta guarda,
+    // `parse_maf_gz` retornava `Ok((vec![], 0, 0))` silenciosamente.
+
+    #[test]
+    fn test_guarda_maf_cabecalho_sem_linhas_de_dado_retorna_err() {
+        const MAF_SO_CABECALHO: &str = "\
+##fileformat=MAFv2.4\n\
+Hugo_Symbol\tEntrez_Gene_Id\tCenter\tNCBI_Build\tChromosome\tStart_Position\tEnd_Position\tStrand\tVariant_Classification\tVariant_Type\tReference_Allele\tTumor_Seq_Allele1\tTumor_Seq_Allele2\tdbSNP_RS\tdbSNP_Val_Status\tTumor_Sample_Barcode\tMatched_Norm_Sample_Barcode\n\
+";
+        let dir = TempDir::new().unwrap();
+        let gz_path = write_maf_gz_fixture(dir.path(), "so_cabecalho.maf.gz", MAF_SO_CABECALHO);
+
+        let allowlist: HashSet<String> = ["TP53".to_string()].into_iter().collect();
+
+        let result = parse_maf_gz(&gz_path, "C3L-00004_tumor", &allowlist);
+        assert!(
+            result.is_err(),
+            "MAF com cabeçalho mas 0 linhas de dado deve retornar Err (anomalia), \
+             não Ok silencioso com 0 ocorrências"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("0 linhas de dados"),
+            "mensagem de erro deve descrever a anomalia: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_guarda_maf_arquivo_totalmente_vazio_retorna_err() {
+        // Nenhum cabeçalho encontrado (arquivo gzip válido, mas sem conteúdo
+        // útil) — mesma anomalia, não deve retornar Ok silencioso.
+        let dir = TempDir::new().unwrap();
+        let gz_path = write_maf_gz_fixture(dir.path(), "vazio.maf.gz", "");
+
+        let allowlist: HashSet<String> = ["TP53".to_string()].into_iter().collect();
+
+        let result = parse_maf_gz(&gz_path, "C3L-00004_tumor", &allowlist);
+        assert!(
+            result.is_err(),
+            "MAF totalmente vazio deve retornar Err (anomalia), não Ok silencioso"
+        );
+    }
+
+    #[test]
+    fn test_guarda_maf_nao_dispara_com_dados_normais() {
+        // Controle negativo: MAF_FIXTURE_A tem dados normais — guarda não deve
+        // disparar e o resultado deve continuar Ok.
+        let dir = TempDir::new().unwrap();
+        let gz_path = write_maf_gz_fixture(dir.path(), "normal.maf.gz", MAF_FIXTURE_A);
+
+        let allowlist: HashSet<String> = ["TP53".to_string(), "VHL".to_string()]
+            .into_iter()
+            .collect();
+
+        let result = parse_maf_gz(&gz_path, "C3L-00004_tumor", &allowlist);
+        assert!(result.is_ok(), "MAF com dados normais não deve disparar a guarda");
+    }
+
+    // ── Regressão: preâmbulo real de 7 linhas `#`-simples do GDC ──────────────
+    //
+    // Bug real: `353 arquivos processados; 0 genes; 0 amostras; 0 ocorrências;
+    // "Coluna 'Hugo_Symbol' não encontrada no cabeçalho MAF"`. Causa-raiz: o
+    // MAF real do GDC tem 7 linhas de preâmbulo `#`-simples (não `##`) antes
+    // da linha de colunas, e a linha de colunas em si NÃO tem prefixo `#`.
+    // O parser antigo tratava "primeira linha não-##" como cabeçalho
+    // (heurística por POSIÇÃO) e tentava parsear `#version gdc-1.0.0` como
+    // cabeçalho, falhando fatalmente. Esta fixture reproduz o preâmbulo real
+    // byte-a-byte (visto ao baixar um `file_id` real do GDC).
+
+    const MAF_FIXTURE_PREAMBULO_REAL_GDC: &str = "\
+#version gdc-1.0.0\n\
+#annotation.spec gdc-2.0.0-aliquot-merged-masked\n\
+#contigs chr1,chr2,chr3\n\
+#sort.order BarcodesAndCoordinate\n\
+#filedate 20220513\n\
+#normal.aliquot 9d8605f9-6281-4ce5-a4fa-4399e1902769\n\
+#tumor.aliquot 5e08ba1d-7269-475b-bda6-e685083916a8\n\
+Hugo_Symbol\tEntrez_Gene_Id\tCenter\tNCBI_Build\tChromosome\tStart_Position\tEnd_Position\tStrand\tVariant_Classification\tVariant_Type\tReference_Allele\tTumor_Seq_Allele1\tTumor_Seq_Allele2\tdbSNP_RS\tdbSNP_Val_Status\tTumor_Sample_Barcode\tMatched_Norm_Sample_Barcode\n\
+TP53\t7157\tWUSM\tGRCh38\tchr17\t7676154\t7676154\t+\tMissense_Mutation\tSNP\tC\tC\tT\t.\t.\tCPT0077490009\tCPT0077490003\n\
+VHL\t7428\tWUSM\tGRCh38\tchr3\t10183774\t10183774\t+\tNonsense_Mutation\tSNP\tG\tG\tA\t.\t.\tCPT0077490009\tCPT0077490003\n\
+";
+
+    #[test]
+    fn test_regressao_preambulo_real_gdc_localiza_cabecalho_e_extrai_ocorrencias() {
+        let dir = TempDir::new().unwrap();
+        let gz_path = write_maf_gz_fixture(dir.path(), "real_gdc.maf.gz", MAF_FIXTURE_PREAMBULO_REAL_GDC);
+
+        let allowlist: HashSet<String> = ["TP53".to_string(), "VHL".to_string()]
+            .into_iter()
+            .collect();
+
+        let result = parse_maf_gz(&gz_path, "C3L-00004_tumor", &allowlist);
+        assert!(
+            result.is_ok(),
+            "MAF com preâmbulo real de 7 linhas `#`-simples deve parsear com \
+             sucesso (regressão do bug '0 arquivos processados'); erro: {:?}",
+            result.err()
+        );
+
+        let (occ, _n_syn, _n_off) = result.unwrap();
+        assert_eq!(
+            occ.len(),
+            2,
+            "Deve extrair as 2 ocorrências não-sinônimas após o preâmbulo real; got={}",
+            occ.len()
+        );
+
+        let tp53 = occ
+            .iter()
+            .find(|o| o.gene_symbol == "TP53")
+            .expect("TP53 missense deve estar presente");
+        assert_eq!(tp53.variant_key, "17:7676154:C:T");
+
+        let vhl = occ
+            .iter()
+            .find(|o| o.gene_symbol == "VHL")
+            .expect("VHL nonsense deve estar presente");
+        assert_eq!(vhl.variant_key, "3:10183774:G:A");
+    }
+
+    // ── Regressão: só o preâmbulo real (sem cabeçalho) deve falhar alto ────────
+    // citando as linhas de preâmbulo vistas, não com erro genérico de coluna.
+
+    #[test]
+    fn test_regressao_preambulo_real_gdc_sem_cabecalho_erra_alto_com_preambulo() {
+        const SO_PREAMBULO: &str = "\
+#version gdc-1.0.0\n\
+#annotation.spec gdc-2.0.0-aliquot-merged-masked\n\
+#contigs chr1,chr2,chr3\n\
+#sort.order BarcodesAndCoordinate\n\
+#filedate 20220513\n\
+#normal.aliquot 9d8605f9-6281-4ce5-a4fa-4399e1902769\n\
+#tumor.aliquot 5e08ba1d-7269-475b-bda6-e685083916a8\n\
+TP53\t7157\tWUSM\tGRCh38\tchr17\t7676154\t7676154\t+\tMissense_Mutation\tSNP\tC\tC\tT\t.\t.\tCPT0077490009\tCPT0077490003\n\
+";
+        let dir = TempDir::new().unwrap();
+        let gz_path = write_maf_gz_fixture(dir.path(), "so_preambulo.maf.gz", SO_PREAMBULO);
+
+        let allowlist: HashSet<String> = ["TP53".to_string()].into_iter().collect();
+
+        let result = parse_maf_gz(&gz_path, "C3L-00004_tumor", &allowlist);
+        assert!(
+            result.is_err(),
+            "MAF sem linha de colunas válida deve falhar alto, não silenciosamente"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("#version gdc-1.0.0"),
+            "mensagem de erro deve citar as linhas de preâmbulo vistas: {}",
+            err_msg
+        );
     }
 }

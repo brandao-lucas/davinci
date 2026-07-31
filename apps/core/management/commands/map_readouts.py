@@ -2,19 +2,33 @@
 Management command — map_readouts
 
 Executa o mapeamento readout→feature (Fase 3, Passo 3.4):
-  Regra 1 (fosfo): PathwayNode(node_type='gene') das vias hsa04151/hsa04010
-                   × matriz de fosfoproteoma (phospho_site).
-  Regra 2 (TF):   TFs do regulon CollecTRI × matriz proteoma (gene).
+  Regra 1 (fosfo): PathwayNode(node_type='gene') das vias do universo desta
+                   execução × matriz de fosfoproteoma (phospho_site).
+  Regra 2 (TF):   TFs do regulon CollecTRI, dentre as vias do universo desta
+                   execução, × matriz proteoma (gene).
 
 Materializa PathwayReadoutFeature (bulk_create ignore_conflicts) e atualiza
 PathwayNode.readout_role para 'phospho' / 'tf_target'.
 
 OmnisPathway Objetivo 2, Fase 3, Passo 3.4.
 
+Universo de vias (generalizado — deixou de ser 3 fixas):
+  Sem `--pathway`, o comando processa TODAS as `Pathway` carregadas em PG
+  (resolvido em tempo de execução por `ReadoutMappingService`, não fixado
+  numa constante). Com `--pathway`, restringe a uma lista explícita — a
+  MESMA lista vale para as DUAS regras (fosfo e TF); não há como restringir
+  cada regra a um universo diferente via este comando, de propósito: vias
+  pontuadas com composições de readout diferentes (ex.: X com fosfo+TF, Y só
+  com TF) produzem z-scores não comparáveis entre si na Fase 4 — ver
+  docstring de `ReadoutMappingService` (apps/core/services/
+  readout_mapping_service.py) para a justificativa completa. Se algum dia for
+  necessário universos distintos por regra, isso é uma chamada direta ao
+  service (não exposta aqui).
+
 Pré-condições (em ordem de execução):
   1. load_phospho_matrix (passo 3.1) — matriz de fosfoproteoma em PG.
   2. load_cptac_matrix (Fase 0) — matriz proteoma gene-level em PG.
-  3. load_pathway_topology (passo 3.2) — PathwayNode das 3 vias em PG.
+  3. load_pathway_topology (passo 3.2) — PathwayNode das vias em PG.
   4. load_regulons (passo 3.3) — JSONL de regulon em
      IngestionJob.parameters['regulon_path'].
 
@@ -29,6 +43,15 @@ Estratégia de validação de existência (A→C concluída — migration 0036):
   catalogado (rode `backfill_matrix_features` antes). Se estiver vazio, o
   mapeamento falha alto (OmicMatrixFeatureNotCataloguedError) em vez de
   degradar silenciosamente para a validação intra-grafo antiga.
+
+Escala (universo expandido para as vias humanas completas do KEGG — 372
+vias, ~5.520 símbolos-gene no grafo): o número de PathwayReadoutFeature
+materializados sobe de milhares (v1, 3 vias) para a ordem de centenas de
+milhares. `ReadoutMappingService` já é set-based (sem query por via em laço)
+e `bulk_create` já é feito em lotes — ver docstring de
+`ReadoutMappingService._persist`. Rode com `--dry-run` primeiro para
+conferir os contadores (incluindo a distribuição por via) antes de
+persistir.
 
 Idempotência:
   bulk_create(ignore_conflicts=True) — seguro re-rodar. PathwayNode.readout_role
@@ -45,17 +68,24 @@ from django.core.management.base import BaseCommand, CommandError
 class Command(BaseCommand):
     help = (
         'Mapeia readouts do grafo KEGG a features das matrizes ômicas '
-        '(Regra 1 fosfo + Regra 2 TF). OmnisPathway Obj 2, Fase 3, Passo 3.4.'
+        '(Regra 1 fosfo + Regra 2 TF), para todas as vias carregadas por '
+        'padrão. OmnisPathway Obj 2, Fase 3, Passo 3.4.'
     )
 
     def add_arguments(self, parser):
         parser.add_argument(
             '--pathway',
             metavar='KEGG_ID',
+            nargs='+',
             default=None,
             help=(
-                'Restringir a uma via KEGG (ex: hsa04151). '
-                'Padrão: todas as vias configuradas no service.'
+                'Restringe a uma ou mais vias KEGG. Aceita múltiplos '
+                'argumentos (--pathway hsa04151 hsa04010), lista separada '
+                'por vírgula (--pathway hsa04151,hsa04010) ou uma mistura '
+                'dos dois. Vale para as DUAS regras (fosfo e TF) — mesmo '
+                'universo, ver docstring do módulo. Padrão (sem esta flag): '
+                'TODAS as vias carregadas em Pathway (resolvido em tempo de '
+                'execução, reflete o catálogo no momento do run).'
             ),
         )
         parser.add_argument(
@@ -80,35 +110,61 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        from apps.core.models import Pathway
         from apps.core.services.readout_mapping_service import (
             DEFAULT_MAPPING_VERSION,
-            PHOSPHO_PATHWAY_IDS,
-            TF_PATHWAY_IDS,
             ReadoutMappingError,
             ReadoutMappingService,
         )
 
-        pathway_filter = options['pathway']
+        pathway_tokens = options['pathway']
         mapping_version = options['mapping_version'] or DEFAULT_MAPPING_VERSION
         dry_run = options['dry_run']
 
-        # Filtra vias se --pathway foi especificado
-        phospho_ids = PHOSPHO_PATHWAY_IDS
-        tf_ids = TF_PATHWAY_IDS
-        if pathway_filter:
-            phospho_ids = [p for p in PHOSPHO_PATHWAY_IDS if p == pathway_filter]
-            tf_ids = [p for p in TF_PATHWAY_IDS if p == pathway_filter]
-            if not phospho_ids and not tf_ids:
-                raise CommandError(
-                    f'Via {pathway_filter!r} nao esta na configuracao '
-                    f'(fosfo: {PHOSPHO_PATHWAY_IDS}, tf: {TF_PATHWAY_IDS}).'
+        # ── Resolve --pathway: aceita múltiplos args e/ou CSV, dedup ────────
+        pathway_ids = None
+        if pathway_tokens:
+            raw_ids = []
+            for token in pathway_tokens:
+                raw_ids.extend(p.strip() for p in token.split(',') if p.strip())
+            seen = set()
+            pathway_ids = []
+            for p in raw_ids:
+                if p not in seen:
+                    seen.add(p)
+                    pathway_ids.append(p)
+
+            existing = set(
+                Pathway.objects.filter(kegg_id__in=pathway_ids).values_list(
+                    'kegg_id', flat=True
                 )
+            )
+            if not existing:
+                raise CommandError(
+                    f'Nenhuma das vias informadas existe em Pathway: '
+                    f'{pathway_ids}. Execute load_pathway_topology para '
+                    f'carrega-las antes.'
+                )
+            missing = [p for p in pathway_ids if p not in existing]
+            if missing:
+                self.stdout.write(self.style.WARNING(
+                    f'Aviso: vias nao encontradas em Pathway (nenhum '
+                    f'PathwayNode sera considerado para elas): {missing}'
+                ))
 
         self.stdout.write(
             f'Mapeamento readout->feature (versao={mapping_version})'
         )
-        self.stdout.write(f'  Vias fosfo (Regra 1): {phospho_ids}')
-        self.stdout.write(f'  Vias TF (Regra 2):    {tf_ids}')
+        if pathway_ids is None:
+            self.stdout.write(
+                '  Vias: TODAS as carregadas em Pathway (resolvido em '
+                'tempo de execucao) — mesmo universo p/ Regra 1 e Regra 2.'
+            )
+        else:
+            self.stdout.write(
+                f'  Vias (restrito via --pathway): {pathway_ids} — mesmo '
+                f'universo p/ Regra 1 e Regra 2.'
+            )
         self.stdout.write(f'  dry_run: {dry_run}')
         self.stdout.write('')
         self.stdout.write('Pre-condicoes necessarias:')
@@ -125,8 +181,8 @@ class Command(BaseCommand):
 
         try:
             service = ReadoutMappingService(
-                pathway_ids_phospho=phospho_ids,
-                pathway_ids_tf=tf_ids,
+                pathway_ids_phospho=pathway_ids,
+                pathway_ids_tf=pathway_ids,
                 mapping_version=mapping_version,
                 dry_run=dry_run,
             )
@@ -161,6 +217,13 @@ class Command(BaseCommand):
         self.stdout.write(f'  phospho_matrix_id:   {report["phospho_matrix_id"]}')
         self.stdout.write(f'  proteome_matrix_id:  {report["proteome_matrix_id"]}')
         self.stdout.write(f'  regulon_path_found:  {report["regulon_path_found"]}')
+        self.stdout.write('')
+        self.stdout.write('Distribuicao por via:')
+        self.stdout.write(f'  n_pathways_total:          {report["n_pathways_total"]}')
+        self.stdout.write(f'  n_pathways_with_phospho:   {report["n_pathways_with_phospho"]}')
+        self.stdout.write(f'  n_pathways_with_tf:        {report["n_pathways_with_tf"]}')
+        self.stdout.write(f'  n_pathways_without_readout:{report["n_pathways_without_readout"]}'
+                           ' (escore degenerado na Fase 4)')
         self.stdout.write('')
         self.stdout.write(f'  estrategia: {report["validation_strategy"]}')
 

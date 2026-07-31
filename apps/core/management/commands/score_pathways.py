@@ -46,11 +46,20 @@ Sensitive-data-handling:
   db_url nunca logada nem impressa. storage_key/caminhos locais dos
   Parquets também não.
 
+Universo de vias (generalizado — deixou de ser 3 fixas):
+  Sem `--pathways`, o comando pontua TODAS as `Pathway` carregadas em PG
+  (resolvido em tempo de execução por `PathwayScoringService`, não fixado
+  numa constante — ver `_resolve_default_pathway_ids` no service). Com
+  `--pathways`, restringe a uma lista explícita — aceita múltiplos
+  argumentos (--pathways hsa04151 hsa04010), lista separada por vírgula
+  (--pathways hsa04151,hsa04010) ou uma mistura dos dois, mesmo formato de
+  `load_regulons`/`map_readouts`.
+
 Uso:
     # Sonda de cobertura (D-4/D-5) sem gravar nada
     .venv/bin/python manage.py score_pathways --project <UUID> --dry-run
 
-    # Execução real (default: as 3 vias, fase4-pfs-v1)
+    # Execução real (default: TODAS as vias carregadas, fase4-pfs-v1)
     .venv/bin/python manage.py score_pathways --project <UUID>
 
     # Via específica + método/versão custom
@@ -67,7 +76,6 @@ Uso:
 
 from django.core.management.base import BaseCommand, CommandError
 
-_DEFAULT_PATHWAYS = 'hsa04151,hsa04010,hsa04115'
 _DEFAULT_SEED_VERSIONS = 'fase2-cnv-v2,fase2-snv-v1,fase2-cnv-v1'
 
 
@@ -86,9 +94,17 @@ class Command(BaseCommand):
         )
         parser.add_argument(
             '--pathways',
-            metavar='IDS',
-            default=_DEFAULT_PATHWAYS,
-            help=f'IDs KEGG separados por vírgula (padrão: {_DEFAULT_PATHWAYS}).',
+            metavar='KEGG_ID',
+            nargs='+',
+            default=None,
+            help=(
+                'Restringe a uma ou mais vias KEGG. Aceita múltiplos '
+                'argumentos (--pathways hsa04151 hsa04010), lista separada '
+                'por vírgula (--pathways hsa04151,hsa04010) ou uma mistura '
+                'dos dois. Padrão (sem esta flag): TODAS as vias carregadas '
+                'em Pathway (resolvido em tempo de execução, reflete o '
+                'catálogo no momento do run).'
+            ),
         )
         parser.add_argument(
             '--seed-method-versions',
@@ -193,9 +209,8 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        from apps.core.models import DaVinciProject
+        from apps.core.models import DaVinciProject, Pathway
         from apps.core.services.pathway_scoring_service import (
-            DEFAULT_PATHWAY_KEGG_IDS,
             DEFAULT_SEED_METHOD_VERSIONS,
             PathwayScoringService,
             PfsFeaturesNotCataloguedError,
@@ -220,10 +235,34 @@ class Command(BaseCommand):
         dry_run = options['dry_run']
         use_async = options['use_async']
 
-        raw_pathways = options['pathways']
-        pathway_ids = [p.strip() for p in raw_pathways.split(',') if p.strip()]
-        if not pathway_ids:
-            pathway_ids = DEFAULT_PATHWAY_KEGG_IDS
+        # ── Resolve --pathways: aceita múltiplos args e/ou CSV, dedup ───────
+        # None (flag omitida) → PathwayScoringService resolve TODAS as
+        # `Pathway` carregadas em PG no momento da execução (não fixado
+        # aqui — ver _resolve_default_pathway_ids no service).
+        pathway_tokens = options['pathways']
+        pathway_ids = None
+        if pathway_tokens:
+            raw_ids = []
+            for token in pathway_tokens:
+                raw_ids.extend(p.strip() for p in token.split(',') if p.strip())
+            seen = set()
+            pathway_ids = []
+            for p in raw_ids:
+                if p not in seen:
+                    seen.add(p)
+                    pathway_ids.append(p)
+
+            existing = set(
+                Pathway.objects.filter(kegg_id__in=pathway_ids).values_list(
+                    'kegg_id', flat=True
+                )
+            )
+            missing = [p for p in pathway_ids if p not in existing]
+            if missing:
+                self.stdout.write(self.style.WARNING(
+                    f'Aviso: vias nao encontradas em Pathway (a pre-checagem '
+                    f'de grafo abaixo vai falhar alto para elas): {missing}'
+                ))
 
         raw_seed_versions = options['seed_method_versions']
         seed_method_versions = [
@@ -239,7 +278,13 @@ class Command(BaseCommand):
             raise CommandError(f'Projeto não encontrado: {project_uuid}')
 
         self.stdout.write(f'Projeto: {project.title} (id={project.id})')
-        self.stdout.write(f'Vias:                 {pathway_ids}')
+        if pathway_ids is None:
+            self.stdout.write(
+                'Vias:                 TODAS as carregadas em Pathway '
+                '(resolvido em tempo de execucao)'
+            )
+        else:
+            self.stdout.write(f'Vias (restrito via --pathways): {pathway_ids}')
         self.stdout.write(f'method_version:       {method_version}')
         self.stdout.write(f'seed_method_versions: {seed_method_versions}')
         self.stdout.write(f'mapping_version:      {mapping_version}')

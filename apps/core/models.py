@@ -2678,10 +2678,108 @@ class PathwayActivityScore(models.Model):
                                 com ≥ `min_regulon_targets` alvos com valor
                                 (termo 2)
 
+    ─── MULTIPLICIDADE: por que o q é NULLABLE e vem DEPOIS ──────────────────
+    Com 3 vias × 84 amostras (252 testes) a α=0,05 sem correção já se esperam
+    ~13 falsos positivos. Ao passar para as 372 vias humanas do KEGG são 31.248
+    testes e ~1.560 "significativos" por puro acaso — a lista de vias
+    significativas seria majoritariamente ruído. `p_empirical` é o valor CRU e
+    permanece cru: nunca é sobrescrito.
+
+    O BH é uma estatística DE CONJUNTO — o q de uma linha depende do rank do
+    seu p entre TODOS os p da família. O motor Rust NÃO tem esse conjunto: um
+    run pode pontuar um subconjunto de vias, e runs sucessivos acumulam linhas
+    sob o MESMO `method_version`. Computar BH dentro do run daria um q sobre a
+    família errada (a do run), silenciosamente diferente da família declarada.
+    Por isso o motor grava os q como NULL e passadas de pós-processamento,
+    disparadas quando a família está completa, preenchem em UM UPDATE
+    set-based por escopo.
+
+    ─── DOIS ESCOPOS SIMULTÂNEOS (0039) — POR QUE O ESCOPO ESTÁ NO NOME ──────
+    A bancada lê a mesma matriz de duas direções, e as duas leituras convivem
+    na MESMA linha porque a natural key não muda:
+
+      POPULACIONAL  `*_across_samples`   família = as amostras de UMA via
+                    partição (pathway_id, method_version), m ≈ 84
+                    "esta via é significativa em mais pacientes que o acaso?"
+
+      INDIVIDUAL    `*_across_pathways`  família = as vias de UM paciente
+                    partição (sample_id, method_version), m ≈ 100
+                    "neste tumor, quais vias se destacam?"
+
+    A 0038 tinha UM q rotulado por um campo `fdr_scope`. Com DOIS q na mesma
+    linha esse desenho vira armadilha: `q_value=0,03` e `q_value_individual=
+    0,20` obriga o leitor a saber, de cor, qual coluna corresponde a qual
+    escopo, e o rótulo passaria a valer para uma coluna só. A 0039 move o
+    escopo do VALOR para o NOME DA COLUNA: `fdr_scope` é removido (nunca teve
+    dado — a passada de FDR jamais rodou) e cada escopo ganha seu trio
+    `q_value_* / fdr_method_* / fdr_n_tests_*`. Sem coluna livre de escopo,
+    não existe linha ambígua.
+
+    O sufixo nomeia AQUILO QUE A FAMÍLIA ATRAVESSA, e por isso o dado
+    confere o nome: `fdr_n_tests_across_samples` conta AMOSTRAS (~84) e
+    `fdr_n_tests_across_pathways` conta VIAS (~100). Um m de 372 em
+    `*_across_samples` é erro visível a olho nu.
+
+    ─── B NÃO PODE SER BAIXO: o piso do q é m/(B+1) ──────────────────────────
+    `p_empirical` satura em `p_min = 1/(B+1)`, logo o MENOR q que o BH pode
+    devolver numa família de tamanho m é `m × p_min = m/(B+1)`. Isto é piso
+    ARITMÉTICO, não estatístico: nenhuma quantidade de sinal biológico o
+    fura.
+
+      B =  1.000 → individual  (m≈100): piso q ≈ 0,100  → NADA passa a 0,05
+                   populacional (m≈84):  piso q ≈ 0,084  → NADA passa a 0,05
+      B = 10.000 → individual  (m≈100): piso q ≈ 0,010  ✓
+                   populacional (m≈84):  piso q ≈ 0,0084 ✓
+
+    O default histórico do motor (B=1000) tornaria as DUAS leituras
+    incapazes de produzir um único achado a α=0,05 — não por ausência de
+    efeito, mas por resolução. Quem reexecutar o motor tem de subir
+    `n_permutations` para 10.000; caso contrário o resultado correto é uma
+    coluna inteira de q acima do limiar, e a conclusão "nada é significativo"
+    seria artefato do B.
+
+    Os campos NOT NULL levam `db_default` (não só `default` Django) pelo mesmo
+    motivo da migration 0020: o motor faz `INSERT ... SELECT` com SUBSET de
+    colunas; sem DEFAULT no nível do BANCO a coluna nova entraria como NULL e
+    o INSERT do Rust quebraria com SqlState 23502 sem que o COPY tivesse
+    mudado uma linha sequer. Os `q_value_*` são nullable e dispensam
+    db_default.
+
+    Consequência operacional do UPSERT: o COPY do motor NÃO conhece estas
+    colunas (o contrato de 17 colunas da 0037 está intacto), mas re-executar
+    um `method_version` REESCREVE `p_empirical` e deixaria q órfãos,
+    calculados sobre p-valores que já não existem. A convenção é: quem
+    reescreve `p_empirical` INVALIDA OS DOIS escopos da linha (ambos os
+    `q_value_*` a NULL, ambos os `fdr_method_*` a '', ambos os
+    `fdr_n_tests_*` a 0). Um q rotulado sempre corresponde ao `p_empirical`
+    que está na mesma linha.
+
+    Degenerados FORA do denominador: espera-se que 60–80% das linhas sejam
+    degeneradas (`null_sd == 0` → `z_score == 0` por convenção do D7 — medido:
+    ~74%) — via sem semente naquele paciente, isto é, teste que NUNCA foi
+    feito. Inflar m com elas encolheria o limiar do BH por um fator de 3 a 5 e
+    enterraria os achados reais. `null_sd == 0` é o predicado que separa os
+    dois grupos e já existe desde a 0037 — nenhum campo novo é necessário para
+    isso. É também o que faz m cair de 84→~84 e de 372→~100 nos dois escopos.
+    Qual predicado usar é decisão de ANÁLISE; o schema apenas garante que ela
+    seja expressável e auditável a posteriori (via `fdr_n_tests_*`).
+
+    Vias metabólicas do KEGG: 93 das 372 produzem grafo 100% SEM SINAL
+    (`PathwayEdge.sign = 0` em todas as arestas; ex.: hsa00020 signed=0
+    unsigned=94). O RWR assinado degenera em difusão não-assinada nelas, e o
+    z resultante não tem direção interpretável. NÃO há campo para isso por
+    desenho — o predicado é derivável por join em `PathwayEdge` (via sem
+    nenhuma aresta com sign≠0). Quem monta a família decide se as segrega;
+    o schema não decide por ele.
+
     Extensibilidade (D10): o ponto de extensão é `method_version` na natural
     key — RWR assinado, PCST e difusão de calor coexistem na mesma tabela SEM
-    migration futura. Não há trait/registry de propagador enquanto houver um só
-    implementador.
+    migration futura. Não há trait/registry de propagador enquanto houver um
+    só implementador. Para o FDR, o ponto de extensão é o SUFIXO: um terceiro
+    escopo (p.ex. global, sobre os 31.248 testes do `method_version`) entra
+    como o trio `q_value_global / fdr_method_global / fdr_n_tests_global`
+    numa migration puramente aditiva — a NK não muda e os escopos existentes
+    não são tocados.
     """
 
     pathway = models.ForeignKey(
@@ -2740,6 +2838,110 @@ class PathwayActivityScore(models.Model):
         'Nº de Permutações (B)',
         default=0,
         help_text='B efetivo usado na nula (default 1000).'
+    )
+
+    # ─── FDR ESCOPO POPULACIONAL: família = as amostras de UMA via ────────────
+    # Partição (pathway_id, method_version). "Esta via é significativa em mais
+    # pacientes que o acaso?" PREENCHIDO POR DJANGO EM PÓS-PROCESSAMENTO, NÃO
+    # PELO COPY DO MOTOR. Ver "DOIS ESCOPOS SIMULTÂNEOS" na docstring.
+    q_value_across_samples = models.FloatField(
+        'q-valor FDR — populacional (via através das amostras)',
+        null=True,
+        blank=True,
+        help_text='p_empirical ajustado para multiplicidade DENTRO DA VIA, '
+                  'através das amostras da coorte: a família é '
+                  '(pathway_id, method_version). NULL tem DOIS significados, '
+                  'desambiguados por fdr_method_across_samples: método=="" → '
+                  'a passada populacional ainda NÃO rodou nesta linha; método '
+                  'preenchido e q NULL → a linha foi DELIBERADAMENTE excluída '
+                  'do denominador (degenerada: null_sd==0). NUNCA NaN — o '
+                  'CheckConstraint pathwayscore_q_across_samples_range rejeita '
+                  'NaN (no Postgres NaN > 1.0 é verdadeiro). NÃO comparável '
+                  'com q_value_across_pathways: são famílias diferentes.'
+    )
+    fdr_method_across_samples = models.CharField(
+        'Método de Correção — populacional',
+        max_length=24,
+        blank=True,
+        default='',
+        db_default='',
+        choices=[
+            ('benjamini_hochberg', 'Benjamini-Hochberg (FDR)'),
+            ('benjamini_yekutieli', 'Benjamini-Yekutieli (FDR, dep. arbitrária)'),
+            ('storey_q', 'Storey q-value (pi0 estimado)'),
+        ],
+        help_text='"" = nenhuma passada populacional tocou esta linha. '
+                  'Preenchido = a linha foi CONSIDERADA por uma passada '
+                  '(mesmo que excluída do denominador, caso em que '
+                  'q_value_across_samples fica NULL). Independente do método '
+                  'do escopo individual: as duas passadas são autônomas.'
+    )
+    fdr_n_tests_across_samples = models.PositiveIntegerField(
+        'Tamanho da Família (m) — populacional: nº de AMOSTRAS',
+        default=0,
+        db_default=0,
+        help_text='m usado como denominador do BH desta linha no escopo '
+                  'populacional — conta AMOSTRAS não-degeneradas desta via '
+                  '(~84 de 84), JÁ DESCONTADAS as degeneradas. Persistido '
+                  'porque o escopo sozinho não reproduz m: a exclusão depende '
+                  'do estado dos dados no instante da passada. 0 = não '
+                  'computado. DIMENSIONAMENTO DE B: o menor q atingível é '
+                  'm/(B+1), piso aritmético que nenhum sinal fura — com '
+                  'm≈84 e B=1000 o piso é 0,084 e NADA passaria a α=0,05; '
+                  'com B=10000 o piso cai para 0,0084. Por isso o motor deve '
+                  'rodar com n_permutations=10000, não com o default 1000.'
+    )
+
+    # ─── FDR ESCOPO INDIVIDUAL: família = as vias de UM paciente ──────────────
+    # Partição (sample_id, method_version). "Neste tumor, quais vias se
+    # destacam?" Mesmo p_empirical, família outra, q outro.
+    q_value_across_pathways = models.FloatField(
+        'q-valor FDR — individual (amostra através das vias)',
+        null=True,
+        blank=True,
+        help_text='p_empirical ajustado para multiplicidade DENTRO DA '
+                  'AMOSTRA, através das vias: a família é '
+                  '(sample_id, method_version). NULL tem DOIS significados, '
+                  'desambiguados por fdr_method_across_pathways: método=="" → '
+                  'a passada individual ainda NÃO rodou nesta linha; método '
+                  'preenchido e q NULL → a linha foi DELIBERADAMENTE excluída '
+                  'do denominador (degenerada: null_sd==0). NUNCA NaN — o '
+                  'CheckConstraint pathwayscore_q_across_pathways_range '
+                  'rejeita NaN. NÃO comparável com q_value_across_samples: '
+                  'são famílias diferentes.'
+    )
+    fdr_method_across_pathways = models.CharField(
+        'Método de Correção — individual',
+        max_length=24,
+        blank=True,
+        default='',
+        db_default='',
+        choices=[
+            ('benjamini_hochberg', 'Benjamini-Hochberg (FDR)'),
+            ('benjamini_yekutieli', 'Benjamini-Yekutieli (FDR, dep. arbitrária)'),
+            ('storey_q', 'Storey q-value (pi0 estimado)'),
+        ],
+        help_text='"" = nenhuma passada individual tocou esta linha. '
+                  'Preenchido = a linha foi CONSIDERADA por uma passada '
+                  '(mesmo que excluída do denominador, caso em que '
+                  'q_value_across_pathways fica NULL). Independente do método '
+                  'do escopo populacional: as duas passadas são autônomas.'
+    )
+    fdr_n_tests_across_pathways = models.PositiveIntegerField(
+        'Tamanho da Família (m) — individual: nº de VIAS',
+        default=0,
+        db_default=0,
+        help_text='m usado como denominador do BH desta linha no escopo '
+                  'individual — conta VIAS não-degeneradas deste paciente '
+                  '(~100 de 372; ~74% das linhas são degeneradas), JÁ '
+                  'DESCONTADAS as degeneradas. Persistido porque o escopo '
+                  'sozinho não reproduz m. 0 = não computado. '
+                  'DIMENSIONAMENTO DE B: o menor q atingível é m/(B+1) — com '
+                  'm≈100 e B=1000 o piso é 0,101, isto é, NENHUMA via de '
+                  'NENHUM paciente poderia jamais passar a α=0,05, por '
+                  'resolução e não por biologia. É o escopo mais exigente e '
+                  'foi ele que fixou B=10000 (piso 0,010). Reexecutar com B '
+                  'baixo produz "nada significativo" como ARTEFATO.'
     )
 
     # ─── Cobertura de semente (D4/D-5) ────────────────────────────────────────
@@ -2811,6 +3013,50 @@ class PathwayActivityScore(models.Model):
             models.UniqueConstraint(
                 fields=['pathway', 'sample', 'method_version'],
                 name='pathwayactivityscore_natural_key_uniq',
+            ),
+            # `double precision` aceita NaN em silêncio e, no Postgres, NaN
+            # ordena como MAIOR que qualquer número — um q=NaN passaria por
+            # `q <= 1` se o teste fosse ingênuo e envenenaria qualquer ORDER
+            # BY. Estes CHECK rejeitam NaN justamente porque NaN <= 1.0 é
+            # FALSO. NULL continua permitido (CHECK com NULL não falha).
+            # Um par (range, labeled) POR ESCOPO: as passadas são autônomas e
+            # uma não pode ser refém do estado da outra.
+            models.CheckConstraint(
+                name='pathwayscore_q_across_samples_range',
+                condition=(
+                    models.Q(q_value_across_samples__isnull=True)
+                    | (
+                        models.Q(q_value_across_samples__gte=0.0)
+                        & models.Q(q_value_across_samples__lte=1.0)
+                    )
+                ),
+            ),
+            # q sem rótulo é número mágico: proíbe gravar q sem declarar o
+            # método que o produziu. O escopo já está no NOME da coluna — não
+            # há campo de escopo a exigir (foi o que a 0039 eliminou).
+            models.CheckConstraint(
+                name='pathwayscore_q_across_samples_labeled',
+                condition=(
+                    models.Q(q_value_across_samples__isnull=True)
+                    | ~models.Q(fdr_method_across_samples='')
+                ),
+            ),
+            models.CheckConstraint(
+                name='pathwayscore_q_across_pathways_range',
+                condition=(
+                    models.Q(q_value_across_pathways__isnull=True)
+                    | (
+                        models.Q(q_value_across_pathways__gte=0.0)
+                        & models.Q(q_value_across_pathways__lte=1.0)
+                    )
+                ),
+            ),
+            models.CheckConstraint(
+                name='pathwayscore_q_across_pathways_labeled',
+                condition=(
+                    models.Q(q_value_across_pathways__isnull=True)
+                    | ~models.Q(fdr_method_across_pathways='')
+                ),
             ),
         ]
         indexes = [

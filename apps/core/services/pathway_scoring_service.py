@@ -6,6 +6,23 @@ contínuo por permutação). Ver
 .claude/plans/2026-07-16-omnispathway-obj2-fase4-motor-pfs-v1.md (D1-D10 +
 ADENDO) para o desenho completo.
 
+Universo de vias (generalizado — deixou de ser 3 fixas):
+  v1 (Fase 4 inicial) fixava DEFAULT_PATHWAY_KEGG_IDS em 3 vias KEGG (hoje
+  alias de LEGACY_V1_PATHWAY_KEGG_IDS). Com a bancada expandida para as vias
+  humanas completas do KEGG (372 vias, grafo com 49.322 nós / 5.520
+  símbolos-gene distintos), fixar em 3 pontuaria só 3 das 372 vias
+  silenciosamente (aparência de run completo, escala desatualizada) — o
+  mesmo modo de falha já corrigido em regulon_load_service e
+  readout_mapping_service. `dispatch()`/`run()` agora resolvem
+  `pathway_kegg_ids=None` para TODAS as `Pathway.kegg_id` em PG no momento
+  da execução (`_resolve_default_pathway_ids`), não para a constante.
+  Lista explícita (via `--pathways` do command, ou chamada programática)
+  continua sendo respeitada tal como passada — INCLUSIVE lista vazia (`[]`).
+  `_resolve_default_pathway_ids()` é set-based (uma única query
+  `Pathway.objects.values_list('kegg_id', flat=True)`) — não gera query por
+  via; os pré-checks (`_check_graph_loaded`/`_check_readouts_mapped`) já
+  usam `__in=pathway_ids`, também set-based.
+
 Responsabilidade (D1 TRAVADO: núcleo 100% Rust, órbita 100% Django):
   1. Resolver AS DUAS matrizes de readout dentro do projeto (isolamento,
      Regra #3): fosfoproteoma (omics_layer='proteomic',
@@ -157,8 +174,17 @@ logger = logging.getLogger(__name__)
 # Defaults do motor PFS v1 (D3/D5/D6/D7 do plano da Fase 4)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Vias padrão (mesmas 3 da Fase 3 — PI3K-Akt, MAPK, p53).
-DEFAULT_PATHWAY_KEGG_IDS = ['hsa04151', 'hsa04010', 'hsa04115']
+# Preset legado (v1, Fase 4 inicial) — as 3 vias KEGG originais (PI3K-Akt,
+# MAPK, p53). NÃO é mais o default de dispatch()/run() (ver "Universo de
+# vias" na docstring do módulo) — mantido nomeado só para reprodutibilidade
+# de execuções antigas / testes que queiram fixar o universo explicitamente.
+LEGACY_V1_PATHWAY_KEGG_IDS = ['hsa04151', 'hsa04010', 'hsa04115']
+
+# Alias retrocompatível (nome antigo) — mesmo conteúdo do preset acima.
+# Não usar como default: dispatch()/run() resolvem `pathway_kegg_ids=None`
+# para TODAS as `Pathway.kegg_id` em PG no momento da execução
+# (`_resolve_default_pathway_ids`), não para esta constante.
+DEFAULT_PATHWAY_KEGG_IDS = LEGACY_V1_PATHWAY_KEGG_IDS
 
 # Precedência de seed por (sample, gene) TRAVADA em D3 (cnv-v2 > snv-v1 >
 # cnv-v1) — a precedência é aplicada dentro do Rust; esta é a LISTA de
@@ -182,6 +208,27 @@ _ACTIVE_STATUSES = (
     ProjectDataset.CurationStatus.DOWNLOADED,
     ProjectDataset.CurationStatus.PENDING,
 )
+
+def _resolve_default_pathway_ids() -> list[str]:
+    """
+    Resolve o universo padrão de vias: TODAS as `Pathway.kegg_id` carregadas
+    em PG neste momento — não a constante `DEFAULT_PATHWAY_KEGG_IDS` (preset
+    legado de 3 vias).
+
+    Chamada sob demanda (dentro de dispatch()/run(), quando
+    `pathway_kegg_ids` não foi informado) para refletir o catálogo `Pathway`
+    no momento da execução, não em tempo de import do módulo. Query única,
+    set-based — não gera N queries para N vias.
+
+    Retorna lista vazia se `Pathway` estiver vazio (grafo ainda não
+    carregado) — `_check_graph_loaded` trata isso da mesma forma que hoje
+    trata qualquer via ausente (`PfsGraphNotLoadedError`, instrui
+    `load_pathway_topology`).
+    """
+    return list(
+        Pathway.objects.order_by('kegg_id').values_list('kegg_id', flat=True)
+    )
+
 
 # Campos da configuração que AFETAM O RESULTADO NUMÉRICO — usados pelo gate
 # de reprodutibilidade (D3). `pathway_kegg_ids` e `dry_run` ficam de fora
@@ -394,6 +441,13 @@ class PathwayScoringService:
         Pré-checks + gates + criação do IngestionJob. Não executa o motor —
         apenas valida pré-condições e enfileira a task Celery.
 
+        Args:
+            pathway_kegg_ids: IDs KEGG a pontuar. None → TODAS as `Pathway`
+                               carregadas em PG neste momento
+                               (`_resolve_default_pathway_ids`) — lista
+                               explícita (incl. `[]`) é respeitada tal como
+                               passada.
+
         Raises:
             PfsMatrixNotFoundError, PfsGraphNotLoadedError,
             PfsReadoutsNotMappedError, PfsFeaturesNotCataloguedError,
@@ -403,7 +457,11 @@ class PathwayScoringService:
         from apps.core.tasks.ingestion_tasks import run_pathway_scoring
 
         service = cls(project)
-        pathway_ids = list(pathway_kegg_ids or DEFAULT_PATHWAY_KEGG_IDS)
+        pathway_ids = (
+            list(pathway_kegg_ids)
+            if pathway_kegg_ids is not None
+            else _resolve_default_pathway_ids()
+        )
         seed_versions = list(seed_method_versions or DEFAULT_SEED_METHOD_VERSIONS)
 
         phospho_matrix = service.resolve_phospho_matrix(project)
@@ -501,6 +559,15 @@ class PathwayScoringService:
         Args:
             job: IngestionJob existente (criado por dispatch); se None, cria
                  internamente (modo síncrono direto do management command).
+            pathway_kegg_ids: IDs KEGG a pontuar. None → usa
+                               `job.parameters['pathway_kegg_ids']` (se
+                               `job` foi informado — os pré-checks abaixo
+                               precisam refletir o universo REAL do job, não
+                               um default stale) ou TODAS as `Pathway`
+                               carregadas em PG neste momento
+                               (`_resolve_default_pathway_ids`). Lista
+                               explícita (incl. `[]`) é respeitada tal como
+                               passada.
             demais args: ver DEFAULT_* no topo do módulo.
 
         Returns:
@@ -508,7 +575,12 @@ class PathwayScoringService:
         """
         import rust_engine
 
-        pathway_ids = list(pathway_kegg_ids or DEFAULT_PATHWAY_KEGG_IDS)
+        if pathway_kegg_ids is not None:
+            pathway_ids = list(pathway_kegg_ids)
+        elif job is not None and job.parameters.get('pathway_kegg_ids') is not None:
+            pathway_ids = list(job.parameters['pathway_kegg_ids'])
+        else:
+            pathway_ids = _resolve_default_pathway_ids()
         seed_versions = list(seed_method_versions or DEFAULT_SEED_METHOD_VERSIONS)
 
         phospho_matrix = self.resolve_phospho_matrix(self.project)
@@ -557,8 +629,9 @@ class PathwayScoringService:
             )
             # Parâmetros efetivos vêm do job pré-criado pelo dispatch (gates
             # já foram checados lá) — mesmo padrão de CnvSeedService.run.
+            # pathway_ids já foi resolvido de job.parameters acima (antes
+            # dos pré-checks, para que eles validem o universo REAL do job).
             p = job.parameters or {}
-            pathway_ids = p.get('pathway_kegg_ids', pathway_ids)
             method_version = p.get('method_version', method_version)
             seed_versions = p.get('seed_method_versions', seed_versions)
             mapping_version = p.get('mapping_version', mapping_version)

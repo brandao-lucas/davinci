@@ -2619,7 +2619,9 @@ impl KeggTopologyManifest {
 /// # Fonte (travada)
 ///
 /// `https://rest.kegg.jp/get/<kegg_id>/kgml` para cada via.
-/// Host allowlist: apenas `rest.kegg.jp`. Rate limit: ≤ 3 req/s (3 vias = 3 chamadas).
+/// Host allowlist: apenas `rest.kegg.jp`. Rate limit: ≤ 3 req/s documentado
+/// pelo KEGG (acesso bloqueado acima disso) — throttle real entre downloads
+/// via `throttle_ms` (default 400ms = 2,5 req/s), não aplicado a cache hits.
 /// Cache local em `<dest_dir>/kegg/<kegg_id>.kgml`.
 ///
 /// # §Sinal
@@ -2642,22 +2644,25 @@ impl KeggTopologyManifest {
 /// | `pathway_kegg_ids` | `list[str]` | IDs KEGG das vias (ex.: `["hsa04151","hsa04010","hsa04115"]`). |
 /// | `dest_dir` | `str` | Diretório de cache local (KGML raw, gitignored). |
 /// | `db_url` | `str` | PostgreSQL connection string. |
+/// | `throttle_ms` | `int` | Intervalo mínimo entre downloads KGML reais (default 400ms = 2,5 req/s; margem sob o limite KEGG de 3 req/s). Cache hits não consomem o throttle. |
 ///
 /// # Retorno
 ///
 /// `KeggTopologyManifest` — ver campos acima. `readout_role` fica `none` em todos os
 /// nós (marcado pelo vitruvio no passo 3.4).
 #[pyfunction]
-#[pyo3(signature = (pathway_kegg_ids, dest_dir, db_url))]
+#[pyo3(signature = (pathway_kegg_ids, dest_dir, db_url, throttle_ms = 400))]
 fn load_kegg_topology(
     pathway_kegg_ids: Vec<String>,
     dest_dir: String,
     db_url: String,
+    throttle_ms: u64,
 ) -> PyResult<KeggTopologyManifest> {
     match crate::omics::kegg_topology_loader::load_kegg_topology(
         &pathway_kegg_ids,
         &dest_dir,
         &db_url,
+        throttle_ms,
     ) {
         Ok(m) => Ok(KeggTopologyManifest {
             n_pathways: m.n_pathways,

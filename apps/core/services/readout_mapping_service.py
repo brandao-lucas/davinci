@@ -8,20 +8,39 @@ Responsabilidade:
   materializar PathwayReadoutFeature + marcar PathwayNode.readout_role.
   Django set-based puro (ORM/SQL) — ZERO Rust, ZERO abertura de Parquet.
 
+Universo de vias (generalizado — deixou de ser 3 fixas):
+  v1 (Fase 3 inicial) fixava as regras em 3 vias KEGG via constante
+  (PHOSPHO_PATHWAY_IDS/TF_PATHWAY_IDS, hoje aliases de
+  LEGACY_V1_PHOSPHO_PATHWAY_IDS/LEGACY_V1_TF_PATHWAY_IDS). Com a bancada
+  expandida para as vias humanas completas do KEGG (372 vias, grafo com
+  49.322 nós / 5.520 símbolos-gene distintos), o default de AMBAS as regras
+  passou a ser TODAS as `Pathway` carregadas em PG — resolvido em
+  `run()`/`_resolve_pathway_universe`, não fixado em constante. As duas
+  regras usam o MESMO universo por padrão (ver docstring de
+  ReadoutMappingService para a justificativa de comparabilidade de z-score
+  entre vias). `pathway_ids_phospho`/`pathway_ids_tf` continuam aceitando
+  lista explícita para restringir uma execução (debug, reprodução do preset
+  legado).
+
 Regra 1 (fosfo):
-  PathwayNode(node_type='gene') das vias hsa04151/hsa04010 (PI3K-Akt, MAPK)
-  × features da matriz de fosfoproteoma (OmicMatrix omics_layer='proteomic',
-  feature_axis='phospho_site', loader_version='phospho-v1').
+  PathwayNode(node_type='gene') das vias do universo resolvido (default:
+  todas) × features da matriz de fosfoproteoma (OmicMatrix
+  omics_layer='proteomic', feature_axis='phospho_site',
+  loader_version='phospho-v1').
   feature_key = gene_symbol do nó (UPPERCASE).
   Onde bate: PathwayNode.readout_role='phospho' + PathwayReadoutFeature(
     rule='phospho', confidence=1.0, mapping_version=<ver>).
+  Vias cujo símbolo não está catalogado na matriz de fosfo simplesmente não
+  geram readout de fosfo (n_features_not_found) — não há lista fixa que as
+  exclua a priori.
 
 Regra 2 (TF):
   Para cada nó cujo gene_symbol é TF (source) no JSONL de regulon (caminho
-  do IngestionJob mais recente de REGULON_LOAD), para cada alvo do regulon
-  cruzar com features da matriz proteoma da Fase 0 (CPTAC-CCRCC proteome,
-  feature_axis='gene'). Onde bate (alvo ∈ features da matriz proteoma): nó
-  do TF recebe readout_role='tf_target' + PathwayReadoutFeature(
+  do IngestionJob mais recente de REGULON_LOAD), dentre as vias do universo
+  resolvido (default: todas), para cada alvo do regulon cruzar com features
+  da matriz proteoma da Fase 0 (CPTAC-CCRCC proteome, feature_axis='gene').
+  Onde bate (alvo ∈ features da matriz proteoma): nó do TF recebe
+  readout_role='tf_target' + PathwayReadoutFeature(
   rule='tf_target', regulon_source='collectri', regulon_sign=±1/0 (lido do
   campo `mode` do JSONL — ver Regra 2 abaixo para o contrato real),
   confidence=CONFIDENCE_TF_TARGET (fixo, sem calibração no v1 — ver Regra 2),
@@ -86,10 +105,12 @@ Catálogo global:
      público CollecTRI/OmniPath). `tf_allowlist` é derivado exclusivamente do
      catálogo global `PathwayNode` (RegulonLoadService._derive_tf_allowlist),
      que também não tem FK de projeto — logo dois projetos que rodem
-     `load_regulons` com os mesmos `pathway_ids` (o caso normal: o command
-     não expõe `--pathway-ids`, sempre usa DEFAULT_PATHWAY_IDS) produzem
-     JSONLs com conteúdo idêntico. Não há dado de usuário, credencial, nem
-     recorte privado de projeto no arquivo — é público e catalogável.
+     `load_regulons` com o mesmo universo de vias (o caso normal, desde a
+     generalização para todas as vias: nenhum `--pathway` informado ⇒ default
+     é TODAS as `Pathway` carregadas em PG — mesmo catálogo global para
+     qualquer projeto que o invoque) produzem JSONLs com conteúdo idêntico.
+     Não há dado de usuário, credencial, nem recorte privado de projeto no
+     arquivo — é público e catalogável.
   3. Consequência: pegar o job mais recente de OUTRO projeto não vaza nada
      sensível daquele projeto — o arquivo não carrega informação alguma sobre
      qual projeto o gerou, apenas o grafo KEGG (global) filtrado pelo dado
@@ -136,25 +157,37 @@ from apps.core.models import (
     IngestionJob,
     OmicMatrix,
     OmicMatrixFeature,
+    Pathway,
     PathwayNode,
     PathwayReadoutFeature,
 )
 
 logger = logging.getLogger(__name__)
 
-# Vias da Regra 1 (fosfo): PI3K-Akt e MAPK (vias de sinalização com fosfo)
-# p53 não entra na Regra 1 porque os readouts de fosfo do ciclo celular são
-# menos bem definidos no fosfoproteoma gene-level. Extensível via parâmetro.
-PHOSPHO_PATHWAY_IDS = ['hsa04151', 'hsa04010']
+# Preset legado (v1, Fase 3 inicial) — as 3 vias KEGG originais (PI3K-Akt,
+# MAPK, p53). NÃO é mais o default do service (ver classe ReadoutMappingService
+# e a Regra "ambas as regras se aplicam a todas as vias" abaixo) — mantido
+# nomeado só para reprodutibilidade de execuções antigas / testes que queiram
+# fixar o universo de vias explicitamente a esse conjunto.
+LEGACY_V1_PHOSPHO_PATHWAY_IDS = ['hsa04151', 'hsa04010']
+LEGACY_V1_TF_PATHWAY_IDS = ['hsa04151', 'hsa04010', 'hsa04115']
 
-# Vias da Regra 2 (TF): todas as 3 (TFs aparecem nas 3 vias)
-TF_PATHWAY_IDS = ['hsa04151', 'hsa04010', 'hsa04115']
+# Aliases retrocompatíveis (nomes antigos) — mesmo conteúdo dos presets acima.
+# Não usar como default: ver ReadoutMappingService.__init__.
+PHOSPHO_PATHWAY_IDS = LEGACY_V1_PHOSPHO_PATHWAY_IDS
+TF_PATHWAY_IDS = LEGACY_V1_TF_PATHWAY_IDS
 
 # loader_version da matriz de fosfoproteoma (passo 3.1)
 PHOSPHO_LOADER_VERSION = 'phospho-v1'
 
 # Versão padrão do mapeamento
 DEFAULT_MAPPING_VERSION = 'fase3-readout-v1'
+
+# Tamanho de lote do bulk_create de PathwayReadoutFeature — ver justificativa
+# de escala na docstring de `_persist`. Não é obrigatório para correção (o
+# Django já fatia sozinho respeitando o limite de params do backend), é para
+# tornar o tamanho do lote previsível com o universo de 372 vias.
+BULK_CREATE_BATCH_SIZE = 5000
 
 # Confidence fixo para PathwayReadoutFeature(rule='tf_target') — Regra 2.
 #
@@ -210,14 +243,41 @@ class ReadoutMappingService:
     """
     Serviço de mapeamento readout→feature (Django set-based puro).
 
-    Uso:
+    Default: TODAS as vias em `Pathway` (resolvido em run(), no momento da
+    execução — reflete o catálogo carregado naquele instante), para AMBAS as
+    regras (fosfo e TF). `pathway_ids_phospho`/`pathway_ids_tf` continuam
+    aceitando uma lista explícita para restringir a execução (ex.: debug de
+    uma via, ou reprodução de uma versão antiga via
+    LEGACY_V1_PHOSPHO_PATHWAY_IDS/LEGACY_V1_TF_PATHWAY_IDS).
+
+    Por que as duas regras aplicam ao MESMO universo de vias (não apenas o
+    default — é uma invariante do service, documentada aqui porque motiva a
+    assinatura do __init__): se a via X for pontuada com readout de fosfo+TF
+    e a via Y só com TF, os z-scores de X e Y não são comparáveis entre si —
+    a composição do readout (quantos/quais sinais entram no score) difere
+    entre elas. Numa assinatura que ordena N vias (v1: 3; agora: as vias
+    carregadas, ex. 372 do KEGG humano), comparabilidade entre todas é
+    requisito, não opcional. Restringir uma regra a um subconjunto e a outra
+    a um universo diferente reintroduz exatamente esse viés — por isso os
+    dois parâmetros são independentes na assinatura (flexibilidade para
+    debug/teste), mas o caso normal (nenhum dos dois informado) usa o MESMO
+    conjunto — todas as vias — para ambas. Vias sem readout de fosfo
+    catalogado na matriz simplesmente não geram PathwayReadoutFeature(rule=
+    'phospho') — é o dado que decide a ausência, não uma lista fixa que
+    exclui a via a priori.
+
+    Uso (default — todas as vias carregadas, ambas as regras):
         service = ReadoutMappingService(
-            pathway_ids_phospho=PHOSPHO_PATHWAY_IDS,
-            pathway_ids_tf=TF_PATHWAY_IDS,
             mapping_version='fase3-readout-v1',
             dry_run=False,
         )
         report = service.run()
+
+    Uso (restrito — reproduz o preset legado v1):
+        service = ReadoutMappingService(
+            pathway_ids_phospho=LEGACY_V1_PHOSPHO_PATHWAY_IDS,
+            pathway_ids_tf=LEGACY_V1_TF_PATHWAY_IDS,
+        )
 
     Retorno de run():
         {
@@ -226,6 +286,10 @@ class ReadoutMappingService:
             'n_nodes_readout': int,
             'n_unmapped_nodes': int,
             'n_features_not_found': int,
+            'n_pathways_total': int,        # nº de vias no universo desta execução
+            'n_pathways_with_phospho': int, # vias com >=1 PathwayReadoutFeature(phospho)
+            'n_pathways_with_tf': int,      # vias com >=1 PathwayReadoutFeature(tf_target)
+            'n_pathways_without_readout': int,  # sem nenhum dos dois — escore degenerado
             'validation_strategy': str,   # documentação da estratégia usada
             'mapping_version': str,
             'dry_run': bool,
@@ -240,8 +304,19 @@ class ReadoutMappingService:
         mapping_version: str = DEFAULT_MAPPING_VERSION,
         dry_run: bool = False,
     ):
-        self.pathway_ids_phospho = pathway_ids_phospho or PHOSPHO_PATHWAY_IDS
-        self.pathway_ids_tf = pathway_ids_tf or TF_PATHWAY_IDS
+        # None = "todas as vias carregadas" — resolvido em run() (não aqui)
+        # para refletir o catálogo `Pathway` no momento da execução, não no
+        # momento da construção do service. Lista explícita (incl. []) é
+        # respeitada tal como passada — [] restringe a execução a NENHUMA
+        # via para aquela regra (não cai de volta no default).
+        self._pathway_ids_phospho_arg = pathway_ids_phospho
+        self._pathway_ids_tf_arg = pathway_ids_tf
+        self.pathway_ids_phospho: list[str] = (
+            pathway_ids_phospho if pathway_ids_phospho is not None else []
+        )
+        self.pathway_ids_tf: list[str] = (
+            pathway_ids_tf if pathway_ids_tf is not None else []
+        )
         self.mapping_version = mapping_version
         self.dry_run = dry_run
         self._start = None
@@ -255,12 +330,15 @@ class ReadoutMappingService:
         Executa o mapeamento de readouts.
 
         Fluxo:
+          0. Resolve o universo de vias (se `pathway_ids_phospho`/`pathway_ids_tf`
+             não foram informados no construtor): TODAS as `Pathway` em PG no
+             momento desta chamada — não no momento da construção do service.
           1. Resolve matrizes (fosfoproteoma + proteoma).
           2. Resolve caminho do JSONL de regulon (IngestionJob mais recente).
           3. Regra 1: cruza nós de fosfo × matriz fosfoproteoma.
           4. Regra 2: cruza TFs regulon × matriz proteoma.
           5. bulk_create PathwayReadoutFeature + update readout_role.
-          6. Retorna relatório.
+          6. Retorna relatório (agregado + distribuição por via).
 
         Returns:
             dict com contadores e estratégia de validação.
@@ -272,6 +350,8 @@ class ReadoutMappingService:
         """
         import time
         self._start = time.monotonic()
+
+        self._resolve_pathway_universe()
 
         phospho_matrix = self._resolve_phospho_matrix()
         proteome_matrix = self._resolve_proteome_matrix()
@@ -303,12 +383,36 @@ class ReadoutMappingService:
         ).exclude(gene_symbol='').count()
         n_unmapped_nodes = max(0, total_gene_nodes - n_nodes_readout)
 
+        # ── Distribuição por via (relatório item 5) ────────────────────────
+        # Set-based: uma única query mapeando kegg_id -> pk para o universo
+        # desta execução; os conjuntos "com phospho"/"com tf" vêm direto dos
+        # nós já carregados em memória (select_related('pathway') nas duas
+        # regras) — sem query adicional por via.
+        universe_kegg_ids = set(self.pathway_ids_phospho) | set(self.pathway_ids_tf)
+        universe_pathway_ids = set(
+            Pathway.objects.filter(kegg_id__in=universe_kegg_ids).values_list(
+                'id', flat=True
+            )
+        ) if universe_kegg_ids else set()
+
+        pathway_ids_with_phospho = {f.node.pathway_id for f in phospho_features}
+        pathway_ids_with_tf = {f.node.pathway_id for f in tf_features}
+        n_pathways_with_phospho = len(pathway_ids_with_phospho)
+        n_pathways_with_tf = len(pathway_ids_with_tf)
+        n_pathways_without_readout = len(
+            universe_pathway_ids - pathway_ids_with_phospho - pathway_ids_with_tf
+        )
+
         report = {
             'n_phospho_mapped': n_phospho_mapped,
             'n_tf_mapped': n_tf_mapped,
             'n_nodes_readout': n_nodes_readout,
             'n_unmapped_nodes': n_unmapped_nodes,
             'n_features_not_found': n_features_not_found,
+            'n_pathways_total': len(universe_pathway_ids),
+            'n_pathways_with_phospho': n_pathways_with_phospho,
+            'n_pathways_with_tf': n_pathways_with_tf,
+            'n_pathways_without_readout': n_pathways_without_readout,
             'mapping_version': self.mapping_version,
             'dry_run': self.dry_run,
             'duration_s': round(duration_s, 2),
@@ -343,7 +447,50 @@ class ReadoutMappingService:
             n_features_not_found,
             duration_s,
         )
+        logger.info(
+            'ReadoutMappingService distribuicao por via: n_pathways_total=%d, '
+            'com_phospho=%d, com_tf=%d, sem_nenhum_readout=%d '
+            '(essas produzirao escore degenerado na Fase 4).',
+            len(universe_pathway_ids),
+            n_pathways_with_phospho,
+            n_pathways_with_tf,
+            n_pathways_without_readout,
+        )
         return report
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Resolução do universo de vias
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _resolve_pathway_universe(self) -> None:
+        """
+        Resolve `self.pathway_ids_phospho`/`self.pathway_ids_tf` quando NÃO
+        foram informados explicitamente no construtor (None) — default:
+        TODAS as `Pathway.kegg_id` carregadas em PG neste momento (query
+        única, reaproveitada para as duas regras quando ambas usam default —
+        garante que as regras enxergam o MESMO universo por construção,
+        reforçando a comparabilidade de z-score entre vias documentada na
+        docstring da classe).
+
+        Lista explícita passada ao construtor (incl. `[]`) nunca é
+        sobrescrita aqui — só o sentinel `None` aciona a resolução.
+        """
+        if self._pathway_ids_phospho_arg is not None and self._pathway_ids_tf_arg is not None:
+            return  # nada a resolver — ambas explícitas
+
+        all_pathway_ids = list(
+            Pathway.objects.order_by('kegg_id').values_list('kegg_id', flat=True)
+        )
+        logger.info(
+            'ReadoutMappingService: universo de vias resolvido via default '
+            '(Pathway em PG): %d via(s).',
+            len(all_pathway_ids),
+        )
+
+        if self._pathway_ids_phospho_arg is None:
+            self.pathway_ids_phospho = all_pathway_ids
+        if self._pathway_ids_tf_arg is None:
+            self.pathway_ids_tf = all_pathway_ids
 
     # ─────────────────────────────────────────────────────────────────────────
     # Resolução de pré-condições
@@ -775,21 +922,43 @@ class ReadoutMappingService:
         readout_role dos PathwayNode mapeados.
 
         Transação atômica — idempotente (NK na bulk_create).
+
+        Escala (generalização p/ 372 vias — verificado, não é conjectura):
+          `bulk_create` SEM `batch_size` explícito já não emite uma única
+          INSERT gigante — o Django calcula internamente
+          (`connection.ops.bulk_batch_size`) o nº máximo de linhas por
+          statement que cabe no limite de parâmetros do backend (Postgres:
+          65535 params/query) e fatia sozinho. Para os 9 campos de
+          PathwayReadoutFeature isso já dá ~7281 linhas/lote automaticamente.
+          `batch_size=BULK_CREATE_BATCH_SIZE` abaixo é mais conservador só
+          para tornar o tamanho do lote PREVISÍVEL (não depende de contar
+          campos do model) e limitar o tamanho de cada round-trip — não é
+          uma correção de um bug de N+1 (não havia: nenhuma query roda dentro
+          de laço por via/nó em nenhuma das duas regras — ver
+          `_apply_rule_phospho`/`_apply_rule_tf`, ambas set-based com no
+          máximo 1 query de validação cada, chamada uma única vez para o
+          batch inteiro de candidatos).
         """
         all_features = phospho_features + tf_features
 
         with transaction.atomic():
             # bulk_create: idempotente pela NK (node, matrix, feature_key,
-            # rule, mapping_version) → ignore_conflicts.
+            # rule, mapping_version) → ignore_conflicts. batch_size explícito
+            # (ver docstring acima) — não é obrigatório p/ correção, é p/
+            # previsibilidade em escala (centenas de milhares de linhas
+            # esperadas com o universo de 372 vias).
             if all_features:
-                created = PathwayReadoutFeature.objects.bulk_create(
+                PathwayReadoutFeature.objects.bulk_create(
                     all_features,
                     ignore_conflicts=True,
+                    batch_size=BULK_CREATE_BATCH_SIZE,
                 )
                 logger.info(
                     'PathwayReadoutFeature bulk_create: %d objetos enviados '
-                    '(ignore_conflicts=True; novos reais podem ser menos).',
+                    'em lotes de %d (ignore_conflicts=True; novos reais '
+                    'podem ser menos).',
                     len(all_features),
+                    BULK_CREATE_BATCH_SIZE,
                 )
 
             # Atualiza readout_role nos PathwayNode mapeados como fosfo
