@@ -1109,8 +1109,33 @@ class OmicMatrix(models.Model):
     """
 
     class DataFormatLevel(models.TextChoices):
+        """Unidade quantitativa em que os valores da matriz estão expressos.
+
+        O rótulo aqui NÃO é cosmético: ele declara a normalização aplicada,
+        que é o que torna (ou não) dois números comparáveis entre si.
+
+        Sobre RNA-seq — `FPKM_LOG2` é distinto de `TPM`, e equipará-los é erro:
+
+        - `TPM`: normaliza por comprimento do gene e DEPOIS reescala cada
+          amostra para somar 1e6. A soma por coluna é constante, então a
+          proporção de mRNA de um gene é comparável ENTRE amostras.
+        - `FPKM_LOG2`: FPKM (fragmentos por kilobase de éxon por milhão de
+          fragmentos mapeados) sob transformação log2. FPKM divide pelo
+          tamanho da biblioteca ANTES de normalizar por comprimento, e sua
+          soma por coluna NÃO é constante — comparação entre amostras carrega
+          viés de composição. O log2 muda a escala outra vez: os valores são
+          logarítmicos, não lineares; diferenças são razões (fold-changes) e
+          média aritmética sobre eles é média geométrica no espaço original.
+
+        Consequência prática: consumidor que confronta abundância de mRNA com
+        abundância de proteína (índice transcrito↔proteína) precisa saber qual
+        das duas está lendo — rótulo errado plantaria viés silencioso
+        exatamente na grandeza medida. Por isso valor próprio, não alias.
+        """
+
         COUNTS = 'counts', 'Counts (contagens brutas)'
         TPM = 'tpm', 'TPM'
+        FPKM_LOG2 = 'fpkm_log2', 'FPKM log2 (RNA-seq, log2 de FPKM)'
         INTENSITIES = 'intensities', 'Intensidades (proteoma/MS)'
         BETAS = 'betas', 'Betas (metilação)'
         LOG_RATIO = 'log_ratio', 'Log-ratio (CNV contínuo)'
@@ -1139,8 +1164,10 @@ class OmicMatrix(models.Model):
         'Nível do Formato',
         max_length=20,
         choices=DataFormatLevel.choices,
-        help_text='Granularidade quantitativa da matriz (counts/TPM/'
-                  'intensities/betas/log_ratio).'
+        help_text='Unidade quantitativa da matriz (counts/tpm/fpkm_log2/'
+                  'intensities/betas/log_ratio). fpkm_log2 = log2 de FPKM e '
+                  'NÃO é equivalente a tpm: normalizações distintas (FPKM não '
+                  'soma constante por amostra) e escala logarítmica.'
     )
     feature_axis = models.CharField(
         'Eixo de Features',
@@ -1216,7 +1243,8 @@ class OmicMatrix(models.Model):
             models.CheckConstraint(
                 name='omicmatrix_data_format_level_valid',
                 condition=models.Q(data_format_level__in=[
-                    'counts', 'tpm', 'intensities', 'betas', 'log_ratio',
+                    'counts', 'tpm', 'fpkm_log2', 'intensities', 'betas',
+                    'log_ratio',
                 ]),
             ),
             models.CheckConstraint(
@@ -3888,6 +3916,7 @@ class IngestionJob(models.Model):
         PHOSPHO_MATRIX_LOAD = 'phospho_matrix_load', 'Carga de Matriz de Fosfoproteoma (OmnisPathway Obj 2)'
         READOUT_MAPPING = 'readout_mapping', 'Mapeamento Readout→Feature (OmnisPathway Obj 2)'
         PATHWAY_SCORE_RUN = 'pathway_score_run', 'Execução do Motor PFS (OmnisPathway Obj 2, Fase 4)'
+        TRANSCRIPTOME_MATRIX_LOAD = 'transcriptome_matrix_load', 'Carga de Matriz de Transcriptoma (OmnisPathway Obj 2)'
 
     class JobStatus(models.TextChoices):
         PENDING = 'pending', 'Pendente'
