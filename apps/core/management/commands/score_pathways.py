@@ -55,6 +55,31 @@ Universo de vias (generalizado — deixou de ser 3 fixas):
   (--pathways hsa04151,hsa04010) ou uma mistura dos dois, mesmo formato de
   `load_regulons`/`map_readouts`.
 
+Filtro de qualidade de topologia (D-2, medido pós-bancada 372-vias):
+  `--min-edges` (padrão 10) e `--min-signed-fraction` (padrão 0.5) excluem
+  do universo DEFAULT vias com grafo insuficiente para o RWR se propagar —
+  medido: achados (q<0,05) concentram-se onde o grafo NÃO existe (vias sem
+  nenhuma aresta respondem por 30% dos achados com enriquecimento 3,67×) e
+  escasseiam onde o grafo é bom (0,60× nas vias ≥50% assinadas). Nesse
+  regime o escore deixa de medir propagação de sinal e passa a medir
+  concordância gene a gene — sinal legítimo, mas não o que o PFS afirma
+  medir. O limiar de fração 0.5 É o gatilho D-2 pré-registrado no plano da
+  Fase 4 ("grafo majoritariamente não assinado → reavaliar"), aqui usado
+  para EXCLUIR em vez de reavaliar `--unsigned-weight`. Medido: de 372 vias
+  sobram 194, preservando 5.440/6.710 pares (81,1%).
+  Só se aplica ao universo DEFAULT (`pathway_kegg_ids=None`) — `--pathways`
+  explícito NUNCA é filtrado, mesmo que a via peça grafo pobre (o operador
+  que pede uma via explicitamente não pode vê-la sumir em silêncio).
+  Desligar: `--min-edges 0 --min-signed-fraction 0` reproduz o universo
+  completo (comportamento anterior a este filtro).
+  Os dois parâmetros ENTRAM no gate de reprodutibilidade (D3) — rodar o
+  mesmo `--method-version` com limiares diferentes mistura dois universos
+  de vias sob a mesma string, corrompendo a família de FDR agregada por
+  `method_version` em `apply_pathway_fdr`.
+  Relatório de exclusão (quantas vias entraram/saíram, quebra por motivo:
+  sem arestas / poucas arestas / fração abaixo do limiar) é impresso ao
+  final do run (ou anexado a `IngestionJob.parameters` no modo --async).
+
 Uso:
     # Sonda de cobertura (D-4/D-5) sem gravar nada
     .venv/bin/python manage.py score_pathways --project <UUID> --dry-run
@@ -72,9 +97,18 @@ Uso:
 
     # Assíncrono (worker Celery deve estar ativo)
     .venv/bin/python manage.py score_pathways --project <UUID> --async
+
+    # Filtro de qualidade de topologia desligado (reproduz universo completo)
+    .venv/bin/python manage.py score_pathways --project <UUID> \\
+        --min-edges 0 --min-signed-fraction 0 --method-version fase4-pfs-v1-unfiltered
 """
 
 from django.core.management.base import BaseCommand, CommandError
+
+from apps.core.services.pathway_scoring_service import (
+    RECOMMENDED_MIN_EDGES,
+    RECOMMENDED_MIN_SIGNED_FRACTION,
+)
 
 _DEFAULT_SEED_VERSIONS = 'fase2-cnv-v2,fase2-snv-v1,fase2-cnv-v1'
 
@@ -179,6 +213,44 @@ class Command(BaseCommand):
             help='Mínimo de alvos com valor para o ULM da Regra 2 (padrão: 5).',
         )
         parser.add_argument(
+            '--min-edges',
+            metavar='N',
+            type=int,
+            default=RECOMMENDED_MIN_EDGES,
+            dest='min_edges',
+            help=(
+                f'Filtro de qualidade de topologia (D-2): exclui do universo '
+                f'DEFAULT vias com menos de N arestas (`PathwayEdge`) — sem '
+                f'substrato suficiente para o RWR se propagar (padrão: '
+                f'{RECOMMENDED_MIN_EDGES}). Só se aplica ao universo default '
+                f'(pathway_kegg_ids=None) — --pathways explícito NUNCA é '
+                f'filtrado. Use --min-edges 0 junto de '
+                f'--min-signed-fraction 0 para desligar (reproduz o '
+                f'universo completo, comportamento anterior a este filtro).'
+            ),
+        )
+        parser.add_argument(
+            '--min-signed-fraction',
+            metavar='FLOAT',
+            type=float,
+            default=RECOMMENDED_MIN_SIGNED_FRACTION,
+            dest='min_signed_fraction',
+            help=(
+                f'Filtro de qualidade de topologia (D-2): exclui do universo '
+                f'DEFAULT vias com fração de arestas assinadas '
+                f'(sign in {{+1,-1}}) abaixo de FLOAT (padrão: '
+                f'{RECOMMENDED_MIN_SIGNED_FRACTION}). Via com ZERO arestas '
+                f'tem fração indefinida (0/0) — tratada como reprovada '
+                f'explicitamente, nunca como 0.0 por acidente aritmético. O '
+                f'padrão 0.5 É o gatilho D-2 pré-registrado no plano da '
+                f'Fase 4 ("grafo majoritariamente não assinado → '
+                f'reavaliar"). Só se aplica ao universo default — '
+                f'--pathways explícito NUNCA é filtrado. Use '
+                f'--min-signed-fraction 0 junto de --min-edges 0 para '
+                f'desligar.'
+            ),
+        )
+        parser.add_argument(
             '--force',
             action='store_true',
             default=False,
@@ -231,14 +303,18 @@ class Command(BaseCommand):
         unsigned_weight = options['unsigned_weight']
         rng_seed = options['rng_seed']
         min_regulon_targets = options['min_regulon_targets']
+        min_edges = options['min_edges']
+        min_signed_fraction = options['min_signed_fraction']
         force = options['force']
         dry_run = options['dry_run']
         use_async = options['use_async']
 
         # ── Resolve --pathways: aceita múltiplos args e/ou CSV, dedup ───────
         # None (flag omitida) → PathwayScoringService resolve TODAS as
-        # `Pathway` carregadas em PG no momento da execução (não fixado
-        # aqui — ver _resolve_default_pathway_ids no service).
+        # `Pathway` carregadas em PG no momento da execução, filtradas por
+        # qualidade de topologia (não fixado aqui — ver
+        # _resolve_default_pathway_ids no service). Lista explícita NUNCA
+        # é filtrada por --min-edges/--min-signed-fraction.
         pathway_tokens = options['pathways']
         pathway_ids = None
         if pathway_tokens:
@@ -281,10 +357,23 @@ class Command(BaseCommand):
         if pathway_ids is None:
             self.stdout.write(
                 'Vias:                 TODAS as carregadas em Pathway '
-                '(resolvido em tempo de execucao)'
+                '(resolvido em tempo de execucao, sujeitas ao filtro de '
+                'qualidade de topologia abaixo)'
+            )
+            self.stdout.write(
+                f'Filtro de topologia:  min_edges={min_edges}  '
+                f'min_signed_fraction={min_signed_fraction} '
+                f'(0/0 = via sem aresta é reprovada explicitamente)'
             )
         else:
             self.stdout.write(f'Vias (restrito via --pathways): {pathway_ids}')
+            self.stdout.write(
+                'Filtro de topologia:  NAO SE APLICA (--pathways explícito '
+                'é sempre respeitado tal como pedido, mesmo com grafo '
+                f'pobre) — min_edges={min_edges} min_signed_fraction='
+                f'{min_signed_fraction} foram informados mas ignorados '
+                'para fins de seleção de universo.'
+            )
         self.stdout.write(f'method_version:       {method_version}')
         self.stdout.write(f'seed_method_versions: {seed_method_versions}')
         self.stdout.write(f'mapping_version:      {mapping_version}')
@@ -306,6 +395,8 @@ class Command(BaseCommand):
             n_permutations=n_permutations,
             rng_seed=rng_seed,
             min_regulon_targets=min_regulon_targets,
+            min_edges=min_edges,
+            min_signed_fraction=min_signed_fraction,
             force=force,
             dry_run=dry_run,
         )
@@ -314,6 +405,9 @@ class Command(BaseCommand):
             self.stdout.write('Modo: assíncrono (Celery)')
             try:
                 job = PathwayScoringService.dispatch(project, **common_kwargs)
+                self._print_topology_filter_report(
+                    job.parameters.get('topology_filter_report')
+                )
                 self.stdout.write(self.style.SUCCESS(
                     f'Job enfileirado: {job.id} (status={job.status})\n'
                     f'Acompanhe o progresso via IngestionJob.id={job.id}'
@@ -362,7 +456,39 @@ class Command(BaseCommand):
     # Relatório
     # ─────────────────────────────────────────────────────────────────────
 
+    def _print_topology_filter_report(self, filter_report: dict | None) -> None:
+        """
+        Relatório de exclusão do filtro de qualidade de topologia (D-2):
+        quantas vias entraram/saíram e a quebra por motivo. `None` quando o
+        filtro não foi aplicado (universo restrito via --pathways
+        explícito) — sem isso o operador não sabe o que deixou de ser
+        testado, e "não testado" não pode ser lido como "testado e
+        negativo".
+        """
+        if filter_report is None:
+            return
+
+        by_reason = filter_report['excluded_by_reason']
+        self.stdout.write('Filtro de qualidade de topologia (D-2) — relatório de exclusão:')
+        self.stdout.write(
+            f'    min_edges={filter_report["min_edges"]}  '
+            f'min_signed_fraction={filter_report["min_signed_fraction"]}'
+        )
+        self.stdout.write(
+            f'    vias consideradas: {filter_report["n_pathways_considered"]}  '
+            f'aprovadas: {filter_report["n_pathways_kept"]}  '
+            f'excluídas: {filter_report["n_pathways_excluded"]}'
+        )
+        self.stdout.write(
+            f'    quebra por motivo — sem arestas: {by_reason["no_edges"]}  '
+            f'poucas arestas (<min_edges): {by_reason["too_few_edges"]}  '
+            f'fração assinada abaixo do limiar: {by_reason["low_signed_fraction"]}'
+        )
+        self.stdout.write('')
+
     def _print_report(self, report: dict) -> None:
+        self._print_topology_filter_report(report.get('topology_filter_report'))
+
         if report['dry_run']:
             self.stdout.write(self.style.WARNING(
                 'DRY RUN — nada foi persistido em PathwayActivityScore.'

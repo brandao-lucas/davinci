@@ -59,6 +59,7 @@ Padrões obrigatórios:
 
 from __future__ import annotations
 
+import itertools
 import os
 import shutil
 import tempfile
@@ -81,18 +82,26 @@ from apps.core.models import (
     OmicSamplePairing,
     Pathway,
     PathwayActivityScore,
+    PathwayEdge,
     PathwayNode,
     PathwayReadoutFeature,
     ProjectDataset,
 )
 from apps.core.services.pathway_scoring_service import (
+    DEFAULT_MIN_EDGES,
     DEFAULT_MIN_REGULON_TARGETS,
+    DEFAULT_MIN_SIGNED_FRACTION,
     DEFAULT_N_PERMUTATIONS,
     DEFAULT_PATHWAY_KEGG_IDS,
     DEFAULT_RESTART,
     DEFAULT_RNG_SEED,
     DEFAULT_SEED_METHOD_VERSIONS,
     DEFAULT_UNSIGNED_WEIGHT,
+    RECOMMENDED_MIN_EDGES,
+    RECOMMENDED_MIN_SIGNED_FRACTION,
+    TOPOLOGY_EXCLUSION_LOW_SIGNED_FRACTION,
+    TOPOLOGY_EXCLUSION_NO_EDGES,
+    TOPOLOGY_EXCLUSION_TOO_FEW_EDGES,
     PathwayScoringService,
     PfsFeaturesNotCataloguedError,
     PfsGraphNotLoadedError,
@@ -101,6 +110,8 @@ from apps.core.services.pathway_scoring_service import (
     PfsPairingMissingError,
     PfsReadoutsNotMappedError,
     PfsReproducibilityGateError,
+    _resolve_default_pathway_ids,
+    _topology_quality_reason,
 )
 
 MAPPING_VERSION = 'fase3-readout-v1'
@@ -162,6 +173,51 @@ def _make_node(
         },
     )
     return node
+
+
+def _make_edge(
+    pathway: Pathway,
+    source: PathwayNode,
+    target: PathwayNode,
+    sign: int,
+    interaction: str = PathwayEdge.Interaction.BINDING,
+    relation_type: str = PathwayEdge.RelationType.PPREL,
+) -> PathwayEdge:
+    """Factory de PathwayEdge — usada pelos testes do filtro de qualidade
+    de topologia (D-2). `sign` é o que a agregação Count(filter=Q(sign__in
+    =[1,-1])) do filtro conta como 'assinada'."""
+    return PathwayEdge.objects.create(
+        pathway=pathway,
+        source_node=source,
+        target_node=target,
+        sign=sign,
+        interaction=interaction,
+        relation_type=relation_type,
+        subtypes=[],
+    )
+
+
+def _make_pathway_topology(pathway: Pathway, n_edges: int, n_signed: int) -> None:
+    """
+    Cria `n_edges` PathwayEdge DISTINTAS na via, das quais as `n_signed`
+    primeiras têm `sign=1` (assinada) e o resto `sign=0` (sem sinal) — usado
+    pelos testes do filtro de qualidade de topologia (D-2) para simular
+    perfis de grafo (poucas arestas / fração baixa / aprovado) sem laço
+    manual por par (nós suficientes + `itertools.permutations` garante
+    pares (source, target) nunca repetidos, respeitando a natural key de
+    PathwayEdge).
+    """
+    assert n_signed <= n_edges
+    n_nodes = 2
+    while n_nodes * (n_nodes - 1) < n_edges:
+        n_nodes += 1
+    nodes = [
+        _make_node(pathway, f'TOPOGENE{i}', f'topo-{pathway.kegg_id}-{i}')
+        for i in range(n_nodes)
+    ]
+    pairs = list(itertools.permutations(nodes, 2))[:n_edges]
+    for idx, (source, target) in enumerate(pairs):
+        _make_edge(pathway, source, target, sign=1 if idx < n_signed else 0)
 
 
 def _make_phospho_matrix(accession: str = 'CPTAC-PFS-PHOSPHO') -> OmicMatrix:
@@ -392,6 +448,8 @@ def _make_prior_run(
         n_permutations=DEFAULT_N_PERMUTATIONS,
         rng_seed=DEFAULT_RNG_SEED,
         min_regulon_targets=DEFAULT_MIN_REGULON_TARGETS,
+        min_edges=DEFAULT_MIN_EDGES,
+        min_signed_fraction=DEFAULT_MIN_SIGNED_FRACTION,
     )
     config.update(config_overrides)
     job = IngestionJob.objects.create(
@@ -1156,6 +1214,302 @@ class PfsPathwayUniverseDefaultTests(PfsScoringBaseTestCase):
 
         self.assertIn('nas vias []', str(ctx.exception))
         fake_engine.run_pfs_scoring.assert_not_called()
+
+
+# =============================================================================
+# 8c. Filtro de qualidade de topologia (D-2)
+# =============================================================================
+
+class PfsTopologyQualityFilterPureTests(PfsScoringBaseTestCase):
+    """
+    `_topology_quality_reason` — classificação pura de UMA via já agregada
+    (n_edges, n_signed_edges), sem tocar o banco.
+    """
+
+    def test_zero_arestas_reprovada_como_no_edges_nao_low_signed_fraction(self):
+        """
+        Via com 0 arestas tem fração 0/0 INDEFINIDA. Reprovada
+        explicitamente como `no_edges` — NUNCA `low_signed_fraction` (que
+        seria o resultado se 0/0 virasse silenciosamente 0.0 e fosse
+        comparada contra o limiar, mascarando a causa real da reprovação —
+        exatamente a confusão que mascarou o achado na primeira medição).
+        """
+        self.assertEqual(
+            _topology_quality_reason(0, 0, min_edges=0, min_signed_fraction=0.5),
+            TOPOLOGY_EXCLUSION_NO_EDGES,
+        )
+        self.assertEqual(
+            _topology_quality_reason(
+                0, 0,
+                min_edges=RECOMMENDED_MIN_EDGES,
+                min_signed_fraction=RECOMMENDED_MIN_SIGNED_FRACTION,
+            ),
+            TOPOLOGY_EXCLUSION_NO_EDGES,
+        )
+
+    def test_poucas_arestas_reprovada_como_too_few_edges(self):
+        """Via com arestas < min_edges reprovada — mesmo com 100% assinada."""
+        self.assertEqual(
+            _topology_quality_reason(5, 5, min_edges=10, min_signed_fraction=0.5),
+            TOPOLOGY_EXCLUSION_TOO_FEW_EDGES,
+        )
+
+    def test_fracao_abaixo_do_limiar_reprovada(self):
+        """Via com arestas suficientes mas fração assinada abaixo do limiar."""
+        self.assertEqual(
+            _topology_quality_reason(10, 3, min_edges=10, min_signed_fraction=0.5),
+            TOPOLOGY_EXCLUSION_LOW_SIGNED_FRACTION,
+        )
+
+    def test_via_aprovada_retorna_none(self):
+        self.assertIsNone(
+            _topology_quality_reason(20, 15, min_edges=10, min_signed_fraction=0.5)
+        )
+
+    def test_fracao_exatamente_no_limiar_aprovada(self):
+        """Fração == limiar passa (comparação é `<`, não `<=`)."""
+        self.assertIsNone(
+            _topology_quality_reason(10, 5, min_edges=10, min_signed_fraction=0.5)
+        )
+
+    def test_filtro_totalmente_desligado_aprova_zero_arestas(self):
+        """
+        `min_edges=0` E `min_signed_fraction=0` juntos: via de zero arestas
+        passa — necessário para `--min-edges 0 --min-signed-fraction 0`
+        reproduzir o universo completo de verdade (inclusive vias sem
+        nenhuma aresta).
+        """
+        self.assertIsNone(
+            _topology_quality_reason(0, 0, min_edges=0, min_signed_fraction=0.0)
+        )
+
+
+class PfsTopologyQualityFilterAggregationTests(PfsScoringBaseTestCase):
+    """
+    `_resolve_default_pathway_ids` — agregação `Count`/`Count(filter=Q(...))`
+    via ORM sobre o cenário base (3 vias, TODAS com zero `PathwayEdge` no
+    `setUp` herdado de `PfsScoringBaseTestCase`).
+    """
+
+    def test_filtro_desligado_reproduz_universo_completo(self):
+        """
+        `min_edges=0, min_signed_fraction=0`: TODAS as `Pathway` (inclusive
+        as de zero arestas do setUp) são mantidas — comportamento anterior
+        a este filtro preservado byte a byte.
+        """
+        kept, report = _resolve_default_pathway_ids(
+            min_edges=0, min_signed_fraction=0.0,
+        )
+
+        self.assertEqual(
+            sorted(kept), sorted(['hsa04151', 'hsa04010', 'hsa04115']),
+        )
+        self.assertEqual(report['n_pathways_considered'], 3)
+        self.assertEqual(report['n_pathways_kept'], 3)
+        self.assertEqual(report['n_pathways_excluded'], 0)
+        self.assertEqual(
+            report['excluded_by_reason'],
+            {'no_edges': 0, 'too_few_edges': 0, 'low_signed_fraction': 0},
+        )
+
+    def test_relatorio_de_exclusao_quebra_por_motivo(self):
+        """
+        4 perfis de grafo distintos → relatório de exclusão bate
+        EXATAMENTE com a quebra por motivo esperada (uma via por motivo +
+        uma aprovada).
+        """
+        # hsa04151 (pathway_pik3k, setUp): 0 arestas → no_edges.
+        # hsa04010 (pathway_mapk, setUp): 3 arestas, 100% assinadas, mas
+        #   3 < min_edges=10 → too_few_edges (prioridade sobre fração).
+        _make_pathway_topology(self.pathway_mapk, n_edges=3, n_signed=3)
+        # hsa04115 (pathway_p53, setUp): 10 arestas, 3 assinadas (30%) →
+        #   low_signed_fraction (10 >= min_edges, mas 0.3 < 0.5).
+        _make_pathway_topology(self.pathway_p53, n_edges=10, n_signed=3)
+        # via extra aprovada: 20 arestas, 15 assinadas (75%).
+        approved = _make_pathway('hsa04150', 'mTOR signaling pathway')
+        _make_pathway_topology(approved, n_edges=20, n_signed=15)
+
+        kept, report = _resolve_default_pathway_ids(
+            min_edges=RECOMMENDED_MIN_EDGES,
+            min_signed_fraction=RECOMMENDED_MIN_SIGNED_FRACTION,
+        )
+
+        self.assertEqual(kept, ['hsa04150'])
+        self.assertEqual(report['min_edges'], RECOMMENDED_MIN_EDGES)
+        self.assertEqual(report['min_signed_fraction'], RECOMMENDED_MIN_SIGNED_FRACTION)
+        self.assertEqual(report['n_pathways_considered'], 4)
+        self.assertEqual(report['n_pathways_kept'], 1)
+        self.assertEqual(report['n_pathways_excluded'], 3)
+        self.assertEqual(
+            report['excluded_by_reason'],
+            {
+                TOPOLOGY_EXCLUSION_NO_EDGES: 1,
+                TOPOLOGY_EXCLUSION_TOO_FEW_EDGES: 1,
+                TOPOLOGY_EXCLUSION_LOW_SIGNED_FRACTION: 1,
+            },
+        )
+        self.assertEqual(
+            report['excluded_kegg_ids_by_reason'][TOPOLOGY_EXCLUSION_NO_EDGES],
+            ['hsa04151'],
+        )
+        self.assertEqual(
+            report['excluded_kegg_ids_by_reason'][TOPOLOGY_EXCLUSION_TOO_FEW_EDGES],
+            ['hsa04010'],
+        )
+        self.assertEqual(
+            report['excluded_kegg_ids_by_reason'][TOPOLOGY_EXCLUSION_LOW_SIGNED_FRACTION],
+            ['hsa04115'],
+        )
+
+
+class PfsTopologyQualityFilterIntegrationTests(PfsScoringBaseTestCase):
+    """
+    Integração via `PathwayScoringService.run()`/`dispatch()` — via
+    aprovada é pontuada de verdade; universo default some do relatório
+    quando reprovado; `--pathways` explícito NUNCA é filtrado; gate de
+    reprodutibilidade reage a `min_edges`/`min_signed_fraction`.
+    """
+
+    def _approve_all_base_pathways(self):
+        """Dá às 3 vias do setUp topologia suficiente p/ passar no filtro
+        recomendado (10 arestas, 75% assinada) — usado nos testes que
+        precisam do universo default completo chegando ao Rust."""
+        for pathway in (self.pathway_pik3k, self.pathway_mapk, self.pathway_p53):
+            _make_pathway_topology(pathway, n_edges=20, n_signed=15)
+
+    def test_run_universo_default_filtra_e_reporta(self):
+        """
+        Só `pathway_pik3k` tem topologia aprovada — `run()` deve pontuar
+        SÓ essa via e o relatório trazer a quebra por motivo das outras 2.
+        """
+        _make_pathway_topology(self.pathway_pik3k, n_edges=20, n_signed=15)
+        # pathway_mapk e pathway_p53 continuam com 0 arestas (setUp).
+
+        fake_engine = MagicMock()
+        fake_engine.run_pfs_scoring.return_value = _make_pfs_manifest()
+        service = PathwayScoringService(self.project)
+        with patch.dict('sys.modules', {'rust_engine': fake_engine}):
+            report = service.run(
+                method_version='fase4-pfs-v1-topofilter-run',
+                min_edges=RECOMMENDED_MIN_EDGES,
+                min_signed_fraction=RECOMMENDED_MIN_SIGNED_FRACTION,
+            )
+
+        call_kwargs = fake_engine.run_pfs_scoring.call_args.kwargs
+        self.assertEqual(call_kwargs['pathway_kegg_ids'], ['hsa04151'])
+        self.assertEqual(report['pathway_kegg_ids'], ['hsa04151'])
+
+        filter_report = report['topology_filter_report']
+        self.assertIsNotNone(filter_report)
+        self.assertEqual(filter_report['n_pathways_kept'], 1)
+        self.assertEqual(filter_report['n_pathways_excluded'], 2)
+        self.assertEqual(
+            filter_report['excluded_by_reason'][TOPOLOGY_EXCLUSION_NO_EDGES], 2,
+        )
+
+    def test_pathways_explicito_nunca_e_filtrado(self):
+        """
+        Via pedida explicitamente com grafo pobre (0 arestas, setUp) NÃO é
+        descartada mesmo com limiares extremamente exigentes — o operador
+        que pede uma via não pode vê-la sumir em silêncio.
+        """
+        fake_engine = _make_persisting_engine(
+            self.pathway_pik3k, self.tumor_sample, self.pairing_phospho,
+        )
+        service = PathwayScoringService(self.project)
+        with patch.dict('sys.modules', {'rust_engine': fake_engine}):
+            report = service.run(
+                pathway_kegg_ids=['hsa04151'],
+                method_version='fase4-pfs-v1-explicit-nofilter',
+                min_edges=999,
+                min_signed_fraction=1.0,
+            )
+
+        self.assertEqual(report['pathway_kegg_ids'], ['hsa04151'])
+        self.assertIsNone(report['topology_filter_report'])
+        fake_engine.run_pfs_scoring.assert_called_once()
+
+    @patch('apps.core.tasks.ingestion_tasks.run_pathway_scoring.delay', return_value=None)
+    def test_dispatch_universo_default_grava_relatorio_no_job(self, mock_delay):
+        _make_pathway_topology(self.pathway_pik3k, n_edges=20, n_signed=15)
+
+        job = PathwayScoringService.dispatch(
+            self.project,
+            method_version='fase4-pfs-v1-topofilter-dispatch',
+            min_edges=RECOMMENDED_MIN_EDGES,
+            min_signed_fraction=RECOMMENDED_MIN_SIGNED_FRACTION,
+        )
+
+        self.assertEqual(job.parameters['pathway_kegg_ids'], ['hsa04151'])
+        filter_report = job.parameters['topology_filter_report']
+        self.assertIsNotNone(filter_report)
+        self.assertEqual(filter_report['n_pathways_kept'], 1)
+        self.assertEqual(filter_report['n_pathways_excluded'], 2)
+
+    @patch('apps.core.tasks.ingestion_tasks.run_pathway_scoring.delay', return_value=None)
+    def test_dispatch_pathways_explicito_relatorio_none_no_job(self, mock_delay):
+        job = PathwayScoringService.dispatch(
+            self.project,
+            pathway_kegg_ids=['hsa04151'],
+            method_version='fase4-pfs-v1-topofilter-dispatch-explicit',
+            min_edges=999,
+            min_signed_fraction=1.0,
+        )
+
+        self.assertIsNone(job.parameters['topology_filter_report'])
+        self.assertEqual(job.parameters['pathway_kegg_ids'], ['hsa04151'])
+
+    def test_filtro_diferente_sob_mesmo_method_version_dispara_gate(self):
+        """
+        `min_edges`/`min_signed_fraction` ENTRAM em GATE_FIELDS: rodar o
+        MESMO `method_version` com `min_signed_fraction` diferente é
+        reprovado pelo gate de reprodutibilidade (D3), mesmo o universo de
+        vias resultante sendo idêntico neste cenário — o gate protege
+        contra a POSSIBILIDADE de universos diferentes sob a mesma string,
+        não reavalia o resultado real do run anterior.
+        """
+        self._approve_all_base_pathways()
+        method_version = 'fase4-pfs-v1-topofilter-gate'
+
+        fake_engine = _make_persisting_engine(
+            self.pathway_pik3k, self.tumor_sample, self.pairing_phospho,
+        )
+        service = PathwayScoringService(self.project)
+        with patch.dict('sys.modules', {'rust_engine': fake_engine}):
+            service.run(
+                method_version=method_version,
+                min_edges=10,
+                min_signed_fraction=0.5,
+            )
+
+        with self.assertRaises(PfsReproducibilityGateError) as ctx:
+            with patch.dict('sys.modules', {'rust_engine': fake_engine}):
+                service.run(
+                    method_version=method_version,
+                    min_edges=10,
+                    min_signed_fraction=0.7,
+                )
+
+        self.assertEqual(ctx.exception.reason, 'mismatch')
+        self.assertIn('min_signed_fraction', str(ctx.exception))
+        fake_engine.run_pfs_scoring.assert_called_once()  # só o 1º run chamou o Rust
+
+    def test_filtro_igual_sob_mesmo_method_version_nao_dispara_gate(self):
+        """Espelho do teste acima: MESMOS min_edges/min_signed_fraction não disparam o gate."""
+        self._approve_all_base_pathways()
+        method_version = 'fase4-pfs-v1-topofilter-gate-same'
+
+        fake_engine = _make_persisting_engine(
+            self.pathway_pik3k, self.tumor_sample, self.pairing_phospho,
+        )
+        service = PathwayScoringService(self.project)
+        with patch.dict('sys.modules', {'rust_engine': fake_engine}):
+            service.run(method_version=method_version, min_edges=10, min_signed_fraction=0.5)
+            report2 = service.run(
+                method_version=method_version, min_edges=10, min_signed_fraction=0.5,
+            )
+
+        self.assertEqual(report2['method_version'], method_version)
 
 
 # =============================================================================

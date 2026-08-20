@@ -18,10 +18,51 @@ Universo de vias (generalizado — deixou de ser 3 fixas):
   da execução (`_resolve_default_pathway_ids`), não para a constante.
   Lista explícita (via `--pathways` do command, ou chamada programática)
   continua sendo respeitada tal como passada — INCLUSIVE lista vazia (`[]`).
-  `_resolve_default_pathway_ids()` é set-based (uma única query
-  `Pathway.objects.values_list('kegg_id', flat=True)`) — não gera query por
-  via; os pré-checks (`_check_graph_loaded`/`_check_readouts_mapped`) já
-  usam `__in=pathway_ids`, também set-based.
+  `_resolve_default_pathway_ids()` é set-based (uma única query de
+  agregação `Count`, ver abaixo) — não gera query por via; os pré-checks
+  (`_check_graph_loaded`/`_check_readouts_mapped`) já usam
+  `__in=pathway_ids`, também set-based.
+
+Filtro de qualidade de topologia (D-2, medido pós-Fase 4/372-vias):
+  `_resolve_default_pathway_ids(min_edges, min_signed_fraction)` filtra o
+  universo default por qualidade do grafo ANTES de chamar o Rust — o motor
+  recebe a lista já filtrada, `rust_src/` não muda. Motivo medido: RWR não
+  se propaga num grafo ausente/pouco assinado — a influência fica retida
+  nos nós semeados e o escore deixa de medir propagação para medir
+  concordância gene a gene (sinal legítimo, mas não é o que o PFS afirma
+  medir). Vias sem NENHUMA aresta respondem por 30% dos achados (q<0,05) da
+  bancada de 372 vias, com enriquecimento 3,67× — o oposto do que se espera
+  de um escore de propagação.
+    - `min_edges` — nº mínimo de `PathwayEdge` na via.
+    - `min_signed_fraction` — fração mínima de arestas com
+      `sign ∈ {+1,−1}` (o resto é `sign=0`, associação sem sinal). Via com
+      ZERO arestas tem fração INDEFINIDA (0/0) — tratada explicitamente
+      como reprovada quando `min_signed_fraction > 0` (não é deixada virar
+      `0.0` por acidente aritmético, que mascararia a real causa da
+      reprovação no relatório de exclusão). Quando o filtro está
+      DESLIGADO (`min_edges=0 min_signed_fraction=0`), via de zero arestas
+      passa — "desligado" precisa reproduzir o universo completo de
+      verdade.
+    - Threshold RECOMENDADO (`RECOMMENDED_MIN_EDGES=10`,
+      `RECOMMENDED_MIN_SIGNED_FRACTION=0.5`) é o gatilho D-2 pré-registrado
+      no plano da Fase 4 ("grafo majoritariamente não assinado →
+      reavaliar") — é o default do management command `score_pathways`,
+      NÃO o default de `dispatch()`/`run()` como API Python (esses ficam
+      em `DEFAULT_MIN_EDGES=0`/`DEFAULT_MIN_SIGNED_FRACTION=0.0`, filtro
+      DESLIGADO, para não mudar silenciosamente o comportamento de
+      qualquer chamador programático existente que não passe estes kwargs
+      — só o operador da bancada via CLI recebe o filtro ligado por
+      padrão). Medido: de 372 vias sobram 194, preservando 5.440/6.710
+      pares (81,1%).
+    - Aplica-se SOMENTE ao universo DEFAULT (`pathway_kegg_ids=None`).
+      Lista explícita via `--pathways` NUNCA é filtrada — o operador que
+      pede uma via explicitamente não pode vê-la sumir em silêncio (mesma
+      garantia já dada para `[]` explícito, ver acima).
+    - Relatório de exclusão (`topology_filter_report`, chave em
+      `IngestionJob.parameters` e no retorno de `run()`): quantas vias
+      entraram/saíram e a quebra por motivo
+      (`no_edges`/`too_few_edges`/`low_signed_fraction`). "Não filtrado
+      no `--pathways` explícito" não gera relatório (`None`).
 
 Responsabilidade (D1 TRAVADO: núcleo 100% Rust, órbita 100% Django):
   1. Resolver AS DUAS matrizes de readout dentro do projeto (isolamento,
@@ -81,6 +122,21 @@ Responsabilidade (D1 TRAVADO: núcleo 100% Rust, órbita 100% Django):
      `pathway_kegg_ids` e `dry_run` NÃO entram no gate: rodar um
      subconjunto de vias não corrompe as vias de fora do subconjunto
      (linhas são por `(pathway, sample)`), e `dry_run` nunca escreve.
+     `min_edges`/`min_signed_fraction` (filtro de qualidade de topologia)
+     ENTRAM no gate — mesmo sendo, à primeira vista, "parâmetro de escopo"
+     como `pathway_kegg_ids`. A diferença que justifica o tratamento
+     diferente: o escopo de `pathway_kegg_ids` é DECLARADO (o operador vê
+     exatamente a lista que pediu), o de `min_edges`/`min_signed_fraction`
+     é DERIVADO (o operador não vê, pelo comando, QUAIS vias o filtro
+     descartou — só o relatório de exclusão mostra). Rodar o mesmo
+     `method_version` primeiro com `--min-signed-fraction 0.5` e depois com
+     `0.7` mistura DOIS universos de vias diferentes sob a MESMA string, e
+     `apply_pathway_fdr` agrega a família de FDR por `method_version` — a
+     família sairia corrompida (achados de universos de qualidade
+     diferente comparados/corrigidos juntos) sem que o gate de
+     `pathway_kegg_ids` (que não vê estes dois parâmetros) pegasse isso.
+     Por isso `min_edges`/`min_signed_fraction` estão em `GATE_FIELDS`
+     apesar de também influenciarem o universo de vias.
   4. Gate de idempotência (job PATHWAY_SCORE_RUN PENDING/RUNNING para o
      mesmo `method_version`, busca GLOBAL) — não duplica execução
      concorrente.
@@ -148,6 +204,7 @@ import tempfile
 
 from django.conf import settings
 from django.core.files.storage import default_storage
+from django.db.models import Count, Q
 from django.utils import timezone
 
 from apps.core.models import (
@@ -200,6 +257,36 @@ DEFAULT_N_PERMUTATIONS = 1000
 DEFAULT_RNG_SEED = 42
 DEFAULT_MIN_REGULON_TARGETS = 5
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Filtro de qualidade de topologia (D-2, medido pós-Fase 4/372-vias) — ver
+# "Filtro de qualidade de topologia" na docstring do módulo para o mecanismo
+# completo e a evidência medida.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Defaults de SERVIÇO (dispatch()/run() como API Python): filtro DESLIGADO —
+# retrocompatibilidade para qualquer chamador programático existente que não
+# passe estes kwargs. O management command usa RECOMMENDED_* abaixo.
+DEFAULT_MIN_EDGES = 0
+DEFAULT_MIN_SIGNED_FRACTION = 0.0
+
+# Defaults RECOMENDADOS (usados pelo management command `score_pathways`) —
+# gatilho D-2 pré-registrado no plano da Fase 4 ("grafo majoritariamente não
+# assinado → reavaliar"). Medido: de 372 vias sobram 194, preservando
+# 5.440/6.710 pares (81,1%).
+RECOMMENDED_MIN_EDGES = 10
+RECOMMENDED_MIN_SIGNED_FRACTION = 0.5
+
+# Motivos de exclusão do relatório (`topology_filter_report`) — nomeados
+# para não colidir com os contadores do manifesto Rust.
+TOPOLOGY_EXCLUSION_NO_EDGES = 'no_edges'
+TOPOLOGY_EXCLUSION_TOO_FEW_EDGES = 'too_few_edges'
+TOPOLOGY_EXCLUSION_LOW_SIGNED_FRACTION = 'low_signed_fraction'
+_TOPOLOGY_EXCLUSION_REASONS = (
+    TOPOLOGY_EXCLUSION_NO_EDGES,
+    TOPOLOGY_EXCLUSION_TOO_FEW_EDGES,
+    TOPOLOGY_EXCLUSION_LOW_SIGNED_FRACTION,
+)
+
 # Statuses de ProjectDataset considerados ativos (consistência com
 # CnvSeedService / SamplePairingService).
 _ACTIVE_STATUSES = (
@@ -209,30 +296,129 @@ _ACTIVE_STATUSES = (
     ProjectDataset.CurationStatus.PENDING,
 )
 
-def _resolve_default_pathway_ids() -> list[str]:
+
+def _topology_quality_reason(
+    n_edges: int, n_signed_edges: int, min_edges: int, min_signed_fraction: float
+) -> str | None:
+    """
+    Classifica UMA via já agregada (n_edges/n_signed_edges) contra o filtro
+    de qualidade de topologia. Retorna o motivo de reprovação
+    (`TOPOLOGY_EXCLUSION_*`) ou `None` se aprovada.
+
+    Ordem de checagem (min_edges ANTES de fração):
+      1. `n_edges < min_edges` → reprovada (`no_edges` se n_edges==0,
+         senão `too_few_edges`).
+      2. `n_edges == 0` mas `min_edges == 0` (não caiu no item 1): fração
+         é 0/0 INDEFINIDA. Reprovada explicitamente (`no_edges`) SE
+         `min_signed_fraction > 0` (o requisito de sinal não pode ser
+         satisfeito sem nenhuma aresta). Se `min_signed_fraction == 0`
+         também (filtro totalmente desligado), aprovada — necessário para
+         `--min-edges 0 --min-signed-fraction 0` reproduzir o universo
+         completo de verdade, incluindo vias de zero arestas.
+      3. Caso contrário, fração = n_signed_edges / n_edges (divisão segura,
+         n_edges > 0 aqui) comparada contra `min_signed_fraction`.
+    """
+    if n_edges < min_edges:
+        return (
+            TOPOLOGY_EXCLUSION_NO_EDGES
+            if n_edges == 0
+            else TOPOLOGY_EXCLUSION_TOO_FEW_EDGES
+        )
+    if n_edges == 0:
+        if min_signed_fraction > 0:
+            return TOPOLOGY_EXCLUSION_NO_EDGES
+        return None
+    signed_fraction = n_signed_edges / n_edges
+    if signed_fraction < min_signed_fraction:
+        return TOPOLOGY_EXCLUSION_LOW_SIGNED_FRACTION
+    return None
+
+
+def _resolve_default_pathway_ids(
+    *,
+    min_edges: int = DEFAULT_MIN_EDGES,
+    min_signed_fraction: float = DEFAULT_MIN_SIGNED_FRACTION,
+) -> tuple[list[str], dict]:
     """
     Resolve o universo padrão de vias: TODAS as `Pathway.kegg_id` carregadas
     em PG neste momento — não a constante `DEFAULT_PATHWAY_KEGG_IDS` (preset
-    legado de 3 vias).
+    legado de 3 vias) — filtradas por qualidade de topologia (D-2).
 
     Chamada sob demanda (dentro de dispatch()/run(), quando
     `pathway_kegg_ids` não foi informado) para refletir o catálogo `Pathway`
-    no momento da execução, não em tempo de import do módulo. Query única,
-    set-based — não gera N queries para N vias.
+    no momento da execução, não em tempo de import do módulo. Query ÚNICA
+    de agregação (`Count`/`Count(filter=Q(...))`) — não gera N queries nem
+    laço por via para calcular a fração assinada.
 
-    Retorna lista vazia se `Pathway` estiver vazio (grafo ainda não
-    carregado) — `_check_graph_loaded` trata isso da mesma forma que hoje
-    trata qualquer via ausente (`PfsGraphNotLoadedError`, instrui
-    `load_pathway_topology`).
+    Com `min_edges=0, min_signed_fraction=0` (defaults de serviço) o filtro
+    é INÓCUO: toda via com `Pathway` carregado é mantida — inclusive as com
+    zero `PathwayEdge` — reproduzindo exatamente o comportamento anterior a
+    este filtro.
+
+    Retorna `(pathway_ids, report)`:
+      - `pathway_ids`: lista ordenada das vias APROVADAS. Vazia se
+        `Pathway` estiver vazio OU se o filtro reprovar todas — em ambos os
+        casos `_check_graph_loaded`/`_check_readouts_mapped` tratam a lista
+        vazia da mesma forma que hoje (falha alta, nunca silenciosa).
+      - `report`: dict com `min_edges`, `min_signed_fraction`,
+        `n_pathways_considered`, `n_pathways_kept`, `n_pathways_excluded`,
+        `excluded_by_reason` (dict motivo→contagem) e
+        `excluded_kegg_ids_by_reason` (dict motivo→lista de kegg_id, para
+        auditoria de QUAIS vias saíram, não só quantas).
     """
-    return list(
-        Pathway.objects.order_by('kegg_id').values_list('kegg_id', flat=True)
+    # Aliases `n_edges_live`/`n_signed_edges_live` (não `n_edges`/`n_signed`)
+    # porque `Pathway.n_edges` já é um FIELD do model (preenchido pelo
+    # loader Rust ao concluir a carga) — Django proíbe annotate() colidir
+    # com nome de field. A agregação AO VIVO (não o campo armazenado) é a
+    # fonte de verdade aqui: é a única forma de obter a fração assinada
+    # (não há campo `n_signed_edges` no model) e evita depender de um
+    # contador que pode ficar desatualizado se o grafo for recarregado.
+    rows = (
+        Pathway.objects.order_by('kegg_id')
+        .annotate(
+            n_edges_live=Count('edges', distinct=True),
+            n_signed_edges_live=Count(
+                'edges', filter=Q(edges__sign__in=[1, -1]), distinct=True
+            ),
+        )
+        .values_list('kegg_id', 'n_edges_live', 'n_signed_edges_live')
     )
+
+    kept: list[str] = []
+    excluded_by_reason = {reason: 0 for reason in _TOPOLOGY_EXCLUSION_REASONS}
+    excluded_kegg_ids_by_reason: dict[str, list[str]] = {
+        reason: [] for reason in _TOPOLOGY_EXCLUSION_REASONS
+    }
+    n_considered = 0
+
+    for kegg_id, n_edges, n_signed_edges in rows:
+        n_considered += 1
+        reason = _topology_quality_reason(
+            n_edges, n_signed_edges, min_edges, min_signed_fraction
+        )
+        if reason is None:
+            kept.append(kegg_id)
+        else:
+            excluded_by_reason[reason] += 1
+            excluded_kegg_ids_by_reason[reason].append(kegg_id)
+
+    report = {
+        'min_edges': min_edges,
+        'min_signed_fraction': min_signed_fraction,
+        'n_pathways_considered': n_considered,
+        'n_pathways_kept': len(kept),
+        'n_pathways_excluded': n_considered - len(kept),
+        'excluded_by_reason': excluded_by_reason,
+        'excluded_kegg_ids_by_reason': excluded_kegg_ids_by_reason,
+    }
+    return kept, report
 
 
 # Campos da configuração que AFETAM O RESULTADO NUMÉRICO — usados pelo gate
 # de reprodutibilidade (D3). `pathway_kegg_ids` e `dry_run` ficam de fora
-# deliberadamente (ver docstring do módulo).
+# deliberadamente; `min_edges`/`min_signed_fraction` ENTRAM (ver "Gate de
+# reprodutibilidade" / item 3 na docstring do módulo para o porquê da
+# assimetria com `pathway_kegg_ids`).
 GATE_FIELDS = (
     'seed_method_versions',
     'mapping_version',
@@ -243,6 +429,8 @@ GATE_FIELDS = (
     'min_regulon_targets',
     'phospho_matrix_id',
     'proteome_matrix_id',
+    'min_edges',
+    'min_signed_fraction',
 )
 
 
@@ -434,6 +622,8 @@ class PathwayScoringService:
         n_permutations: int = DEFAULT_N_PERMUTATIONS,
         rng_seed: int = DEFAULT_RNG_SEED,
         min_regulon_targets: int = DEFAULT_MIN_REGULON_TARGETS,
+        min_edges: int = DEFAULT_MIN_EDGES,
+        min_signed_fraction: float = DEFAULT_MIN_SIGNED_FRACTION,
         force: bool = False,
         dry_run: bool = False,
     ) -> IngestionJob:
@@ -443,10 +633,16 @@ class PathwayScoringService:
 
         Args:
             pathway_kegg_ids: IDs KEGG a pontuar. None → TODAS as `Pathway`
-                               carregadas em PG neste momento
+                               carregadas em PG neste momento, filtradas por
+                               qualidade de topologia
                                (`_resolve_default_pathway_ids`) — lista
                                explícita (incl. `[]`) é respeitada tal como
-                               passada.
+                               passada e NUNCA é filtrada por
+                               min_edges/min_signed_fraction.
+            min_edges: filtro de qualidade de topologia (D-2) — só se aplica
+                       ao universo DEFAULT (`pathway_kegg_ids=None`).
+                       Default de serviço 0 = filtro desligado.
+            min_signed_fraction: idem — default de serviço 0.0 = desligado.
 
         Raises:
             PfsMatrixNotFoundError, PfsGraphNotLoadedError,
@@ -457,11 +653,13 @@ class PathwayScoringService:
         from apps.core.tasks.ingestion_tasks import run_pathway_scoring
 
         service = cls(project)
-        pathway_ids = (
-            list(pathway_kegg_ids)
-            if pathway_kegg_ids is not None
-            else _resolve_default_pathway_ids()
-        )
+        if pathway_kegg_ids is not None:
+            pathway_ids = list(pathway_kegg_ids)
+            topology_filter_report = None
+        else:
+            pathway_ids, topology_filter_report = _resolve_default_pathway_ids(
+                min_edges=min_edges, min_signed_fraction=min_signed_fraction,
+            )
         seed_versions = list(seed_method_versions or DEFAULT_SEED_METHOD_VERSIONS)
 
         phospho_matrix = service.resolve_phospho_matrix(project)
@@ -483,6 +681,8 @@ class PathwayScoringService:
             n_permutations=n_permutations,
             rng_seed=rng_seed,
             min_regulon_targets=min_regulon_targets,
+            min_edges=min_edges,
+            min_signed_fraction=min_signed_fraction,
         )
 
         service._check_no_active_job(method_version)
@@ -495,6 +695,7 @@ class PathwayScoringService:
             'method_version': method_version,
             'force': force,
             'dry_run': dry_run,
+            'topology_filter_report': topology_filter_report,
             # db_url NÃO é armazenada (sensitive-data-handling)
         }
 
@@ -536,6 +737,8 @@ class PathwayScoringService:
         n_permutations: int = DEFAULT_N_PERMUTATIONS,
         rng_seed: int = DEFAULT_RNG_SEED,
         min_regulon_targets: int = DEFAULT_MIN_REGULON_TARGETS,
+        min_edges: int = DEFAULT_MIN_EDGES,
+        min_signed_fraction: float = DEFAULT_MIN_SIGNED_FRACTION,
         force: bool = False,
         dry_run: bool = False,
     ) -> dict:
@@ -564,10 +767,16 @@ class PathwayScoringService:
                                `job` foi informado — os pré-checks abaixo
                                precisam refletir o universo REAL do job, não
                                um default stale) ou TODAS as `Pathway`
-                               carregadas em PG neste momento
+                               carregadas em PG neste momento, filtradas por
+                               qualidade de topologia
                                (`_resolve_default_pathway_ids`). Lista
                                explícita (incl. `[]`) é respeitada tal como
-                               passada.
+                               passada e NUNCA é filtrada por
+                               min_edges/min_signed_fraction.
+            min_edges, min_signed_fraction: filtro de qualidade de
+                               topologia (D-2) — só se aplica ao universo
+                               DEFAULT. Ignorados se `job` foi informado com
+                               `pathway_kegg_ids` explícito no job.
             demais args: ver DEFAULT_* no topo do módulo.
 
         Returns:
@@ -575,12 +784,16 @@ class PathwayScoringService:
         """
         import rust_engine
 
+        topology_filter_report = None
         if pathway_kegg_ids is not None:
             pathway_ids = list(pathway_kegg_ids)
         elif job is not None and job.parameters.get('pathway_kegg_ids') is not None:
             pathway_ids = list(job.parameters['pathway_kegg_ids'])
+            topology_filter_report = job.parameters.get('topology_filter_report')
         else:
-            pathway_ids = _resolve_default_pathway_ids()
+            pathway_ids, topology_filter_report = _resolve_default_pathway_ids(
+                min_edges=min_edges, min_signed_fraction=min_signed_fraction,
+            )
         seed_versions = list(seed_method_versions or DEFAULT_SEED_METHOD_VERSIONS)
 
         phospho_matrix = self.resolve_phospho_matrix(self.project)
@@ -605,6 +818,8 @@ class PathwayScoringService:
                 n_permutations=n_permutations,
                 rng_seed=rng_seed,
                 min_regulon_targets=min_regulon_targets,
+                min_edges=min_edges,
+                min_signed_fraction=min_signed_fraction,
             )
             if not dry_run:
                 self._check_reproducibility_gate(method_version, config, force)
@@ -615,6 +830,7 @@ class PathwayScoringService:
                 'method_version': method_version,
                 'force': force,
                 'dry_run': dry_run,
+                'topology_filter_report': topology_filter_report,
             }
             job = IngestionJob.objects.create(
                 project=self.project,
@@ -640,6 +856,8 @@ class PathwayScoringService:
             n_permutations = p.get('n_permutations', n_permutations)
             rng_seed = p.get('rng_seed', rng_seed)
             min_regulon_targets = p.get('min_regulon_targets', min_regulon_targets)
+            min_edges = p.get('min_edges', min_edges)
+            min_signed_fraction = p.get('min_signed_fraction', min_signed_fraction)
             dry_run = p.get('dry_run', dry_run)
 
         try:
@@ -656,6 +874,9 @@ class PathwayScoringService:
                 n_permutations=n_permutations,
                 rng_seed=rng_seed,
                 min_regulon_targets=min_regulon_targets,
+                min_edges=min_edges,
+                min_signed_fraction=min_signed_fraction,
+                topology_filter_report=topology_filter_report,
                 dry_run=dry_run,
                 rust_engine=rust_engine,
             )
@@ -808,10 +1029,16 @@ class PathwayScoringService:
         n_permutations: int,
         rng_seed: int,
         min_regulon_targets: int,
+        min_edges: int,
+        min_signed_fraction: float,
     ) -> dict:
         """
         Configuração canônica do run — usada tanto para `parameters` do
         IngestionJob quanto para a comparação do gate de reprodutibilidade.
+        `min_edges`/`min_signed_fraction` entram no gate (ver GATE_FIELDS)
+        mesmo quando `pathway_kegg_ids` foi passado explicitamente (o
+        filtro não foi aplicado nesse caso, mas o parâmetro DECLARADO ainda
+        é parte da configuração do run).
         """
         return {
             'pathway_kegg_ids': sorted(pathway_kegg_ids),
@@ -824,6 +1051,8 @@ class PathwayScoringService:
             'n_permutations': n_permutations,
             'rng_seed': rng_seed,
             'min_regulon_targets': min_regulon_targets,
+            'min_edges': min_edges,
+            'min_signed_fraction': min_signed_fraction,
         }
 
     def _check_reproducibility_gate(
@@ -897,6 +1126,9 @@ class PathwayScoringService:
         n_permutations: int,
         rng_seed: int,
         min_regulon_targets: int,
+        min_edges: int = DEFAULT_MIN_EDGES,
+        min_signed_fraction: float = DEFAULT_MIN_SIGNED_FRACTION,
+        topology_filter_report: dict | None = None,
         dry_run: bool,
         rust_engine,
     ) -> dict:
@@ -1033,6 +1265,10 @@ class PathwayScoringService:
             'proteome_matrix_id': proteome_matrix.id,
             'mapping_version': mapping_version,
             'dry_run': dry_run,
+            # ── Filtro de qualidade de topologia (D-2) ───────────────────
+            'min_edges': min_edges,
+            'min_signed_fraction': min_signed_fraction,
+            'topology_filter_report': topology_filter_report,
             # ── Manifesto (PfsRunManifest) ─────────────────────────────
             'n_pathways': manifest.n_pathways,
             'n_pathways_no_readout': manifest.n_pathways_no_readout,
