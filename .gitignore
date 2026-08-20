@@ -35,5 +35,10 @@ celerybeat-schedule*
 # (KGML do KEGG, regulons CollecTRI/OmniPath) cuja licenca academica proibe
 # redistribuicao. Antes deste bloco a protecao dependia de um .gitignore
 # untracked dentro de diagnostics/cache/ — inexistente em clone limpo/CI.
-diagnostics/
+# NOTA: e' 'diagnostics/*' e nao 'diagnostics/' de proposito. O Git nao
+# re-inclui arquivo cujo diretorio-pai foi excluido, entao com 'diagnostics/'
+# a negacao abaixo ficava inerte. Com 'diagnostics/*' os subdiretorios
+# (backups/, cache/) continuam integralmente excluidos e so os .md da raiz
+# de diagnostics/ voltam a ser versionaveis.
+diagnostics/*
 !diagnostics/*.md
